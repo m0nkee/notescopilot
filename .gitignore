@@ -1,0 +1,30 @@
+# macOS
+.DS_Store
+*.swp
+*~
+
+# 构建产物
+build/
+*.o
+*.cstemp
+
+# 测试与工具编译产物（可执行文件，目录名与套件同名）
+tests/selai-tests/selai-tests
+tests/slashgroup-tests/slashgroup-tests
+tests/template-tests/template-tests
+tests/urltitle-tests/urltitle-tests
+tests/e2e-run
+tools/memprobe
+tools/navtest
+tools/px2
+tools/render_settings
+tools/dbg
+
+# Xcode / Swift
+DerivedData/
+*.xcuserstate
+.Packages/
+.build/
+
+# 日志
+*.log

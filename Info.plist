@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleExecutable</key>
+	<string>NotesCopilot</string>
+	<key>CFBundleIdentifier</key>
+	<string>local.notescopilot.app</string>
+	<key>CFBundleName</key>
+	<string>NotesCopilot</string>
+	<key>CFBundleDisplayName</key>
+	<string>NotesCopilot</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>2.5.0</string>
+	<key>CFBundleVersion</key>
+	<string>1</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>13.0</string>
+	<key>LSUIElement</key>
+	<true/>
+	<key>NSHighResolutionCapable</key>
+	<true/>
+	<key>NSAppleEventsUsageDescription</key>
+	<string>NotesCopilot 需要向 Apple Notes 发送脚本以创建笔记，并向系统事件发送粘贴指令，把 AI 结果插入你的笔记。</string>
+</dict>
+</plist>
