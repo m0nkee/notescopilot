@@ -80,8 +80,7 @@ enum SlashGroup: CaseIterable {
 struct SlashCommand: Identifiable {
     let id = UUID()
     let name: String      // 不带斜杠的命令名
-    /// 全局键入时匹配的别名（中文命令名经 IME 组合后键盘事件拿不到，
-    /// 需提供拼音/英文别名；面板内斜杠菜单仍按 name 匹配）
+    /// 英文命令别名；菜单筛选和 AX 正文执行也支持直接匹配中文 name。
     let alias: String
     let detail: String
     let action: SlashAction
@@ -99,14 +98,14 @@ struct SlashCommand: Identifiable {
 
 func buildSlashCommands() -> [SlashCommand] {
     var cmds: [SlashCommand] = [
-        SlashCommand(name: "续写", alias: "xuxie", detail: "基于笔记上下文自然续写", action: .run("请基于上文内容自然地续写下去，保持原文的风格与格式。")),
-        SlashCommand(name: "总结", alias: "zongjie", detail: "总结笔记上下文的要点", action: .run("请用简洁的要点总结以下内容的核心信息。")),
-        SlashCommand(name: "翻译", alias: "fanyi", detail: "翻译成英文", action: .run("请将以下内容翻译成英文，保持原意与语气。")),
-        SlashCommand(name: "润色", alias: "runse", detail: "让文字更通顺专业", action: .run("请润色以下文字，使其更通顺、专业，保持原意与格式。")),
-        SlashCommand(name: "解释", alias: "jieshi", detail: "解释关键概念与逻辑", action: .run("请解释以下内容的关键概念与逻辑。")),
-        SlashCommand(name: "扩写", alias: "kuoxie", detail: "补充细节与论据", action: .run("请扩展以下内容，补充细节与论据，保持原有结构。")),
-        SlashCommand(name: "要点", alias: "yaodian", detail: "改写为要点清单", action: .run("请把以下内容改写成结构清晰的要点清单（Markdown 列表）。")),
-        SlashCommand(name: "标题", alias: "biaoti", detail: "为笔记拟 3 个候选标题", action: .run("请为以下笔记拟 3 个候选标题，每行一个。")),
+        SlashCommand(name: "续写", alias: "continue", detail: "基于笔记上下文自然续写", action: .run("请基于上文内容自然地续写下去，保持原文的风格与格式。")),
+        SlashCommand(name: "总结", alias: "summarize", detail: "总结笔记上下文的要点", action: .run("请用简洁的要点总结以下内容的核心信息。")),
+        SlashCommand(name: "翻译", alias: "translate", detail: "翻译成英文", action: .run("请将以下内容翻译成英文，保持原意与语气。")),
+        SlashCommand(name: "润色", alias: "polish", detail: "让文字更通顺专业", action: .run("请润色以下文字，使其更通顺、专业，保持原意与格式。")),
+        SlashCommand(name: "解释", alias: "explain", detail: "解释关键概念与逻辑", action: .run("请解释以下内容的关键概念与逻辑。")),
+        SlashCommand(name: "扩写", alias: "expand", detail: "补充细节与论据", action: .run("请扩展以下内容，补充细节与论据，保持原有结构。")),
+        SlashCommand(name: "要点", alias: "keypoints", detail: "改写为要点清单", action: .run("请把以下内容改写成结构清晰的要点清单（Markdown 列表）。")),
+        SlashCommand(name: "标题", alias: "titles", detail: "为笔记拟 3 个候选标题", action: .run("请为以下笔记拟 3 个候选标题，每行一个。")),
         SlashCommand(name: "修拼写", alias: "fixgrammar", detail: "修复拼写与语法（Ask AI）", action: .run("请修复以下文字的拼写与语法错误，只输出修正后的文本，不要解释。")),
         SlashCommand(name: "格式检查", alias: "format", detail: "检查格式问题并列出修改建议（Ask AI）", action: .run("请检查以下内容的格式问题（标点符号、多余空格、标题层级、列表结构、错别字），逐条列出：问题位置、问题描述、修改建议。不要直接改写原文，只输出问题清单。")),
         SlashCommand(name: "变短", alias: "shorter", detail: "压缩得更精炼（Ask AI）", action: .run("请把以下内容压缩得更简洁，保留核心信息。")),
@@ -205,23 +204,32 @@ enum KeywordStore {
 
 final class KeywordListener {
     static let shared = KeywordListener()
+    private let accessibilityTrusted: () -> Bool
+    private let tapFactory: (CGEventTapOptions) -> CFMachPort?
+
+    init(accessibilityTrusted: @escaping () -> Bool = { NotesBridge.shared.isTrusted },
+         tapFactory: ((CGEventTapOptions) -> CFMachPort?)? = nil) {
+        self.accessibilityTrusted = accessibilityTrusted
+        self.tapFactory = tapFactory ?? Self.createTap
+    }
+
     private var tap: CFMachPort?
     private var source: CFRunLoopSource?
     private var buffer = ""
     /// 对应 ProNotes 的 maxSequenceLength：缓冲区上限
     private let maxSequenceLength = 64
-    /// 斜杠命令缓冲（"/润色" 的拼音/英文别名）：
+    /// 斜杠命令缓冲（如英文别名 "/polish"）：
     /// 只在监听启动后重新开始记录，避免旧缓冲误触发
     private var slashBuf = ""
     /// 授权重试定时器：用户在系统设置里授完权后自动拉起监听，无需重启应用
     private var retryTimer: Timer?
-    /// 上次记录的输入监控预检结果（日志去重）
-    private var lastPreLog: Bool?
+    /// 上次记录的辅助功能授权结果（日志去重）
+    private var lastTrustLog: Bool?
 
     var enabled: Bool { UserDefaults.standard.bool(forKey: "nc.kw.enabled") }
 
     /// 监听是否真正在跑（菜单栏状态展示用）
-    var isRunning: Bool { tap != nil }
+    var isRunning: Bool { tap.map { CGEvent.tapIsEnabled(tap: $0) } ?? false }
 
     /// 键盘斜杠缓冲是否为空（AX 通道与 tap 通道互斥用）
     var slashBufIsEmpty: Bool { slashBuf.isEmpty }
@@ -241,55 +249,90 @@ final class KeywordListener {
     func startIfNeeded() {
         guard tap == nil else { return }
         guard enabled || slashGlobal else {
+            cancelPermissionRetry()
             NCLog.log("startIfNeeded 跳过：关键词与全局斜杠均关闭")
-            return
-        }
-        // macOS 10.15+：全局监听 keyDown 需要「输入监控」权限（与辅助功能是两个独立授权项）
-        let pre = CGPreflightListenEventAccess()
-        // 预检结果只在变化时记录，避免未授权时每 3 秒刷屏淹没有效日志
-        if lastPreLog != pre {
-            NCLog.log("startIfNeeded：输入监控预检 = \(pre)，二进制 = \(Bundle.main.bundleURL.path)")
-            lastPreLog = pre
-        }
-        if !pre {
-            _ = CGRequestListenEventAccess()   // 主动拉起系统授权弹窗
             NotificationCenter.default.post(
                 name: .init("nc.kwStatus"),
-                object: "等待「输入监控」授权：请到「系统设置 › 隐私与安全性 › 输入监控」勾选 NotesCopilot，授权后自动生效。")
-            schedulePermissionRetry()
+                object: "菜单键盘导航与关键词扩展已关闭。")
             return
         }
-        let mask = CGEventMask(1 << CGEventType.keyDown.rawValue)
-        guard let t = CGEvent.tapCreate(
-            tap: .cgSessionEventTap,
-            place: .headInsertEventTap,
-            options: .defaultTap,
-            eventsOfInterest: mask,
-            callback: { _, type, event, _ in
-                if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
-                    if let tap = KeywordListener.shared.tap { CGEvent.tapEnable(tap: tap, enable: true) }
-                    return Unmanaged.passUnretained(event)
-                }
-                return KeywordListener.shared.handle(event)
-            },
-            userInfo: nil
-        ) else {
-            NCLog.log("tapCreate 失败（无输入监控权限或会话 tap 不可用）")
-            NotificationCenter.default.post(
-                name: .init("nc.kwStatus"),
-                object: "创建键盘监听失败：请到「系统设置 › 隐私与安全性 › 输入监控」中授权 NotesCopilot 后重试。")
-            schedulePermissionRetry()
+        // defaultTap 会拦截/修改事件，需要辅助功能；输入监控预检不能阻止此主动 tap。
+        let trusted = accessibilityTrusted()
+        if lastTrustLog != trusted {
+            NCLog.log("菜单键盘导航与关键词监听：辅助功能授权 = \(trusted)，二进制 = \(Bundle.main.bundleURL.path)")
+            lastTrustLog = trusted
+        }
+        guard trusted else {
+            waitForAccessibility()
+            return
+        }
+        guard let t = tapFactory(.defaultTap) else {
+            NCLog.log("主动键盘监听未创建：tapCreate 返回空值")
+            reportTapUnavailable()
             return
         }
         tap = t
         source = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, t, 0)
         CFRunLoopAddSource(CFRunLoopGetMain(), source, .commonModes)
         CGEvent.tapEnable(tap: t, enable: true)
+        guard isRunning else {
+            NCLog.log("主动键盘监听已创建但未启用：tapIsEnabled 返回 false")
+            stop()
+            reportTapUnavailable()
+            return
+        }
         cancelPermissionRetry()
-        NCLog.log("键盘监听已启动（tap 创建成功）")
+        NCLog.log("菜单键盘导航与关键词监听已启动（主动 tap 已启用）")
         NotificationCenter.default.post(
             name: .init("nc.kwStatus"),
-            object: "键盘监听已启动：斜杠命令、Markdown 扩展、关键词扩展均可用。")
+            object: "菜单键盘导航与关键词监听已启动。")
+    }
+
+    private static func createTap(options: CGEventTapOptions) -> CFMachPort? {
+        let mask = CGEventMask(1 << CGEventType.keyDown.rawValue)
+        return CGEvent.tapCreate(
+            tap: .cgSessionEventTap,
+            place: .headInsertEventTap,
+            options: options,
+            eventsOfInterest: mask,
+            callback: { _, type, event, _ in
+                if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
+                    KeywordListener.shared.handleTapDisabled()
+                    return Unmanaged.passUnretained(event)
+                }
+                return KeywordListener.shared.handle(event)
+            },
+            userInfo: nil
+        )
+    }
+
+    /// 撤销辅助功能后不能反复启用旧 tap；保留重试等待用户重新授权。
+    func handleTapDisabled() {
+        guard accessibilityTrusted() else {
+            stop()
+            waitForAccessibility()
+            return
+        }
+        if let tap { CGEvent.tapEnable(tap: tap, enable: true) }
+        if !isRunning {
+            stop()
+            reportTapUnavailable()
+        }
+    }
+
+    private func waitForAccessibility() {
+        NotificationCenter.default.post(
+            name: .init("nc.kwStatus"),
+            object: "菜单键盘导航与关键词扩展等待「辅助功能」授权：请在「系统设置 › 隐私与安全性 › 辅助功能」中允许 NotesCopilot，授权后自动重试。")
+        schedulePermissionRetry()
+    }
+
+    private func reportTapUnavailable() {
+        NCLog.log("菜单键盘导航与关键词监听创建或启用失败（当前会话 tap 不可用）")
+        NotificationCenter.default.post(
+            name: .init("nc.kwStatus"),
+            object: "菜单键盘导航与关键词扩展暂不可用：当前会话无法创建键盘监听，已安排自动重试。")
+        schedulePermissionRetry()
     }
 
     /// 每 3 秒重试一次：授权完成后自动启动监听（无须重启应用）
@@ -557,7 +600,7 @@ final class AXSlashWatcher {
             MainActor.assumeIsolated {
                 guard let self else { return }
                 if NotesBridge.shared.isTrusted {
-                    NCLog.log("✅ 辅助功能授权成功！AX 斜杠通道已激活，可到 Notes 输入 /runse 测试")
+                    NCLog.log("✅ 辅助功能授权成功！AX 斜杠通道已激活，可到 Notes 输入 /polish 测试")
                     self.trustTimer?.invalidate()
                     self.trustTimer = nil
                     self.lastAXOK = Date()
@@ -665,7 +708,7 @@ final class AXSlashWatcher {
     }
 
     /// 检测光标前是否有一个「正在输入、尚未终止」的 / 命令段（用于建议下拉）。
-    /// 返回形如 "/runse" 的查询串；与触发通道（matchAXSlashTail）语义一致：允许行中 /，
+    /// 返回形如 "/polish" 的查询串；与触发通道（matchAXSlashTail）语义一致：允许行中 /，
     /// 仅排除 URL 型斜杠（"https:" 后、连续 "//" 中）。
     nonisolated static func activeSlashQuery(_ tail: String) -> String? {
         let norm = tail.replacingOccurrences(of: "／", with: "/")
@@ -700,7 +743,7 @@ final class AXSlashWatcher {
             }
             return out
         }
-        // 别名（拼音/英文）与中文命令名/模板名均可匹配——中文 IME 直接打命令名可命中
+        // 英文别名与中文命令名/模板名均可匹配——中文 IME 直接打命令名可命中
         let pref = cmds.filter { cmd in
             (!cmd.alias.isEmpty && cmd.alias.lowercased().hasPrefix(token))
                 || cmd.name.lowercased().hasPrefix(token)
@@ -763,7 +806,7 @@ final class AXSlashWatcher {
         let token = String(trigger.dropFirst()).lowercased()
         let cmds = buildSlashCommands()
         if let exact = cmds.first(where: { !$0.alias.isEmpty && $0.alias.lowercased() == token }) { return exact }
-        // 中文 IME 场景：拼音被组合提交为中文命令名/模板名（真机取证：/runse → "/润色"）。
+        // AX 正文支持直接键入中文命令名/模板名，例如 "/润色"。
         // 命令名匹配让 IME 用户无需切英文输入法；中文名模板（alias 为空）也在此命中。
         if let byName = cmds.first(where: { $0.name == token }) { return byName }
         let prefix = cmds.filter { !$0.alias.isEmpty && $0.alias.lowercased().hasPrefix(token) }

@@ -32,10 +32,9 @@ final class HighlightRowView: NSTableRowView {
 // 输入 / 未终止时跟随光标弹出：持续输入实时过滤，点选即执行，↑↓ 键盘导航 ⏎ 执行 esc 关闭
 // （删除已输入的 /xxx 段并走 performGlobalSlash）。
 // 关键：NSPanel.styleMask 含 .nonactivatingPanel —— 点击面板不抢 Notes 焦点，
-// 文本光标不丢，键盘继续打进 Notes；键盘导航经 CGEventTap 拦截路由（见 SlashKeyTap）。
+// 文本光标不丢，键盘继续打进 Notes；键盘导航经 KeywordListener 的 active CGEventTap 拦截路由。
 //
-// IME 保护：当前输入源为中文（拼音等组合式 IME）时 ↑↓/⏎ 全部放行——
-// 组合期内箭头是 IME 候选窗导航键，拦截会破坏中文输入；英文输入法下才接管。
+// IME 保护：有标记文本的组合期放行 ↑↓/⏎，避免破坏候选导航；中文输入法未组合时仍可导航。
 
 @MainActor
 final class SlashSuggestPanel: NSObject, NSWindowDelegate {
@@ -66,9 +65,10 @@ final class SlashSuggestPanel: NSObject, NSWindowDelegate {
 
     private var panel: NSPanel?
     private var tableView: NSTableView?
+    private weak var keyboardHint: NSTextField?
     private var items: [SlashCommand] = []
     private var rows: [Row] = []
-    /// 当前查询串（如 "/runse"），选中执行时删除它
+    /// 当前查询串（如 "/polish"），选中执行时删除它
     private var query = ""
     private var target: NotesBridge.SelectionSnapshot?
     private var dismissedQuery: String?
@@ -93,6 +93,7 @@ final class SlashSuggestPanel: NSObject, NSWindowDelegate {
         guard let target = NotesBridge.shared.readTextSnapshot() else { hide(); return }
         self.target = target
         self.query = newQuery
+        refreshKeyboardHint()
         // 内容未变且面板已在：仅跟随光标移动，避免每 120ms 重绘
         if itemsEqual(newItems), let p = panel, p.isVisible {
             relocateIfNeeded(cursorRect)
@@ -248,7 +249,9 @@ final class SlashSuggestPanel: NSObject, NSWindowDelegate {
         scroll.translatesAutoresizingMaskIntoConstraints = false
 
         // 底部快捷键提示条
-        let footer = NSTextField(labelWithString: "↑↓ 选择    ⏎ 执行    esc 关闭    点击直接执行")
+        let footer = NSTextField(labelWithString: "")
+        keyboardHint = footer
+        refreshKeyboardHint()
         footer.font = .monospacedSystemFont(ofSize: 10, weight: .regular)
         footer.textColor = .tertiaryLabelColor
         footer.alignment = .center
@@ -276,6 +279,12 @@ final class SlashSuggestPanel: NSObject, NSWindowDelegate {
         ])
         panel = p
         tableView = table
+    }
+
+    private func refreshKeyboardHint() {
+        keyboardHint?.stringValue = KeywordListener.shared.isRunning
+            ? "↑↓ 选择    ⏎ 执行    esc 关闭    点击直接执行"
+            : "键盘监听未启动 · 可点击命令 · 请检查辅助功能授权"
     }
 
     /// Quartz 坐标（左上原点）→ AppKit 坐标（左下原点），并尽量放在光标下方

@@ -59,7 +59,7 @@ NotesCopilot 常驻菜单栏，为 Apple Notes 提供 AI 加工能力：全局�
 ## 📦 安装
 
 ### 下载使用
-1. 从 [GitHub Releases](https://github.com/m0nkee/notescopilot/releases/latest) 下载 `NotesCopilot-2.6.0-arm64.dmg`，打开后将 `NotesCopilot.app` 拖入「Applications」
+1. 从 [GitHub Releases](https://github.com/m0nkee/notescopilot/releases/latest) 下载 `NotesCopilot-2.6.1-arm64.dmg`，打开后将 `NotesCopilot.app` 拖入「Applications」
 2. 首次启动：系统设置 → 隐私与安全性 → **辅助功能** 中授权 NotesCopilot
 3. 未配置模型时打开设置，已配置时打开 AI 面板；之后可用菜单栏图标或 `⇧⌘Space` 呼出
 
@@ -94,7 +94,7 @@ scripts/package-dmg.sh
 |---|---|
 | 辅助功能（必需） | 读写 Notes 选区/光标、枚举格式菜单、AX 轮询通道、CGEvent 键击投递 |
 | 自动化（Apple Events） | 读取当前笔记身份以安全绑定选区/写回目标，以及创建笔记等脚本操作 |
-| 输入监控（可选） | 斜杠菜单键盘导航与关键词扩展；未授权仍可点击命令 |
+| 输入监控 | 当前键盘导航与关键词扩展使用已授权的辅助功能通道，无需额外开启 |
 | 完全磁盘访问（资料库需要） | 只读本机 Notes 数据库、建立正文搜索索引与导入模板 |
 
 Notes 中输入 `/` 或选中文字没有反应时，先查看 AI 面板的笔记上下文提示，或设置 → 通用与诊断。辅助功能未授权会阻断触发；读取笔记身份被拒绝时，还需在自动化中允许 NotesCopilot 控制 Notes。两项权限分开检查，输入监控不影响鼠标点击斜杠命令。
@@ -115,7 +115,7 @@ Notes 中输入 `/` 或选中文字没有反应时，先查看 AI 面板的笔�
 ```
 notescopilot/
 ├── build.sh              # 一键构建脚本（swiftc 直编，产出 .app）
-├── Info.plist            # Bundle 配置（v2.6.0，LSUIElement）
+├── Info.plist            # Bundle 配置（v2.6.1，LSUIElement）
 ├── src/                  # 源码（模块职责，见 docs/ARCHITECTURE.md）
 ├── tests/                # 九套回归（含写回、流式、资料库和产品逻辑）
 ├── scripts/run-tests.sh  # 测试回归脚本

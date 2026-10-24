@@ -1,4 +1,5 @@
 import Foundation
+import AppKit
 
 private var passed = 0
 private var failed = 0
@@ -60,9 +61,88 @@ private func urlFallbackTests() async {
     check(await task.value == nil, "取消后不继续读取标题来源")
 }
 
+@MainActor
+private func keyboardListenerTests() async {
+    let defaults = UserDefaults.standard
+    let previous = defaults.volatileDomain(forName: UserDefaults.argumentDomain)
+    defer { defaults.setVolatileDomain(previous, forName: UserDefaults.argumentDomain) }
+    func features(keywords: Bool, slash: Bool) {
+        var fixture = previous
+        fixture["nc.kw.enabled"] = keywords
+        fixture["nc.slash.global"] = slash
+        defaults.setVolatileDomain(fixture, forName: UserDefaults.argumentDomain)
+    }
+    var messages: [String] = []
+    let observer = NotificationCenter.default.addObserver(forName: .init("nc.kwStatus"), object: nil, queue: nil) { notification in
+        guard let message = notification.object as? String else { return }
+        MainActor.assumeIsolated { messages.append(message) }
+    }
+    defer { NotificationCenter.default.removeObserver(observer) }
+
+    features(keywords: false, slash: true)
+    var attempts = 0
+    var tapOptions: [UInt32] = []
+    let accessible = KeywordListener(accessibilityTrusted: { true }, tapFactory: { options in
+        attempts += 1
+        tapOptions.append(options.rawValue)
+        return nil
+    })
+    defer { accessible.stop() }
+    accessible.startIfNeeded()
+    check(attempts == 1 && tapOptions == [CGEventTapOptions.defaultTap.rawValue],
+          "辅助功能已授权时主动键盘tap不受输入监控未授权阻断")
+    check(!accessible.isRunning, "tap工厂失败不会误报键盘导航或关键词监听已运行")
+    check(messages.last?.contains("键盘") == true && messages.last?.contains("输入监控") == false
+          && messages.last?.contains("Markdown") == false,
+          "tap失败只报告键盘导航与关键词状态而不要求额外输入监控")
+    try? await Task.sleep(nanoseconds: 3_300_000_000)
+    check(attempts >= 2 && !accessible.isRunning, "创建tap失败后仍按3秒间隔重试且不误报成功")
+    accessible.stop()
+
+    features(keywords: true, slash: false)
+    var blockedAttempts = 0
+    var trusted = false
+    let inaccessible = KeywordListener(accessibilityTrusted: { trusted }, tapFactory: { _ in
+        blockedAttempts += 1
+        return nil
+    })
+    defer { inaccessible.stop() }
+    inaccessible.startIfNeeded()
+    check(blockedAttempts == 0 && !inaccessible.isRunning, "缺少辅助功能时不会创建可拦截按键的主动tap")
+    check(messages.last?.contains("辅助功能") == true && messages.last?.contains("Markdown") == false,
+          "辅助功能缺失给出准确键盘功能授权提示")
+    trusted = true
+    try? await Task.sleep(nanoseconds: 3_300_000_000)
+    check(blockedAttempts >= 1 && !inaccessible.isRunning, "辅助功能授权变化后重试真实启动路径但nil工厂不代表成功")
+    let attemptsBeforeRevocation = blockedAttempts
+    trusted = false
+    inaccessible.handleTapDisabled()
+    inaccessible.startIfNeeded()
+    check(blockedAttempts == attemptsBeforeRevocation && !inaccessible.isRunning
+          && messages.last?.contains("辅助功能") == true,
+          "权限撤销的禁用回调不盲目重启主动tap而是等待重新授权")
+    inaccessible.stop()
+
+    features(keywords: false, slash: false)
+    var disabledAttempts = 0
+    let disabled = KeywordListener(accessibilityTrusted: { true }, tapFactory: { _ in
+        disabledAttempts += 1
+        return nil
+    })
+    defer { disabled.stop() }
+    disabled.startIfNeeded()
+    check(disabledAttempts == 0 && !disabled.isRunning, "关键词与斜杠菜单均关闭时不启动键盘tap")
+    messages.append("菜单键盘导航与关键词监听已启动。")
+    let messageCountBeforeRestart = messages.count
+    disabled.restart()
+    check(messages.count == messageCountBeforeRestart + 1 && messages.last == "菜单键盘导航与关键词扩展已关闭。",
+          "关闭全部键盘功能后restart会发布关闭状态以替换界面缓存的已启动消息")
+}
+
 renderingTests()
 templateImportTests()
 Task { @MainActor in
+    await keyboardListenerTests()
     await urlFallbackTests()
     print("product-tests: \(passed) passed, \(failed) failed")
     exit(failed == 0 ? 0 : 1)

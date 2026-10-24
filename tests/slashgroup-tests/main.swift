@@ -99,6 +99,54 @@ do {
     check(AXSlashWatcher.matchSlashToken("/format")?.name == "格式检查", "matchSlashToken 命中格式检查")
 }
 
+// 英文别名同时用于菜单展示、前缀筛选和 Notes 正文执行，不保留拼音别名。
+do {
+    let old = TemplateStore.templates
+    defer { TemplateStore.templates = old }
+    TemplateStore.templates = []
+    let commands = buildSlashCommands()
+    let routes: [(name: String, legacy: String, english: String, instruction: String)] = [
+        ("续写", "xuxie", "continue", "续写"),
+        ("总结", "zongjie", "summarize", "要点"),
+        ("翻译", "fanyi", "translate", "翻译成英文"),
+        ("润色", "runse", "polish", "润色"),
+        ("解释", "jieshi", "explain", "关键概念"),
+        ("扩写", "kuoxie", "expand", "扩展"),
+        ("要点", "yaodian", "keypoints", "Markdown 列表"),
+        ("标题", "biaoti", "titles", "3 个候选标题"),
+    ]
+    for route in routes {
+        check(commands.first { $0.name == route.name }?.alias == route.english,
+              "\(route.name) 菜单展示英文别名 /\(route.english)")
+        let suggested = AXSlashWatcher.suggestCandidates(for: "/" + route.english)
+        let partial = AXSlashWatcher.suggestCandidates(for: "/" + String(route.english.prefix(3)))
+        check(suggested.first?.name == route.name && partial.contains { $0.name == route.name && $0.alias == route.english },
+              "/\(route.english) 完整与前缀查询筛选对应命令")
+        let matched = AXSlashWatcher.matchSlashToken("/" + route.english.uppercased())
+        let correctAction: Bool
+        if let matched, case .run(let instruction) = matched.action {
+            correctAction = matched.name == route.name && instruction.contains(route.instruction)
+        } else { correctAction = false }
+        check(correctAction, "/\(route.english) 不区分大小写并匹配对应 AI 动作")
+        let tail = AXSlashWatcher.matchAXSlashTail("合成段落 /\(route.english) ")
+        check(tail?.cmd.name == route.name && tail?.cmd.alias == route.english
+              && tail?.deleteCount == route.english.count + 2,
+              "/\(route.english) 加空格执行保留正确目标与删除长度")
+        check(AXSlashWatcher.matchSlashToken("/" + route.legacy) == nil
+              && !AXSlashWatcher.suggestCandidates(for: "/" + route.legacy).contains { $0.name == route.name },
+              "旧拼音 /\(route.legacy) 不再匹配或筛选内置命令")
+    }
+    let aliases = commands.map { $0.alias.lowercased() }.filter { !$0.isEmpty }
+    check(Set(aliases).count == aliases.count, "英文替换后所有内置别名互不冲突")
+    let titleAction = AXSlashWatcher.matchSlashToken("/title")?.action
+    if let titleAction, case .format(.title) = titleAction { check(true, "/title 保留 Notes 标题格式命令") }
+    else { check(false, "/title 保留 Notes 标题格式命令") }
+    let titleSuggestions = AXSlashWatcher.suggestCandidates(for: "/tit")
+    check(titleSuggestions.contains { $0.alias == "titles" && $0.name == "标题" }
+          && titleSuggestions.contains { $0.alias == "title" && $0.name == "标题样式" },
+          "/tit 同时展示 AI 拟标题与 Notes 标题格式，完整命令各自可用")
+}
+
 // URL 路径不能抢先命中 /title 等命令并删掉用户的网址。
 do {
     check(AXSlashWatcher.activeSlashQuery("https://example.com/title") == nil, "URL 路径不弹斜杠菜单")

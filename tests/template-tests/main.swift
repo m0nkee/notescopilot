@@ -137,7 +137,7 @@ do {
     check(AXSlashWatcher.matchSlashToken("/会议纪要")?.name == "会议纪要", "中文名命中 /会议纪要")
     check(AXSlashWatcher.matchSlashToken("/signoff")?.name == "Sign-off", "英文名模板走拼音/英文别名")
     check(AXSlashWatcher.matchSlashToken("/huiyijiyao") == nil, "中文名无拼音别名（IME 限制，预期不命中）")
-    check(AXSlashWatcher.matchSlashToken("/x")?.name == "续写", "前缀唯一命中 /x → 续写")
+    check(AXSlashWatcher.matchSlashToken("/cont")?.name == "续写", "前缀唯一命中 /cont → 续写")
     check(AXSlashWatcher.matchSlashToken("/不存在zz") == nil, "未知命令不命中")
     check(AXSlashWatcher.matchSlashToken("/") == nil, "单个斜杠不命中")
 }

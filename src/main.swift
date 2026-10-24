@@ -215,7 +215,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let statusLine = NSMenuItem(title: "键盘监听：检查中…", action: nil, keyEquivalent: "")
         statusLine.isEnabled = false
         menu.addItem(statusLine)
-        add("打开输入监控设置…", #selector(openListenEventSettings), target: self)
         add("权限自检（写入日志）", #selector(selfCheck), target: self)
         menu.addItem(.separator())
         add("打开面板（全局快捷键 ⇧⌘Space）", #selector(showPanel), target: self)
@@ -244,15 +243,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         } else if cgRunning {
             first.title = "键盘监听：● 运行中（斜杠命令可用）"
         } else if axRunning {
-            first.title = "斜杠命令：● AX 通道运行中（Notes 内可用）"
+            first.title = "斜杠命令：● AX 通道可用，键盘导航未启动"
         } else {
-            first.title = "键盘监听：○ 未授权（点击「打开输入监控设置」勾选本应用）"
-        }
-    }
-
-    @objc func openListenEventSettings() {
-        if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent") {
-            NSWorkspace.shared.open(url)
+            first.title = "键盘监听：○ 未启动，请检查辅助功能授权"
         }
     }
 
@@ -265,7 +258,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         alert.messageText = "权限状态"
         alert.informativeText = """
         辅助功能（AX 通道依赖）：\(ax ? "✅ 已授权" : "❌ 未授权——这是斜杠命令不生效的最可能原因")
-        输入监控（键盘监听通道依赖）：\(listen ? "✅ 已授权" : "⚠️ 未授权（影响命令键盘导航与关键词扩展，可用鼠标点击命令）")
+        键盘导航与关键词扩展：\(KeywordListener.shared.isRunning ? "✅ 监听已启动" : "监听未启动，可用鼠标点击命令")
+        输入监控（当前键盘导航无需额外开启）：\(listen ? "✅ 已授权" : "未授权")
         Notes 访问：\(NotesBridge.shared.refreshAccessIssue()?.message ?? "未记录访问错误；请在 Notes 正文尝试命令或选区加工。")
 
         二进制路径：\(Bundle.main.bundleURL.path)

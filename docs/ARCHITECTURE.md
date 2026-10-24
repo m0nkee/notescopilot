@@ -8,7 +8,7 @@ NotesCopilot 为 Swift 单进程应用（`swiftc` 直编，零第三方依赖）
 |---|---|
 | `main.swift` | 应用主体：菜单栏 StatusItem、AI 面板窗口、全局快捷键 ⇧⌘Space（Carbon EventHotKey）、设置/资料库窗口、应用生命周期 |
 | `Chat.swift` | `ChatEngine` + `AIService`：OpenAI 兼容端点 SSE 流式请求、多模型配置、上下文注入 |
-| `Slash.swift` | 斜杠命令引擎：`/` 触发、命令注册表（AI/Markdown/模板/工具分组）、`NCLog` 诊断日志、KeywordListener（输入监控通道） |
+| `Slash.swift` | 斜杠命令引擎：`/` 触发、命令注册表（AI/Markdown/模板/工具分组）、`NCLog` 诊断日志、KeywordListener（辅助功能授权的 active event tap） |
 | `SlashSuggest.swift` | 斜杠命令候选面板 UI（分组列表、键盘导航） |
 | `SelectionAI.swift` | **选中加工条**：`SelectionWatcher`（0.2s AX 轮询）、`SelectionAIPanel`（AI/自定义/格式三段分组）、`SelectionKeyPanel`/`ActivatingTextField`（面板键盘焦点）、`NotesFormatButton`（格式按钮纯逻辑，可单测） |
 | `NotesBridge.swift` | **Notes 桥接核心**：选区/光标读写、`formatMenuItems`（13 项格式菜单）、AX 菜单枚举与 AXPress、快捷键兜底（AXMenuItemCmdChar/Modifiers → CGEvent）、`selectionSignature` |
@@ -29,6 +29,7 @@ NotesCopilot 为 Swift 单进程应用（`swiftc` 直编，零第三方依赖）
 
 - AX 轮询不依赖「输入监控」权限，需要辅助功能授权；完整快照另通过自动化读取笔记身份，绑定安全的写回目标
 - `AXSlashWatcher`（0.12s）是 Notes 正文斜杠/Markdown/URL 的唯一执行通道，各功能独立读取开关；键盘监听只负责命令导航和关键词扩展
+- `KeywordListener` 使用 `.defaultTap` 拦截菜单导航键，由辅助功能授权和实际 tap 创建/启用结果决定是否启动；不以 listen-only 的输入监控预检提前阻止启动。撤权时停止旧 tap；创建或重新启用失败后限速重试，超时且授权仍有效时可直接恢复现有 tap。
 - 命令删除绑定原 Notes 快照，通过 AX 区间替换并等待删除确认，不向其他应用投递全局退格
 - 主面板、选中加工和模板写回均再次校验笔记、正文、选区与操作有效期；取消期间不执行迟到写入
 - `SelectionWatcher`（0.2s）轮询选区，出现稳定选区后弹出加工条

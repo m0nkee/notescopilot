@@ -173,3 +173,32 @@ Notes 中 `/`、选区弹条及笔记写回仍待系统授权实际生效后的�
 - DMG 的 SHA-256 为 `f50d4af6afe00c53974b876e1341f69e72197140209244ab2b5cd3330c4abc59`，另提供 `SHA256SUMS.txt`。
 - 当前仅有 Apple Development 签名，尚未进行 Developer ID Application 签名和 Apple 公证。`spctl --assess --type execute` 实际返回 `rejected`；不能将包完整性验证通过表述为 Gatekeeper 信任验证通过，此限制已写入安装及发布说明。
 - 发布准备只改变版本元数据、打包脚本和文档；功能源码与此前真机验收保持一致。构建包不包含配置、API Key、笔记、测试日志或本地回滚包。
+
+### 斜杠菜单键盘导航修复（2026-10-24，未发布）
+
+- 用户报告菜单能弹出，但上下键无法正常选择。原生产进程实际显示辅助功能已授权、输入监控未授权，日志表明监听在输入监控预检失败后直接返回，没有尝试创建 tap。个人合成测试笔记中可弹出菜单，工具向 Notes 发送一次 Down 后菜单高亮没有变化。
+- Apple [WWDC19 安全说明](https://developer.apple.com/videos/play/wwdc2019/701/) 区分 listen-only 的输入监控授权与 active `.defaultTap` 的辅助功能授权。当前代码用后者拦截方向键，却以前者的预检硬性阻止启动，是本轮可确定的代码问题；没有发现同内容轮询每次重置选择的证据。
+- 用真实 `KeywordListener.startIfNeeded` 加最小权限/工厂注入建立红测，先复现 **23 通过、4 失败**，日志 `slash-keyboard-red.log`。移除输入监控门禁和重复授权请求，改由 AX 授权及实际 tap 创建/启用结果判断；`isRunning` 查询真实启用状态，禁用或撤权时清理旧 tap 并保留 3 秒重试。
+- 修复后产品回归 **30/30**，root 独立重跑产品和斜杠分组共 **61/61**，日志 `slash-keyboard-green.log`、`slash-keyboard-root.log`。工厂全部返回 nil，因此仅证明真实启动路径、失败提示、限速重试和权限变化处理，不将其误记为真实系统 tap 安装成功。
+- 设置页、菜单诊断和斜杠菜单底部改为显示实际监听可用性，移除错误的额外输入监控要求。14 种隔离原生布局通过并检查了通用页排版，日志 `ui-keyboard-fix.log`，图片 `build/ui-keyboard-fix/`。
+- 独立构建至 `build/keyboard-fix/NotesCopilot.app`，稳定开发签名及严格验证通过，源码哈希 `keyboard-fix-source-sha256.txt`。切换前 CUA 明确报告 Mac 锁屏，已请求用户解锁；旧生产包和配置未替换。真实方向键、回车、Esc 验收仍待继续，GitHub 的 v2.6.0 包未改动。
+
+### 内置英文别名与合并验收（2026-10-24，未发布）
+
+- 按用户要求将八个内置 AI 命令的拼音别名替换为 `continue`、`summarize`、`translate`、`polish`、`explain`、`expand`、`keypoints`、`titles`；`title` 继续对应 Notes 标题格式，用户模板名称保持原样。同步菜单数据、帮助文字、日志示例和模板匹配回归。
+- 新增真实命令注册表、筛选、大小写匹配、正文空格触发、动作与删除长度的回归，替换前复现 **33 通过、41 失败**，日志 `english-alias-red.log`。旧拼音不再匹配内置命令。
+- 键盘功能全部关闭时会发布关闭状态，避免设置页残留“已启动”；新增回归先复现 **30 通过、1 失败**，修复后产品套件 **31/31**，日志 `slash-keyboard-disabled-red.log`、`slash-keyboard-disabled-green.log`。
+- 英文别名定向回归 **74/74**；root 独立重跑斜杠、产品与模板三套共 **146/146**（74/31/41），日志 `english-alias-green.log`、`english-keyboard-root.log`。14 种隔离原生布局重新通过，日志 `ui-english-keyboard.log`，并检查了通用权限页排版。
+- 合并包稳定开发签名、严格验证及源码校验通过后切换至 `build/NotesCopilot.app`，旧包保留在 `build/retired-keyboard.yzkJjj/NotesCopilot.app.backup`。真机 AX 显示已授权，但主动监听仍失败；随后仅增加创建/启用阶段诊断、重建签名并切换，明确记录 `tapCreate 返回空值`，并非立即检查 `tapIsEnabled` 导致失败。该阶段旧包保留在 `build/retired-keyboard.4HC1re/NotesCopilot.app.backup`。
+- 只读系统日志中，当前进程的 Accessibility 与 PostEvent 授权均返回允许；另有旧签名的 ListenEvent 记录匹配失败。Secure Event Input 检查为 false，全局 event tap 列表可正常读取。
+- 在正常退出应用后，仅执行 `tccutil reset ListenEvent local.notescopilot.app` 清除该应用的失效监听记录，再启动同一二进制。AX 授权继续有效，实际日志记录“主动 tap 已启用”，不再创建失败；没有额外授予输入监控、重置其他应用权限或重启系统会话。该对照试验说明本机旧记录是剩余阻断；代码错误的输入监控门禁与环境残留均已分别处理。
+- CUA 在个人合成测试笔记中实际写入 `/tra`，未从工具所选窗口观察到菜单；随后用户用真实输入明确确认显示“翻译 /translate”，英文别名已在本机运行包生效。监听恢复后，用户实按两次 ↓ 再一次 ↑，明确确认“续写 → 总结 → 翻译 → 总结”切换正常；再明确确认 Esc 关闭和 `/set` 回车打开设置两项都正常。日志同时记录“建议面板执行：设置，删除 4 字符”。
+- 最终通过原生界面恢复了重启前的合成上下文与翻译任务草稿，读回一致；模型设置仍显示“已保存”。最终运行源码哈希为 `english-keyboard-diagnostic-source-sha256.txt`。本轮尚未提交代码或更新 GitHub Release。
+
+### v2.6.1 发布包验证（2026-10-24）
+
+- 将本轮修复归入 2.6.1，build 3；功能源码与上文用户真实验收的运行包一致，仅更新版本元数据及发布文档。源码哈希为 `release-v2.6.1-source-sha256.txt`。
+- 独立构建至 `build/release-v2.6.1/NotesCopilot.app`，使用稳定 Apple Development 身份签名；严格签名校验通过。未替换正在运行的已验收应用或配置。
+- 生成 `NotesCopilot-2.6.1-arm64.dmg`，`hdiutil verify` 通过。只读挂载后，应用逐文件比对、2.6.1/build 3、arm64 架构、严格签名与 Applications 安装软链接均通过验证；验证后镜像已卸载。
+- DMG SHA-256：`ae533c47b65a6292c58362d3048a633c2e3dacd8ec8eb578bf97350055a2b0ab`，随包提供 `SHA256SUMS.txt`。包中仅包含应用与安装入口，不包含配置、API Key、笔记或测试日志。
+- 当前仍为开发签名、尚未公证，`spctl --assess --type execute` 实际返回 `rejected`，发行说明已明确此限制。发布使用标签 `v2.6.1`；上传时须同时验证远端附件校验和。

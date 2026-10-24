@@ -831,7 +831,7 @@ enum SettingsPage: String, CaseIterable, Identifiable {
         case .prompt: return "AI 的角色设定，随每次请求发送"
         case .markdown: return "在 Notes 里键入 # / ## / [] / > / ``` / - / * / 1. + 空格 自动套格式"
         case .templates: return "在提示词输入框键入 / 即可通过斜杠命令插入"
-        case .expansion: return "Notes AI 交互需辅助功能与 Notes 自动化；关键词扩展另需输入监控"
+        case .expansion: return "Notes AI 交互需辅助功能与 Notes 自动化；键盘导航与关键词扩展使用辅助功能授权"
         case .general: return "登录启动、权限检查与连接诊断"
         }
     }
@@ -905,7 +905,7 @@ struct SettingsView: View {
     @State private var testingModel = false
     @State private var importingTemplates = false
     @State private var axAuthorized = false
-    @State private var inputAuthorized = false
+    @State private var keyboardRunning = false
     @State private var notesAccessIssue: NotesAccessIssue?
     /// 当前导航页（Magpie 左侧导航）
     @State private var page: SettingsPage = .model
@@ -918,8 +918,9 @@ struct SettingsView: View {
         }
         .frame(minWidth: 900, minHeight: 620)
         .disabled(recoveringCredentials)
-        .onReceive(NotificationCenter.default.publisher(for: .init("nc.kwStatus"))) { n in
+        .onReceive(NotificationCenter.default.publisher(for: .init("nc.kwStatus")).receive(on: DispatchQueue.main)) { n in
             kwStatus = n.object as? String
+            refreshPermissionStatus()
         }
         .onReceive(NotificationCenter.default.publisher(for: ProfileStore.errorNotification).receive(on: DispatchQueue.main)) { note in
             statusText = note.object as? String ?? "配置保存失败，请检查钥匙串权限。"
@@ -1706,16 +1707,16 @@ struct SettingsView: View {
                 Toggle("在 Notes 正文键入 / 显示命令菜单", isOn: $slashGlobal)
                     .toggleStyle(.switch)
                 if slashGlobal {
-                    Text("输入 / 后可点击命令，或键入 /runse、/zongjie、/fanyi 等别名加空格。上下文使用当前选区或光标段落；AI 完成后确认写回。获取笔记上下文与写回需辅助功能及 Notes 自动化权限，以确认当前笔记身份。")
+                    Text("输入 / 后可点击命令，或键入 /polish、/summarize、/translate 等别名加空格。上下文使用当前选区或光标段落；AI 完成后确认写回。获取笔记上下文与写回需辅助功能及 Notes 自动化权限，以确认当前笔记身份。")
                         .font(.caption).foregroundColor(.secondary)
-                    Text("中文名称与拼音别名均可筛选；键盘 ↑↓ / 回车导航需要输入监控，未授权时仍可点击命令。")
+                    Text("中文名称与英文别名均可筛选；辅助功能授权后可用 ↑↓ 选择、回车执行、Esc 关闭。键盘监听暂不可用时，仍可点击命令。")
                         .font(.caption2).foregroundColor(.secondary)
                 }
             }
             card("keyboard", "关键词文本扩展") {
                 Toggle("启用关键词文本扩展", isOn: $kwEnabled).toggleStyle(.switch)
                 if kwEnabled {
-                    Text("需在「系统设置 › 隐私与安全性 › 输入监控」授权本应用；触发词不能含空格。")
+                    Text("使用辅助功能授权的键盘监听；触发词不能含空格。")
                         .font(.caption).foregroundColor(.secondary)
                     ForEach($rules) { $r in
                         HStack(spacing: 6) {
@@ -1787,8 +1788,10 @@ struct SettingsView: View {
                       systemImage: axAuthorized ? "checkmark.circle" : "exclamationmark.circle")
                     .font(.caption).foregroundColor(axAuthorized ? .secondary : .orange)
                 if let issue = notesAccessIssue { NotesAccessNoticeView(issue: issue) }
-                Label(inputAuthorized ? "命令键盘导航与关键词扩展：已授权" : "命令键盘导航与关键词扩展：输入监控未授权（可用鼠标点击命令）",
-                      systemImage: inputAuthorized ? "checkmark.circle" : "info.circle").font(.caption).foregroundColor(.secondary)
+                Label(keyboardRunning ? "命令键盘导航与关键词扩展：监听已启动" : "命令键盘导航与关键词扩展：监听未启动（可用鼠标点击命令）",
+                      systemImage: keyboardRunning ? "checkmark.circle" : "info.circle").font(.caption).foregroundColor(.secondary)
+                Text("键盘导航使用辅助功能授权，无需额外开启输入监控。")
+                    .font(.caption).foregroundColor(.secondary)
                 Text("笔记库及模板导入需要完全磁盘访问权限；创建笔记、读取笔记身份及浏览器标题会在首次使用时请求自动化权限。")
                     .font(.caption).foregroundColor(.secondary)
                 HStack {
@@ -1796,7 +1799,6 @@ struct SettingsView: View {
                         NotesBridge.shared.openAccessibilityPrefs()
                     }
                     Button("自动化设置") { NotesBridge.shared.openAutomationPrefs() }
-                    Button("输入监控") { openPrivacy("Privacy_ListenEvent") }
                     Button("完全磁盘访问") { openPrivacy("Privacy_AllFiles") }
                     Button("重新检查") { refreshPermissionStatus() }
                 }.controlSize(.small)
@@ -1857,7 +1859,7 @@ struct SettingsView: View {
     private func refreshPermissionStatus() {
         notesAccessIssue = notesAccessIssueProvider()
         axAuthorized = notesAccessIssue != .accessibilityRequired
-        inputAuthorized = CGPreflightListenEventAccess()
+        keyboardRunning = KeywordListener.shared.isRunning
     }
 
     private func openPrivacy(_ pane: String) {
