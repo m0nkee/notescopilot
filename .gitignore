@@ -7,6 +7,18 @@
 build/
 *.o
 *.cstemp
+*.app/
+*.dmg
+
+# 本地凭据
+.env
+.env.*
+!.env.example
+secrets.json
+credentials.json
+*.key
+*.p12
+*.pfx
 
 # 测试与工具编译产物（可执行文件，目录名与套件同名）
 tests/selai-tests/selai-tests
@@ -19,6 +31,7 @@ tools/navtest
 tools/px2
 tools/render_settings
 tools/dbg
+tools/pixprobe
 
 # Xcode / Swift
 DerivedData/

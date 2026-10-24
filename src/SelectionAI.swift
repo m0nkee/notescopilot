@@ -43,7 +43,7 @@ enum NotesFormatButton {
     nonisolated static func items(presenting titles: [String]) -> [NotesFormatItem] {
         let set = Set(titles)
         return NotesBridge.formatMenuItems
-            .filter { set.contains($0.menu) }
+            .filter { NotesBridge.formatMenuTitles(for: $0.menu).contains { set.contains($0) } }
             .map { NotesFormatItem(menuTitle: $0.menu, label: $0.label) }
     }
 
@@ -90,13 +90,46 @@ enum SelAIState: Equatable {
     }
 }
 
+/// Coordinates the real poll's cheap selection signature and fallible full
+/// snapshot preparation. A show is observable only after preparation succeeds.
+struct SelectionPollingState {
+    private(set) var state: SelAIState = .idle
+    private var failedSignature: String?
+    private var nextSnapshotAttempt: Date?
+
+    mutating func poll(currentSig: String?, now: Date, prepareShow: () -> Bool) -> SelAIState.StepAction {
+        if currentSig != failedSignature {
+            failedSignature = nil
+            nextSnapshotAttempt = nil
+        }
+        if let deadline = nextSnapshotAttempt, now < deadline { return .none }
+        let (next, action) = SelAIState.step(state, currentSig: currentSig)
+        if action == .show, !prepareShow() {
+            if let currentSig {
+                state = .watching(sig: currentSig, stable: 1)
+                failedSignature = currentSig
+                // Permission failures must stay recoverable without retrying
+                // an Apple Event on every 0.2-second selection poll.
+                nextSnapshotAttempt = now.addingTimeInterval(1)
+            }
+            return .none
+        }
+        state = next
+        if action == .show {
+            failedSignature = nil
+            nextSnapshotAttempt = nil
+        }
+        return action
+    }
+}
+
 // MARK: - 轮询 watcher
 
 @MainActor
 final class SelectionWatcher {
     static let shared = SelectionWatcher()
     private var timer: Timer?
-    private var state: SelAIState = .idle
+    private var polling = SelectionPollingState()
 
     private var enabled: Bool {
         UserDefaults.standard.object(forKey: "nc.selai.enabled") == nil
@@ -115,7 +148,7 @@ final class SelectionWatcher {
 
     func stop() {
         timer?.invalidate(); timer = nil
-        state = .idle
+        polling = SelectionPollingState()
         SelectionAIPanel.shared.hide()
     }
 
@@ -123,15 +156,22 @@ final class SelectionWatcher {
         guard enabled else { return }
         // 用户正在面板输入框里打字（面板持 key、Notes 不在前台）：挂起轮询，避免面板被误收起
         if SelectionAIPanel.shared.panelIsKey { return }
+        if SelectionAIPanel.shared.isRetainingResult { return }
+        if SelectionAIPanel.shared.cancelIfTargetChanged() { polling = SelectionPollingState() }
         // 上下文里的选中区间签名：仅选区起止，不读全文（省一次 AX 取值）
         let sig: String? = NotesBridge.shared.selectionSignature()
-        let (next, action) = SelAIState.step(state, currentSig: sig)
-        state = next
+        var preparedSnapshot: NotesBridge.SelectionSnapshot?
+        let action = polling.poll(currentSig: sig, now: Date()) {
+            guard NotesBridge.isFrontmostNotes(),
+                  let snapshot = NotesBridge.shared.readSelectionSnapshot(),
+                  sig == "\(snapshot.range.location):\(snapshot.range.length)" else { return false }
+            preparedSnapshot = snapshot
+            return true
+        }
         switch action {
         case .show:
             // 弹出时才做完整快照（文本 + 边界矩形 + 元素引用）
-            guard NotesBridge.isFrontmostNotes(),
-                  let snap = NotesBridge.shared.readSelectionSnapshot() else { break }
+            guard let snap = preparedSnapshot else { break }
             SelectionAIPanel.shared.showMenu(for: snap)
             NCLog.log("选中加工面板弹出：选中 \(snap.text.count) 字 @\(snap.range.location)")
         case .hide:
@@ -143,6 +183,106 @@ final class SelectionWatcher {
 }
 
 // MARK: - 悬浮面板（非激活，hover 风格）
+
+/// 请求状态与选区一起失效；迟到的完成和错误均不能更新新选区。
+@MainActor
+final class SelectionAIRequest {
+    typealias Completion = (String, String) async throws -> String
+    private let complete: Completion?
+    private var requestID: UUID?
+    private var writeOperationID: UUID?
+    private(set) var snapshot: NotesBridge.SelectionSnapshot?
+    private(set) var resultText = ""
+    private(set) var busy = false
+    private(set) var lastError: String?
+    private(set) var task: Task<Void, Never>?
+    var onChange: (() -> Void)?
+
+    init(complete: Completion? = nil) { self.complete = complete }
+
+    func select(_ snapshot: NotesBridge.SelectionSnapshot) {
+        cancel()
+        self.snapshot = snapshot
+    }
+
+    func cancel() {
+        writeOperationID = nil
+        requestID = nil
+        task?.cancel()
+        task = nil
+        snapshot = nil
+        resultText = ""
+        lastError = nil
+        busy = false
+    }
+
+    func run(instruction: String) {
+        guard let snapshot else { return }
+        writeOperationID = nil
+        requestID = nil
+        task?.cancel()
+        task = nil
+        resultText = ""
+        lastError = nil
+        let operation: Completion
+        do {
+            if let complete {
+                operation = complete
+            } else {
+                let configuration = try AIRequestConfiguration.current()
+                operation = { instruction, context in
+                    try await AIService.complete(instruction: instruction, context: context, configuration: configuration)
+                }
+            }
+        } catch {
+            busy = false
+            lastError = error.localizedDescription
+            onChange?()
+            return
+        }
+        let id = UUID()
+        requestID = id
+        busy = true
+        onChange?()
+        task = Task { @MainActor [weak self] in
+            do {
+                let text = try await operation(instruction, snapshot.text)
+                guard let self, !Task.isCancelled, self.requestID == id,
+                      self.snapshot?.matches(snapshot) == true else { return }
+                self.resultText = text
+                self.busy = false
+                self.task = nil
+                self.onChange?()
+            } catch {
+                guard let self, !Task.isCancelled, self.requestID == id else { return }
+                self.lastError = error.localizedDescription
+                self.busy = false
+                self.task = nil
+                self.onChange?()
+            }
+        }
+    }
+
+    /// 写入失败不消费结果；关闭面板或切换请求后，迟到的写入回调不影响新结果。
+    func writeResult(using writer: (NotesBridge.SelectionSnapshot, String, @escaping () -> Bool, @escaping (String?) -> Void) -> Void,
+                     completion: @escaping (String?) -> Void) {
+        guard let snapshot, !resultText.isEmpty else { return }
+        let result = resultText
+        let id = UUID()
+        writeOperationID = id
+        let valid: () -> Bool = { [weak self] in
+            guard let self else { return false }
+            return self.writeOperationID == id && self.snapshot?.matches(snapshot) == true
+                && self.resultText == result && !self.busy
+        }
+        writer(snapshot, result, valid) { [weak self] error in
+            guard let self, valid() else { return }
+            self.writeOperationID = nil
+            self.lastError = error
+            completion(error)
+        }
+    }
+}
 
 /// 可成为 key window 的 borderless 面板：否则自定义指令输入框拿不到键盘焦点（默认 borderless canBecomeKey=false）
 /// .nonactivatingPanel 保证弹出时不抢 Notes 焦点；但要输入时需应用内激活（见 ActivatingTextField）
@@ -169,9 +309,14 @@ final class SelectionAIPanel: NSObject {
 
     private var panel: NSPanel?
     private var mode: Mode = .hidden
-    private var snapshot: NotesBridge.SelectionSnapshot?
-    private var resultText: String = ""
-    private var pendingInstruction: String = ""
+    private let request = SelectionAIRequest()
+    private var snapshot: NotesBridge.SelectionSnapshot? { request.snapshot }
+    private var resultText: String { request.resultText }
+
+    override init() {
+        super.init()
+        request.onChange = { [weak self] in self?.requestDidChange() }
+    }
 
     // 菜单态控件
     private var actionsRow: NSStackView?
@@ -184,6 +329,16 @@ final class SelectionAIPanel: NSObject {
     private var resultButtons: NSStackView?
     private var statusLabel: NSTextField?
     private var spinner: NSProgressIndicator?
+    private var replaceButton: NSButton?
+    private var appendButton: NSButton?
+    private var copyButton: NSButton?
+    private var retryButton: NSButton?
+    private var closeButton: NSButton?
+    private var lastInstruction: (text: String, name: String)?
+    private(set) var isRetainingResult = false
+    private var writing = false
+    private var expandedFormats = false
+    private var moreFormatsButton: NSButton?
 
     var isVisible: Bool { panel?.isVisible ?? false }
 
@@ -191,31 +346,45 @@ final class SelectionAIPanel: NSObject {
     var panelIsKey: Bool { panel?.isKeyWindow ?? false }
 
     func hide() {
+        let heldFocus = panelIsKey
+        request.cancel()
+        spinner?.stopAnimation(nil)
         panel?.orderOut(nil)
         mode = .hidden
-        yieldToNotes {}
+        isRetainingResult = false
+        writing = false
+        if heldFocus { yieldToNotes {} }
+    }
+
+    @discardableResult
+    func cancelIfTargetChanged() -> Bool {
+        if isRetainingResult { return false }
+        guard let snapshot, !panelIsKey else { return false }
+        guard !NotesBridge.shared.isCurrent(snapshot) else { return false }
+        hide()
+        return true
     }
 
     /// 面板输入期间本应用是前台；交给 Notes 的动作前先把前台还给 Notes
-    private func yieldToNotes(then action: @escaping () -> Void = {}) {
+    private func yieldToNotes(then action: @escaping @MainActor () -> Void = {}) {
         if NSWorkspace.shared.frontmostApplication?.bundleIdentifier == NotesBridge.notesBundleID {
             action()
             return
         }
+        guard NSWorkspace.shared.frontmostApplication?.processIdentifier == ProcessInfo.processInfo.processIdentifier else {
+            return
+        }
         NSWorkspace.shared.runningApplications.first(where: { $0.bundleIdentifier == NotesBridge.notesBundleID })?.activate()
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35, execute: action)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { action() }
     }
 
     // MARK: 弹出菜单
 
     func showMenu(for snap: NotesBridge.SelectionSnapshot) {
-        snapshot = snap
-        resultText = ""
+        isRetainingResult = false
+        writing = false
+        request.select(snap)
         let p = ensurePanel()
-        guard mode == .hidden else {
-            // 面板已在：选区变了，更新快照即可
-            return
-        }
         switchTo(.menu)
         let h = menuHeight()
         layout(size: NSSize(width: 380, height: h))
@@ -234,70 +403,60 @@ final class SelectionAIPanel: NSObject {
 
     /// 菜单态面板高度：AI 行 + 自定义行 + 格式行数 × 27 + 底部余量
     private func menuHeight() -> CGFloat {
-        122 + CGFloat(formatRows.count) * 27
+        122 + CGFloat(expandedFormats ? formatRows.count : min(1, formatRows.count)) * 27
     }
 
     // MARK: 加工执行
 
     private func run(instruction: String, actionName: String) {
-        guard let snap = snapshot ?? NotesBridge.shared.readSelectionSnapshot() else { return }
-        snapshot = snap
-        pendingInstruction = instruction
+        guard let snap = snapshot else { return }
+        lastInstruction = (instruction, actionName)
+        isRetainingResult = false
         switchTo(.working)
         statusLabel?.stringValue = "「\(actionName)」加工中…（选中 \(snap.text.count) 字）"
         spinner?.startAnimation(nil)
-        Task { @MainActor in
-            do {
-                let out = try await AIService.complete(instruction: instruction, context: snap.text)
-                self.spinner?.stopAnimation(nil)
-                self.resultText = out
-                self.switchTo(.result)
-                self.layout(size: NSSize(width: 440, height: 236))
-                if let snap2 = self.snapshot {
-                    self.place(below: snap2.bounds, size: NSSize(width: 440, height: 236))
-                }
-                NCLog.log("选中加工完成：「\(actionName)」→ \(out.count) 字")
-            } catch {
-                self.spinner?.stopAnimation(nil)
-                self.resultText = ""
-                self.switchTo(.result)
-                self.statusLabel?.stringValue = "❌ \(error.localizedDescription)"
-                NCLog.log("选中加工失败：「\(actionName)」\(error.localizedDescription)")
-            }
-        }
+        request.run(instruction: instruction)
+    }
+
+    private func requestDidChange() {
+        guard !request.busy, let snapshot else { return }
+        guard panelIsKey || NotesBridge.shared.isCurrent(snapshot) else { hide(); return }
+        spinner?.stopAnimation(nil)
+        switchTo(.result)
+        layout(size: NSSize(width: 440, height: 236))
+        place(below: snapshot.bounds, size: NSSize(width: 440, height: 236))
+        if let error = request.lastError { statusLabel?.stringValue = "❌ \(error)" }
     }
 
     // MARK: 结果动作
 
     private func replaceSelection() {
-        guard var snap = snapshot else { return }
-        hide()
-        yieldToNotes {
-            // 快照可能滞后：替换前重读一次选区，若签名一致用最新引用
-            if let fresh = NotesBridge.shared.readSelectionSnapshot(),
-               fresh.range.location == snap.range.location, fresh.range.length == snap.range.length {
-                snap = fresh
-            }
-            if let err = NotesBridge.shared.replaceSelection(in: snap, with: self.resultText) {
-                NCLog.log("选中替换失败：\(err)")
-            } else {
-                NCLog.log("选中替换成功：\(self.resultText.count) 字")
-            }
-        }
+        writeResult(append: false)
     }
 
     private func appendAfter() {
-        guard var snap = snapshot else { return }
-        hide()
-        yieldToNotes {
-            if let fresh = NotesBridge.shared.readSelectionSnapshot(),
-               fresh.range.location == snap.range.location, fresh.range.length == snap.range.length {
-                snap = fresh
-            }
-            if let err = NotesBridge.shared.appendAfterSelection(in: snap, with: self.resultText) {
-                NCLog.log("选中追加失败：\(err)")
+        writeResult(append: true)
+    }
+
+    private func writeResult(append: Bool) {
+        guard let snap = snapshot, !resultText.isEmpty, !writing else { return }
+        writing = true
+        isRetainingResult = true
+        updateResultButtons()
+        let range = append ? CFRange(location: snap.range.location + snap.range.length, length: 0) : snap.range
+        request.writeResult(using: { target, text, valid, completed in
+            NotesBridge.shared.writeWhenNotesActive(in: target, text: text, range: range,
+                                                    html: MarkdownDocument.html(text),
+                                                    isOperationValid: valid, completion: completed)
+        }) { [weak self] error in
+            guard let self else { return }
+            self.writing = false
+            if let error {
+                self.statusLabel?.stringValue = "❌ \(error) 结果已保留，可重试或复制。"
+                self.updateResultButtons()
+                self.panel?.orderFront(nil)
             } else {
-                NCLog.log("选中追加成功：\(self.resultText.count) 字")
+                self.hide()
             }
         }
     }
@@ -387,7 +546,7 @@ final class SelectionAIPanel: NSObject {
 
         // 菜单态：Notes 原生格式按钮（标题/列表/块引用…，动态枚举「格式」菜单，仅显示当前已支持的项）
         let fmtItems = NotesFormatButton.items(presenting: NotesBridge.shared.supportedFormatTitles())
-        for (i, rowItems) in NotesFormatButton.splitRows(fmtItems).enumerated() {
+        for (i, rowItems) in NotesFormatButton.splitRows(fmtItems, maxPerRow: 4).enumerated() {
             let frow = NSStackView()
             frow.orientation = .horizontal
             frow.spacing = 5
@@ -407,6 +566,19 @@ final class SelectionAIPanel: NSObject {
             }
             container.addArrangedSubview(frow)
             formatRows.append(frow)
+        }
+        if formatRows.count > 1, let firstRow = formatRows.first {
+            let more = NSButton(title: "更多格式 ▾", target: nil, action: nil)
+            more.controlSize = .small
+            more.onAction = { [weak self] _ in
+                guard let self else { return }
+                self.expandedFormats.toggle()
+                self.moreFormatsButton?.title = self.expandedFormats ? "收起 ▴" : "更多格式 ▾"
+                self.switchTo(.menu)
+                self.layout(size: NSSize(width: 380, height: self.menuHeight()))
+            }
+            firstRow.addArrangedSubview(more)
+            moreFormatsButton = more
         }
 
         // 结果/加载态：状态行 + 结果文本 + 按钮行
@@ -444,15 +616,28 @@ final class SelectionAIPanel: NSObject {
         let replace = NSButton(title: "替换选区", target: nil, action: nil)
         replace.keyEquivalent = "\r"
         replace.onAction = { [weak self] _ in self?.replaceSelection() }
+        replaceButton = replace
         let append = NSButton(title: "追加到后", target: nil, action: nil)
         append.onAction = { [weak self] _ in self?.appendAfter() }
+        appendButton = append
         let copy = NSButton(title: "复制", target: nil, action: nil)
         copy.onAction = { [weak self] _ in self?.copyResult() }
+        copyButton = copy
+        let retry = NSButton(title: "重试", target: nil, action: nil)
+        retry.controlSize = .small
+        retry.onAction = { [weak self] _ in
+            guard let self, let instruction = self.lastInstruction else { return }
+            self.run(instruction: instruction.text, actionName: instruction.name)
+        }
+        retryButton = retry
         let close = NSButton(title: "✕", target: nil, action: nil)
         close.bezelStyle = .texturedRounded
         close.controlSize = .small
         close.onAction = { [weak self] _ in self?.hide() }
-        [replace, append, copy, NSView()].forEach { btns.addArrangedSubview($0) }
+        close.keyEquivalent = "\u{1b}"
+        close.toolTip = "关闭并取消当前加工"
+        closeButton = close
+        [replace, append, copy, retry, NSView()].forEach { btns.addArrangedSubview($0) }
         btns.addArrangedSubview(close)
         container.addArrangedSubview(btns)
         resultButtons = btns
@@ -471,7 +656,9 @@ final class SelectionAIPanel: NSObject {
 
     /// 应用 Notes 原生段落格式到当前选区：面板保持展开，方便连续叠加格式
     private func applyFormat(_ menuTitle: String) {
+        guard let snapshot else { return }
         yieldToNotes {
+            guard NotesBridge.shared.isCurrent(snapshot) else { self.hide(); return }
             if let err = NotesBridge.shared.applyFormat(menuTitle) {
                 NCLog.log("格式「\(menuTitle)」失败：\(err)")
                 self.statusLabel?.stringValue = "❌ 格式「\(menuTitle)」：\(err)"
@@ -488,11 +675,13 @@ final class SelectionAIPanel: NSObject {
         let menuMode = m == .menu
         actionsRow?.isHidden = !menuMode
         customRow?.isHidden = !menuMode
-        for frow in formatRows { frow.isHidden = !menuMode }
+        for (i, frow) in formatRows.enumerated() { frow.isHidden = !menuMode || (!expandedFormats && i > 0) }
         statusLabel?.isHidden = (m == .menu)
         spinner?.isHidden = (m != .working)
         resultView?.enclosingScrollView?.isHidden = (m != .result)
-        resultButtons?.isHidden = (m != .result)
+        resultButtons?.isHidden = (m != .result && m != .working)
+        closeButton?.title = m == .working ? "取消" : "✕"
+        updateResultButtons()
         if m == .menu {
             statusLabel?.stringValue = ""
         }
@@ -500,6 +689,15 @@ final class SelectionAIPanel: NSObject {
             resultView?.string = resultText
             statusLabel?.stringValue = "AI 已加工 \(resultText.count) 字，可替换原选区、追加到选区后，或复制："
         }
+    }
+
+    private func updateResultButtons() {
+        let available = mode == .result && !resultText.isEmpty && !writing
+        replaceButton?.isEnabled = available
+        appendButton?.isEnabled = available
+        copyButton?.isEnabled = available
+        retryButton?.isHidden = mode != .result
+        retryButton?.isEnabled = !writing && lastInstruction != nil
     }
 
     private func layout(size: NSSize) {
@@ -541,7 +739,7 @@ final class SelectionAIPanel: NSObject {
         let mainH = NSScreen.screens.first { $0.frame.minX == 0 && $0.frame.minY == 0 }?.frame.height
             ?? NSScreen.screens.map { $0.frame.height }.max() ?? f.height
         let qy = -(f.minY + f.height - mainH)
-        return CGRect(x: f.minX, y: min(0, qy), width: f.width, height: f.height)
+        return CGRect(x: f.minX, y: qy, width: f.width, height: f.height)
     }
 }
 

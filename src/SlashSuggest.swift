@@ -70,6 +70,8 @@ final class SlashSuggestPanel: NSObject, NSWindowDelegate {
     private var rows: [Row] = []
     /// 当前查询串（如 "/runse"），选中执行时删除它
     private var query = ""
+    private var target: NotesBridge.SelectionSnapshot?
+    private var dismissedQuery: String?
     /// 键盘导航当前行
     private var selectedRow = 0
     /// 程序性 selectRow 触发的 selectionDidChange 不执行（只有用户点击才执行）
@@ -83,8 +85,13 @@ final class SlashSuggestPanel: NSObject, NSWindowDelegate {
     // MARK: - 外部接口（AXSlashWatcher 轮询驱动）
 
     func update(items newItems: [SlashCommand], query newQuery: String, cursorRect: CGRect?) {
+        guard NotesBridge.isFrontmostNotes(), Self.slashEnabled else { hide(); return }
+        if dismissedQuery == newQuery { return }
+        dismissedQuery = nil
         if let until = suppressUntil, Date() < until { return }
         suppressUntil = nil
+        guard let target = NotesBridge.shared.readTextSnapshot() else { hide(); return }
+        self.target = target
         self.query = newQuery
         // 内容未变且面板已在：仅跟随光标移动，避免每 120ms 重绘
         if itemsEqual(newItems), let p = panel, p.isVisible {
@@ -120,15 +127,18 @@ final class SlashSuggestPanel: NSObject, NSWindowDelegate {
 
     func hide() {
         panel?.orderOut(nil)
+        target = nil
     }
 
     /// 点选/回车执行：删除已输入的 /xxx 段，走统一触发（含删除落地时序）
     private func perform(_ cmd: SlashCommand) {
+        guard NotesBridge.isFrontmostNotes(), Self.slashEnabled,
+              let target, NotesBridge.shared.isCurrent(target) else { hide(); return }
+        let deleteCount = query.count
         hide()
         suppressUntil = Date().addingTimeInterval(1.5)
-        let deleteCount = query.count
         NCLog.log("建议面板执行：\(cmd.name)，删除 \(deleteCount) 字符")
-        KeywordListener.performGlobalSlash(cmd, deleteCount: deleteCount)
+        KeywordListener.performGlobalSlash(cmd, deleteCount: deleteCount, target: target, expectedToken: query)
     }
 
     /// 第一个命令行（初始选中；分组头不可选）
@@ -150,6 +160,7 @@ final class SlashSuggestPanel: NSObject, NSWindowDelegate {
 
     /// 可见时接管 ↑↓/⏎/esc；返回 true = 已消费（吞掉事件，不透传给 Notes）
     func routeKeyIfVisible(_ code: CGKeyCode) -> Bool {
+        guard NotesBridge.isFrontmostNotes(), Self.slashEnabled else { hide(); return false }
         guard panel?.isVisible == true, !rows.isEmpty, !Self.isIMEComposing else { return false }
         switch code {
         case 125:   // ↓
@@ -158,14 +169,20 @@ final class SlashSuggestPanel: NSObject, NSWindowDelegate {
             moveSelection(-1); return true
         case 36:    // ⏎
             if rows.indices.contains(selectedRow), case .cmd(let c) = rows[selectedRow] {
-                perform(c); return true
+                DispatchQueue.main.async { self.perform(c) }
+                return true
             }
         case 53:    // esc：关闭面板，并抑制重弹（用户明确关闭后，光标前残留的 / 不应马上弹回）
-            suppressUntil = Date().addingTimeInterval(1.5)
+            dismissedQuery = query
             hide(); return true
         default: break
         }
         return false
+    }
+
+    private static var slashEnabled: Bool {
+        let defaults = UserDefaults.standard
+        return defaults.object(forKey: "nc.slash.global") == nil || defaults.bool(forKey: "nc.slash.global")
     }
 
     private func moveSelection(_ delta: Int) {
@@ -298,7 +315,7 @@ final class SlashSuggestPanel: NSObject, NSWindowDelegate {
             }
         }
         // 用 origin 找屏幕并夹取：优先鼠标/光标所在屏，放不下就换屏
-        var screen = NSScreen.screens.first { $0.frame.contains(origin) } ?? NSScreen.main ?? NSScreen.screens[0]
+        let screen = NSScreen.screens.first { $0.frame.contains(origin) } ?? NSScreen.main ?? NSScreen.screens[0]
         var x = origin.x
         var y = origin.y - height
         if y < screen.visibleFrame.minY {
@@ -325,7 +342,7 @@ final class SlashSuggestPanel: NSObject, NSWindowDelegate {
         let mainH = NSScreen.screens.first { $0.frame.minX == 0 && $0.frame.minY == 0 }?.frame.height
             ?? NSScreen.screens.map { $0.frame.height }.max() ?? f.height
         let qy = -(f.minY + f.height - mainH)
-        return CGRect(x: f.minX, y: min(0, qy), width: f.width, height: f.height)
+        return CGRect(x: f.minX, y: qy, width: f.width, height: f.height)
     }
 
     /// 定位可疑日志 5s 去重（鼠标停在远处时 fallback 每次轮询都刷，污染日志）
@@ -350,7 +367,7 @@ final class SlashSuggestPanel: NSObject, NSWindowDelegate {
 /// 组合结束（含中文 IME 激活但未输入时）键盘导航正常接管——
 /// 检测方式：Notes 焦点元素的 AXMarkedTextRange（组合文本存在即组合中）。
 /// 旧实现按「输入源是中文」一刀切，导致中文输入法激活时 / 下拉永远无法用箭头选择。
-private extension SlashSuggestPanel {
+extension SlashSuggestPanel {
     nonisolated static var isIMEComposing: Bool {
         guard let notes = NSWorkspace.shared.runningApplications.first(where: {
             $0.bundleIdentifier == "com.apple.Notes"

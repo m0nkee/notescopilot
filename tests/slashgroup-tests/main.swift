@@ -99,6 +99,15 @@ do {
     check(AXSlashWatcher.matchSlashToken("/format")?.name == "格式检查", "matchSlashToken 命中格式检查")
 }
 
+// URL 路径不能抢先命中 /title 等命令并删掉用户的网址。
+do {
+    check(AXSlashWatcher.activeSlashQuery("https://example.com/title") == nil, "URL 路径不弹斜杠菜单")
+    check(AXSlashWatcher.matchAXSlashTail("https://example.com/title ") == nil, "URL 路径与命令重名也不删除路径")
+    check(AXSlashWatcher.matchAXSlashTail("https://title ") == nil, "URL 域名与命令重名也不触发")
+    check(AXSlashWatcher.activeSlashQuery("www.example.com/body") == nil, "无协议 www URL 路径不弹菜单")
+    check(AXSlashWatcher.matchAXSlashTail("段落 /title ")?.cmd.alias == "title", "普通行中斜杠命令仍可执行")
+}
+
 print("")
 print(fail == 0 ? "全部通过：\(pass) 项" : "失败 \(fail) 项 / 共 \(pass + fail) 项")
 exit(fail == 0 ? 0 : 1)

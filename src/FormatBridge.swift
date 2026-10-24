@@ -58,6 +58,7 @@ enum FormatBridge {
     /// 限定在菜单栏子树内搜索只需 3ms。
     @discardableResult
     static func triggerMenu(item titled: String) -> Bool {
+        guard NotesBridge.isFrontmostNotes() else { return false }
         if let cached = menuCache[titled] {
             if AXUIElementPerformAction(cached, kAXPressAction as CFString) == .success { return true }
             menuCache.removeValue(forKey: titled)   // 失效：丢弃重找
@@ -96,6 +97,7 @@ enum FormatBridge {
     /// ⌘T 同时绑在「标题」与「表格」、⌘B 同时绑在「正文」与「粗体」上，keystroke 有歧义），
     /// 快捷键仅作菜单未命中的兜底。
     static func trigger(_ style: FormatStyle) -> Bool {
+        guard NotesBridge.isFrontmostNotes() else { return false }
         for t in style.menuTitles {
             if triggerMenu(item: t) { return true }
         }
@@ -105,6 +107,7 @@ enum FormatBridge {
     /// 标准菜单快捷键兜底（真机 dump：核对清单=⇧⌘L、粗体=⌘B、斜体=⌘I、下划线=⌘U）。
     /// CGEventPost 合成击键：NSAppleScript/System Events 同步执行耗时数百 ms 且阻塞主线程。
     static func triggerShortcut(_ style: FormatStyle) -> Bool {
+        guard NotesBridge.isFrontmostNotes() else { return false }
         guard let sc = style.shortcut, let key = sc.split(separator: " ").first else { return false }
         // 解析 "b using command down" → (virtualKey, flags)
         guard let vk = Self.virtualKey(for: String(key).lowercased()) else { return false }
@@ -187,6 +190,7 @@ enum FormatBridge {
         func on(_ key: String, _ defaultValue: Bool = true) -> Bool {
             d.object(forKey: key) == nil ? defaultValue : d.bool(forKey: key)
         }
+        guard on("nc.md.enabled") else { return false }
         switch style {
         case .title, .heading, .subheading: return on("nc.md.headers")
         case .checklist:    return on("nc.md.checklists")

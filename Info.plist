@@ -13,9 +13,9 @@
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
-	<string>2.5.0</string>
+	<string>2.6.0</string>
 	<key>CFBundleVersion</key>
-	<string>1</string>
+	<string>2</string>
 	<key>LSMinimumSystemVersion</key>
 	<string>13.0</string>
 	<key>LSUIElement</key>
@@ -23,6 +23,6 @@
 	<key>NSHighResolutionCapable</key>
 	<true/>
 	<key>NSAppleEventsUsageDescription</key>
-	<string>NotesCopilot 需要向 Apple Notes 发送脚本以创建笔记，并向系统事件发送粘贴指令，把 AI 结果插入你的笔记。</string>
+	<string>NotesCopilot 需要读取 Apple Notes 当前笔记的标识，确认选区和 AI 写回目标，并通过脚本创建新笔记。</string>
 </dict>
 </plist>

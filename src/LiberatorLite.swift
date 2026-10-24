@@ -10,7 +10,7 @@ let SQLITE_TRANSIENT = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
 // ZICCLOUDSYNCINGOBJECT 统一实体表、Z_ENT 实体类型、ZTITLE1 笔记标题、
 // 行内附件 UTI（hashtag/link）、ZMARKEDFORDELETION 软删除过滤、COLLATE NOCASE 标签匹配
 
-struct NoteSummary: Identifiable, Hashable {
+struct NoteSummary: Identifiable, Hashable, Sendable {
     let pk: Int64
     var uuid: String
     var title: String
@@ -19,6 +19,58 @@ struct NoteSummary: Identifiable, Hashable {
     var created: Date?
     var folder: String
     var id: Int64 { pk }
+}
+
+struct NoteContent: Sendable {
+    let markdown: String
+    let plainText: String
+    let warning: String?
+    let isComplete: Bool
+}
+
+struct NoteAIContext: Sendable {
+    let note: NoteSummary
+    let content: NoteContent
+}
+
+/// Shared by mouse/keyboard selection and exercised without a running Notes app.
+struct LibrarySelectionState {
+    private(set) var selectedID: Int64?
+    private(set) var content: NoteContent?
+    private(set) var isLoading = false
+    private var requestID: UUID?
+
+    mutating func begin(noteID: Int64?) -> UUID? {
+        selectedID = noteID
+        content = nil
+        isLoading = noteID != nil
+        requestID = noteID.map { _ in UUID() }
+        return requestID
+    }
+
+    @discardableResult
+    mutating func complete(_ content: NoteContent, noteID: Int64, requestID: UUID) -> Bool {
+        guard selectedID == noteID, self.requestID == requestID else { return false }
+        self.content = content
+        isLoading = false
+        return true
+    }
+}
+
+struct LibraryQuery {
+    var searchText = ""
+    var folderPK: Int64?
+    var hashtag: String?
+    var sort: SearchSort = .updatedDescending
+
+    func execute(in store: NotesStore) -> [NoteSummary] {
+        var list = hashtag.map { store.notes(hashtag: $0) } ?? store.notes(folderPK: folderPK)
+        if !searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            let matches = Set(store.search(searchText).map(\.pk))
+            list = list.filter { matches.contains($0.pk) }
+        }
+        return sort.sorted(list)
+    }
 }
 
 // MARK: 搜索排序（证据：updatedDescending / updatedAscending / createdDescending / createdAscending）
@@ -58,9 +110,15 @@ enum StoreError: LocalizedError {
     }
 }
 
-final class NotesStore {
+final class NotesStore: @unchecked Sendable {
+    // One connection and one index are shared by UI reads and file-event indexing.
+    // Recursive locking also keeps a search from observing a half-rebuilt index.
+    private let lock = NSRecursiveLock()
     private var db: OpaquePointer?
     private var fts: OpaquePointer?
+    private var hasFTS = false
+    private let enableFTS: Bool
+    private var separateDataColumns: Set<String> = []
     let path: String
     private var noteEnt: Int64 = 12
     private var folderEnt: Int64 = 11
@@ -70,27 +128,29 @@ final class NotesStore {
     private var noteCreatedCol = "ZCREATIONDATE1"  // 创建时间列（缺列时回退修改时间）
     private var folderTitleCol = "ZTITLE2"
     private var blobCol = "ZDATA"
-    private(set) var indexedCount = 0
+    private var indexCount = 0
+    var indexedCount: Int { lock.lock(); defer { lock.unlock() }; return indexCount }
 
     static var defaultPath: String {
         NSHomeDirectory() + "/Library/Group Containers/group.com.apple.notes/NoteStore.sqlite"
     }
 
-    init(path: String = NotesStore.defaultPath) throws {
+    init(path: String = NotesStore.defaultPath, enableFTS: Bool = true) throws {
         self.path = path
+        self.enableFTS = enableFTS
         var handle: OpaquePointer?
-        let flags = SQLITE_OPEN_READONLY
+        let flags = SQLITE_OPEN_READONLY | SQLITE_OPEN_FULLMUTEX
         guard sqlite3_open_v2(path, &handle, flags, nil) == SQLITE_OK, let handle else {
             let msg = handle.map { String(cString: sqlite3_errmsg($0)) } ?? "unknown"
-            if sqlite3_open_v2(path, nil, flags, nil) != SQLITE_OK {
-                let lower = msg.lowercased()
-                if lower.contains("authorization") || lower.contains("denied") || lower.contains("unable to open") {
-                    throw StoreError.permissionDenied(path)
-                }
+            sqlite3_close(handle)
+            let lower = msg.lowercased()
+            if lower.contains("authorization") || lower.contains("denied") || lower.contains("unable to open") {
+                throw StoreError.permissionDenied(path)
             }
             throw StoreError.corrupted(msg)
         }
         db = handle
+        sqlite3_busy_timeout(handle, 2_000)
         try detectSchema()
         try buildFTS()
     }
@@ -109,20 +169,22 @@ final class NotesStore {
                 let ent = (r[0] as? Int64) ?? -1
                 let name = (r[1] as? String) ?? ""
                 let n = name.lowercased()
-                if n.contains("folder") { folderEnt = ent }
-                if n.contains("notedata") { dataEnt = ent }
-                else if n.contains("note") { noteEnt = ent }
+                if n == "icfolder" { folderEnt = ent }
+                if n == "icnotedata" { dataEnt = ent }
+                if n == "icnote" { noteEnt = ent }
             }
         }
         // 列名自适应（不同 macOS 版本列名有差异）
-        guard let cols = tableColumns("ZICCLOUDSYNCINGOBJECT") else {
+        guard let cols = tableColumns("ZICCLOUDSYNCINGOBJECT"), !cols.isEmpty else {
             throw StoreError.corrupted("未找到 ZICCLOUDSYNCINGOBJECT 表")
         }
         if !cols.contains(noteTitleCol) { noteTitleCol = cols.first { $0.hasPrefix("ZTITLE") } ?? "ZTITLE1" }
-        noteCreatedCol = cols.first { $0.hasPrefix("ZCREATIONDATE") } ?? "ZMODIFICATIONDATE1"
+        noteCreatedCol = cols.contains("ZCREATIONDATE1") ? "ZCREATIONDATE1"
+            : (cols.first { $0.hasPrefix("ZCREATIONDATE") } ?? "ZMODIFICATIONDATE1")
         folderTitleCol = cols.contains("ZTITLE2") ? "ZTITLE2" : noteTitleCol
         noteRefCol = cols.contains("ZNOTEDATA") ? "ZNOTEDATA" : (cols.contains("ZDATA") ? "ZDATA" : noteRefCol)
         blobCol = cols.contains("ZDATA") ? "ZDATA" : "ZNSData"
+        separateDataColumns = Set(tableColumns("ZICNOTEDATA") ?? [])
     }
 
     private func tableColumns(_ table: String) -> [String]? {
@@ -134,13 +196,15 @@ final class NotesStore {
 
     @discardableResult
     private func query(_ sql: String, _ args: [Any] = [], on handle: OpaquePointer? = nil) -> [[Any?]]? {
+        lock.lock(); defer { lock.unlock() }
         let h = handle ?? db
         var stmt: OpaquePointer?
         guard sqlite3_prepare_v2(h, sql, -1, &stmt, nil) == SQLITE_OK else { return nil }
         defer { sqlite3_finalize(stmt) }
         bind(args, to: stmt)
         var out: [[Any?]] = []
-        while sqlite3_step(stmt) == SQLITE_ROW {
+        var result = sqlite3_step(stmt)
+        while result == SQLITE_ROW {
             var row: [Any?] = []
             let n = sqlite3_column_count(stmt)
             for i in 0..<n {
@@ -156,8 +220,9 @@ final class NotesStore {
                 }
             }
             out.append(row)
+            result = sqlite3_step(stmt)
         }
-        return out
+        return result == SQLITE_DONE ? out : nil
     }
 
     private func bind(_ args: [Any], to stmt: OpaquePointer?) {
@@ -166,11 +231,8 @@ final class NotesStore {
             case let v as Int64: sqlite3_bind_int64(stmt, Int32(i + 1), v)
             case let v as Int: sqlite3_bind_int64(stmt, Int32(i + 1), Int64(v))
             case let v as String:
-                let arr = [UInt8](v.utf8)
-                arr.withUnsafeBufferPointer { buf in
-                    if let p = buf.baseAddress {
-                        sqlite3_bind_text(stmt, Int32(i + 1), p, Int32(buf.count), SQLITE_TRANSIENT)
-                    }
+                _ = v.withCString { p in
+                    sqlite3_bind_text(stmt, Int32(i + 1), p, Int32(v.utf8.count), SQLITE_TRANSIENT)
                 }
             case let v as Double: sqlite3_bind_double(stmt, Int32(i + 1), v)
             default: break
@@ -180,26 +242,27 @@ final class NotesStore {
 
     // MARK: 笔记列表（证据 SQL：ZMARKEDFORDELETION != 1 过滤 + 置顶优先 + 修改时间倒序）
 
-    func notes(limit: Int = 500, folderPK: Int64? = nil) -> [NoteSummary] {
+    func notes(limit: Int? = nil, folderPK: Int64? = nil) -> [NoteSummary] {
+        lock.lock(); defer { lock.unlock() }
         var sql = """
         SELECT n.Z_PK, n.ZIDENTIFIER, n.\(noteTitleCol), n.ZSNIPPET, n.ZMODIFICATIONDATE1,
                COALESCE(NULLIF(f.\(folderTitleCol), ''), f.\(noteTitleCol), ''), n.\(noteCreatedCol)
         FROM ZICCLOUDSYNCINGOBJECT n
         LEFT JOIN ZICCLOUDSYNCINGOBJECT f ON n.ZFOLDER = f.Z_PK
-        WHERE n.Z_ENT = ? AND n.ZMARKEDFORDELETION != 1
+        WHERE n.Z_ENT = ? AND COALESCE(n.ZMARKEDFORDELETION, 0) != 1
         """
         var args: [Any] = [noteEnt]
         if let fp = folderPK {
             sql += " AND n.ZFOLDER = ?"
             args.append(fp)
         }
-        sql += " ORDER BY n.ZISPINNED DESC, n.ZMODIFICATIONDATE1 DESC LIMIT ?"
-        args.append(limit)
+        sql += " ORDER BY n.ZISPINNED DESC, n.ZMODIFICATIONDATE1 DESC"
+        if let limit { sql += " LIMIT ?"; args.append(max(0, limit)) }
         return (query(sql, args) ?? []).compactMap(Self.makeSummary)
     }
 
     func folders() -> [(pk: Int64, name: String)] {
-        let sql = "SELECT Z_PK, COALESCE(NULLIF(\(folderTitleCol), ''), \(noteTitleCol)), ZFOLDERTYPE FROM ZICCLOUDSYNCINGOBJECT WHERE Z_ENT = ? AND ZMARKEDFORDELETION != 1 ORDER BY 2 ASC"
+        let sql = "SELECT Z_PK, COALESCE(NULLIF(\(folderTitleCol), ''), \(noteTitleCol)), ZFOLDERTYPE FROM ZICCLOUDSYNCINGOBJECT WHERE Z_ENT = ? AND COALESCE(ZMARKEDFORDELETION, 0) != 1 ORDER BY 2 ASC"
         return (query(sql, [folderEnt]) ?? []).compactMap { r in
             guard let pk = r[0] as? Int64, let name = r[1] as? String else { return nil }
             let t = (r[2] as? Int64) ?? 0
@@ -212,13 +275,13 @@ final class NotesStore {
         let ts = (row[4] as? Double) ?? 0
         var date: Date?
         if ts > 0 {
-            // Core Data 时间戳（2001 纪元）或 Unix 纪元自适应
-            date = ts > 600_000_000 ? Date(timeIntervalSince1970: ts) : Date(timeIntervalSinceReferenceDate: ts)
+            // NoteStore's Core Data date columns always use the 2001 epoch.
+            date = Date(timeIntervalSinceReferenceDate: ts)
         }
         let ts2 = (row[6] as? Double) ?? 0
         var created: Date?
         if ts2 > 0 {
-            created = ts2 > 600_000_000 ? Date(timeIntervalSince1970: ts2) : Date(timeIntervalSinceReferenceDate: ts2)
+            created = Date(timeIntervalSinceReferenceDate: ts2)
         }
         return NoteSummary(pk: pk,
                            uuid: (row[1] as? String) ?? "",
@@ -235,7 +298,7 @@ final class NotesStore {
         let sql = """
         SELECT DISTINCT h.ZTOKENCONTENTIDENTIFIER FROM ZICCLOUDSYNCINGOBJECT h
         WHERE h.ZTYPEUTI1 = 'com.apple.notes.inlinetextattachment.hashtag'
-          AND h.ZMARKEDFORDELETION != 1
+          AND COALESCE(h.ZMARKEDFORDELETION, 0) != 1
         ORDER BY 1
         """
         return (query(sql) ?? []).compactMap { $0[0] as? String }.filter { !$0.isEmpty }
@@ -243,12 +306,13 @@ final class NotesStore {
 
     func notes(hashtag: String) -> [NoteSummary] {
         let sql = """
-        SELECT n.Z_PK, n.ZIDENTIFIER, n.\(noteTitleCol), n.ZSNIPPET, n.ZMODIFICATIONDATE1, '', n.\(noteCreatedCol)
+        SELECT DISTINCT n.Z_PK, n.ZIDENTIFIER, n.\(noteTitleCol), n.ZSNIPPET, n.ZMODIFICATIONDATE1, '', n.\(noteCreatedCol)
         FROM ZICCLOUDSYNCINGOBJECT h
         JOIN ZICCLOUDSYNCINGOBJECT n ON n.Z_PK = h.ZNOTE1
         WHERE h.ZTYPEUTI1 = 'com.apple.notes.inlinetextattachment.hashtag'
           AND h.ZTOKENCONTENTIDENTIFIER = ? COLLATE NOCASE
-          AND h.ZMARKEDFORDELETION != 1
+          AND COALESCE(h.ZMARKEDFORDELETION, 0) != 1
+          AND COALESCE(n.ZMARKEDFORDELETION, 0) != 1
         ORDER BY n.ZMODIFICATIONDATE1 DESC
         """
         return (query(sql, [hashtag]) ?? []).compactMap(Self.makeSummary)
@@ -258,12 +322,13 @@ final class NotesStore {
 
     func backlinks(toNoteUUID: String) -> [NoteSummary] {
         let sql = """
-        SELECT n.Z_PK, n.ZIDENTIFIER, n.\(noteTitleCol), n.ZSNIPPET, n.ZMODIFICATIONDATE1, '', n.\(noteCreatedCol)
+        SELECT DISTINCT n.Z_PK, n.ZIDENTIFIER, n.\(noteTitleCol), n.ZSNIPPET, n.ZMODIFICATIONDATE1, '', n.\(noteCreatedCol)
         FROM ZICCLOUDSYNCINGOBJECT h
         JOIN ZICCLOUDSYNCINGOBJECT n ON n.Z_PK = h.ZNOTE1
         WHERE h.ZTYPEUTI1 = 'com.apple.notes.inlinetextattachment.link'
           AND h.ZTOKENCONTENTIDENTIFIER = ? COLLATE NOCASE
-          AND h.ZMARKEDFORDELETION != 1
+          AND COALESCE(h.ZMARKEDFORDELETION, 0) != 1
+          AND COALESCE(n.ZMARKEDFORDELETION, 0) != 1
         """
         return (query(sql, [toNoteUUID]) ?? []).compactMap(Self.makeSummary)
     }
@@ -271,12 +336,37 @@ final class NotesStore {
     // MARK: 笔记正文数据（ZNOTEDATA/ZDATA → 数据实体行 → ZDATA blob → topotext）
 
     func noteBodyData(pk: Int64) -> Data? {
+        lock.lock(); defer { lock.unlock() }
+        // Modern Notes stores gzip protobuf bodies in a separate Core Data table.
+        if separateDataColumns.contains("ZDATA") {
+            if separateDataColumns.contains("ZNOTE"),
+               let data = query("SELECT ZDATA FROM ZICNOTEDATA WHERE ZNOTE = ?", [pk])?.first?.first as? Data {
+                return data
+            }
+            if separateDataColumns.contains("Z_PK"),
+               let ref = query("SELECT \(noteRefCol) FROM ZICCLOUDSYNCINGOBJECT WHERE Z_PK = ?", [pk])?.first?.first as? Int64,
+               let data = query("SELECT ZDATA FROM ZICNOTEDATA WHERE Z_PK = ?", [ref])?.first?.first as? Data {
+                return data
+            }
+        }
         let sql = "SELECT \(noteRefCol) FROM ZICCLOUDSYNCINGOBJECT WHERE Z_PK = ?"
         guard let ref = (query(sql, [pk])?.first?.first as? Int64) else { return nil }
         let blobSQL = "SELECT \(blobCol) FROM ZICCLOUDSYNCINGOBJECT WHERE Z_PK = ? AND Z_ENT = ?"
         if let d = query(blobSQL, [ref, dataEnt])?.first?.first as? Data { return d }
         return query("SELECT \(blobCol) FROM ZICCLOUDSYNCINGOBJECT WHERE Z_PK = ?", [ref])?
             .first?.first as? Data
+    }
+
+    func content(for note: NoteSummary) -> NoteContent {
+        if let blob = noteBodyData(pk: note.pk), let doc = TopotextDecoder.decode(blob) {
+            let warning = doc.warnings.isEmpty ? nil : doc.warnings.joined(separator: "；")
+            let markdown = MarkdownConverter.convert(note: note, doc: doc)
+            return NoteContent(markdown: markdown, plainText: doc.text,
+                               warning: warning, isComplete: doc.isComplete)
+        }
+        let warning = "无法读取完整正文（可能为加密笔记或不支持的数据格式），当前仅显示摘要。"
+        return NoteContent(markdown: MarkdownConverter.convert(note: note, doc: nil),
+                           plainText: note.snippet, warning: warning, isComplete: false)
     }
 
     // MARK: 全文检索（复刻 Liberator.sqlite 的 FTS documents 表 + remove_diacritics=2）
@@ -287,59 +377,54 @@ final class NotesStore {
             throw StoreError.corrupted("无法创建内存索引")
         }
         fts = mem
-        // 先尝试 fts5（系统 SQLite 支持），失败退回 fts3（与 ProNotes 相同）
-        if sqlite3_exec(fts, "CREATE VIRTUAL TABLE documents USING fts5(title, snippet, tokenize='unicode61 remove_diacritics 2')", nil, nil, nil) != SQLITE_OK {
-            guard sqlite3_exec(fts, "CREATE VIRTUAL TABLE documents USING fts3(title, snippet, tokenize=? )", nil, nil, nil) != SQLITE_OK else {
-                throw StoreError.corrupted("FTS 不可用")
-            }
+        // Keep a plain, folded-text index as well: unicode61 cannot find CJK
+        // substrings, and older system SQLite builds may not provide FTS5.
+        guard sqlite3_exec(fts, "CREATE TABLE search_documents (id INTEGER PRIMARY KEY, text TEXT NOT NULL)", nil, nil, nil) == SQLITE_OK else {
+            throw StoreError.corrupted("无法创建搜索索引")
+        }
+        hasFTS = enableFTS && sqlite3_exec(fts, "CREATE VIRTUAL TABLE documents USING fts5(title, snippet, body, tokenize='unicode61 remove_diacritics 2')", nil, nil, nil) == SQLITE_OK
+        if enableFTS && !hasFTS {
+            hasFTS = sqlite3_exec(fts, "CREATE VIRTUAL TABLE documents USING fts3(title, snippet, body, tokenize=unicode61)", nil, nil, nil) == SQLITE_OK
         }
         indexAll()
     }
 
     func indexAll() {
-        _ = query("DELETE FROM documents", on: fts)
-        indexedCount = 0
-        var stmt: OpaquePointer?
-        guard sqlite3_prepare_v2(fts, "INSERT INTO documents(rowid, title, snippet) VALUES (?,?,?)", -1, &stmt, nil) == SQLITE_OK else { return }
-        defer { sqlite3_finalize(stmt) }
-        indexedCount = 0
-        for n in notes(limit: 5000) {
-            let t2 = [UInt8](n.title.utf8)
-            let s2 = [UInt8](n.snippet.utf8)
-            t2.withUnsafeBufferPointer { tb2 in
-                s2.withUnsafeBufferPointer { sb2 in
-                    sqlite3_reset(stmt)
-                    sqlite3_bind_int64(stmt, 1, n.pk)
-                    if let tp = tb2.baseAddress {
-                        sqlite3_bind_text(stmt, 2, tp, Int32(tb2.count), SQLITE_TRANSIENT)
-                    }
-                    if let sp = sb2.baseAddress {
-                        sqlite3_bind_text(stmt, 3, sp, Int32(sb2.count), SQLITE_TRANSIENT)
-                    }
-                    if sqlite3_step(stmt) == SQLITE_DONE { indexedCount += 1 }
-                }
+        lock.lock(); defer { lock.unlock() }
+        guard sqlite3_exec(fts, "BEGIN IMMEDIATE", nil, nil, nil) == SQLITE_OK else { return }
+        defer { sqlite3_exec(fts, "COMMIT", nil, nil, nil) }
+        if hasFTS { _ = query("DELETE FROM documents", on: fts) }
+        _ = query("DELETE FROM search_documents", on: fts)
+        indexCount = 0
+        for n in notes() {
+            let body = noteBodyData(pk: n.pk).flatMap(TopotextDecoder.decode)?.text ?? n.snippet
+            let folded = Self.fold(n.title + "\n" + n.snippet + "\n" + body)
+            if query("INSERT INTO search_documents(id, text) VALUES (?,?)", [n.pk, folded], on: fts) != nil {
+                indexCount += 1
+            }
+            if hasFTS {
+                _ = query("INSERT INTO documents(rowid,title,snippet,body) VALUES (?,?,?,?)",
+                          [n.pk, n.title, n.snippet, body], on: fts)
             }
         }
     }
 
+    private static func fold(_ text: String) -> String {
+        text.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: Locale(identifier: "en_US_POSIX"))
+    }
+
     func search(_ text: String) -> [NoteSummary] {
-        let q = text.trimmingCharacters(in: .whitespaces)
+        lock.lock(); defer { lock.unlock() }
+        let q = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !q.isEmpty else { return [] }
-        var terms = q.split(separator: " ").map { String($0).replacingOccurrences(of: "\"", with: "") }
-        terms = terms.filter { !$0.isEmpty }
+        let terms = q.split(whereSeparator: { $0.isWhitespace }).map { Self.fold(String($0)) }
         guard !terms.isEmpty else { return [] }
-        // 逐词前缀查询后取交集（CJK 无分词时多词 AND 更可靠）
-        var sets: [Set<Int64>] = []
-        for t in terms {
-            guard let rows = query("SELECT rowid FROM documents WHERE documents MATCH ? ORDER BY rank",
-                                   ["\"\(t)\"*"], on: fts) else { return [] }
-            sets.append(Set(rows.compactMap { $0[0] as? Int64 }))
-        }
-        var pks = sets.first ?? []
-        for s in sets.dropFirst() { pks.formIntersection(s) }
-        let all = notes(limit: 5000)
-        let map = Dictionary(uniqueKeysWithValues: all.map { ($0.pk, $0) })
-        return pks.sorted().compactMap { map[$0] }
+        // Literal AND substrings work for Chinese and punctuation-heavy text,
+        // never interpret user input as an FTS query or LIKE pattern.
+        let clauses = Array(repeating: "instr(text, ?) > 0", count: terms.count).joined(separator: " AND ")
+        let rows = query("SELECT id FROM search_documents WHERE \(clauses)", terms, on: fts) ?? []
+        let pks = Set(rows.compactMap { $0[0] as? Int64 })
+        return notes().filter { pks.contains($0.pk) }
     }
 }
 

@@ -227,54 +227,146 @@ enum TemplateSeeder {
 // 完整流程：plan（静态变量）→ {{ask:}} 依次弹窗输入 → {{ai:}} 串行请求 → 回填 → 插入
 // 任一 ask 取消 = 整体中止；ai 失败时保留 {{ai:...}} 原文并上报错误，其余照常插入。
 
+private final class TemplateCancellationToken: @unchecked Sendable {
+    private let lock = NSLock()
+    private var cancelled = false
+    var isCancelled: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return cancelled
+    }
+    func cancel() {
+        lock.lock(); defer { lock.unlock() }
+        cancelled = true
+    }
+}
+
 @MainActor
 enum TemplateRunner {
-    /// 展开并插入模板
-    /// - Parameters:
-    ///   - selection: 笔记选中/上下文（{{selection}} 的取值）
-    ///   - insert: 最终文本落地回调（面板与全局斜杠各不相同）
-    ///   - onError: 非致命错误回调（如 {{ai:}} 请求失败）
-    static func run(_ template: TemplateNote,
-                    selection: String,
-                    insert: @escaping (String) -> Void,
-                    onError: @escaping (String) -> Void) {
-        // 剪贴板必须在插入前读取（typeExpansion 会临时改写剪贴板）
-        let clip = NSPasteboard.general.string(forType: .string) ?? ""
-        let plan = TemplateEngine.plan(template.content, selection: selection, clipboard: clip)
+    typealias Ask = @MainActor (String) async -> String?
+    typealias Completion = @MainActor (String, String) async throws -> String
 
-        guard plan.hasInteractive else {
-            insert(TemplateEngine.render(plan, answers: [:], ais: [:]))
-            return
-        }
-
-        collectAsks(plan: plan, answers: [:]) { answers in
-            guard let answers else { return }   // 用户取消：整体中止
-            runAI(plan: plan, answers: answers, ais: [:], firstError: nil) { final, error in
-                if let error { onError(error) }
-                insert(final)
-            }
-        }
+    struct Output {
+        let text: String
+        let firstError: String?
     }
 
-    /// 依次弹窗收集 {{ask:}} 输入；取消返回 nil
-    private static func collectAsks(plan: TemplateExpansionPlan,
-                                    answers: [Int: String],
-                                    done: @escaping ([Int: String]?) -> Void) {
-        guard let next = plan.asks.keys.filter({ answers[$0] == nil }).sorted().first else {
-            done(answers)   // 无 ask 或全部答完
-            return
+    private static var tasks: [UUID: Task<Void, Never>] = [:]
+    private static var cancellationGeneration = UUID()
+
+    /// 同时停止 ask/AI 与等待 Notes 激活的写入；已排队的桥接回调也会失效。
+    static func cancelAll() {
+        cancellationGeneration = UUID()
+        let pending = Array(tasks.values)
+        tasks.removeAll()
+        for task in pending { task.cancel() }
+    }
+
+    /// 展开并插入模板；返回任务供调用方取消或等待。剪贴板/ask 可注入以免测试触发系统 UI。
+    @discardableResult
+    static func run(_ template: TemplateNote,
+                    selection: String,
+                    clipboard: String? = nil,
+                    ask: Ask? = nil,
+                    complete: Completion? = nil,
+                    isOperationValid: @escaping () -> Bool = { true },
+                    insert: @escaping (String) -> Void,
+                    onError: @escaping (String) -> Void) -> Task<Void, Never> {
+        start(template, selection: selection, clipboard: clipboard, ask: ask, complete: complete,
+              isOperationValid: isOperationValid, insert: { text, _ in insert(text) }, onError: onError)
+    }
+
+    private static func start(_ template: TemplateNote,
+                              selection: String, clipboard: String?, ask: Ask?, complete: Completion?,
+                              isOperationValid: @escaping () -> Bool,
+                              insert: @escaping (String, @escaping () -> Bool) async -> Void,
+                              onError: @escaping (String) -> Void) -> Task<Void, Never> {
+        let clip = clipboard ?? NSPasteboard.general.string(forType: .string) ?? ""
+        let plan = TemplateEngine.plan(template.content, selection: selection, clipboard: clip)
+        // 在 Task/ask 开始前抓取，设置切换不会改变本次运行的任一 AI 请求。
+        let complete = snapshotCompletion(for: plan, injected: complete)
+        let id = UUID()
+        let generation = cancellationGeneration
+        let token = TemplateCancellationToken()
+        let valid: () -> Bool = { !token.isCancelled && generation == cancellationGeneration && isOperationValid() }
+        let task = Task { @MainActor in
+            await withTaskCancellationHandler {
+                defer { tasks[id] = nil }
+                do {
+                    try Task.checkCancellation()
+                    guard valid() else { return }
+                    let output = try await execute(plan, selection: selection, ask: ask, complete: complete)
+                    try Task.checkCancellation()
+                    guard valid() else { return }
+                    if let error = output.firstError { onError(error) }
+                    try Task.checkCancellation()
+                    guard valid() else { return }
+                    await insert(output.text, valid)
+                } catch is CancellationError {
+                    token.cancel()
+                } catch {
+                    if valid() { onError(error.localizedDescription) }
+                }
+            } onCancel: { token.cancel() }
         }
-        let question = plan.asks[next] ?? ""
-        askUser(question: question) { answer in
-            guard let answer else { done(nil); return }
-            var next2 = answers
-            next2[next] = answer
-            collectAsks(plan: plan, answers: next2, done: done)
+        tasks[id] = task
+        return task
+    }
+
+    /// 无 UI 的异步计划执行入口；失败槽位保留原文，每槽只尝试一次。
+    static func execute(_ plan: TemplateExpansionPlan,
+                        selection: String,
+                        ask: Ask? = nil,
+                        complete: Completion? = nil) async throws -> Output {
+        try Task.checkCancellation()
+        let complete = snapshotCompletion(for: plan, injected: complete)
+        var answers: [Int: String] = [:]
+        for slot in plan.asks.keys.sorted() {
+            try Task.checkCancellation()
+            let question = plan.asks[slot] ?? ""
+            let answer: String?
+            if let ask { answer = await ask(question) }
+            else { answer = askUser(question: question) }
+            try Task.checkCancellation()
+            guard let answer else { throw CancellationError() }
+            answers[slot] = answer
+        }
+
+        var ais: [Int: String] = [:]
+        var firstError: String?
+        if let complete {
+            for slot in plan.ais.keys.sorted() {
+                try Task.checkCancellation()
+                let instruction = plan.ais[slot] ?? ""
+                do {
+                    ais[slot] = try await complete(instruction, selection)
+                    try Task.checkCancellation()
+                } catch {
+                    try Task.checkCancellation()
+                    if error is CancellationError || (error as? URLError)?.code == .cancelled {
+                        throw CancellationError()
+                    }
+                    let message = "模板 {{ai:\(instruction.prefix(20))}}… 请求失败：\(error.localizedDescription)"
+                    firstError = firstError ?? message
+                }
+            }
+        }
+        try Task.checkCancellation()
+        return Output(text: TemplateEngine.render(plan, answers: answers, ais: ais), firstError: firstError)
+    }
+
+    private static func snapshotCompletion(for plan: TemplateExpansionPlan,
+                                           injected: Completion?) -> Completion? {
+        if let injected { return injected }
+        guard !plan.ais.isEmpty else { return nil }
+        let configuration = Result { try AIRequestConfiguration.current() }
+        return { instruction, context in
+            try await AIService.complete(instruction: instruction, context: context,
+                                         configuration: configuration.get())
         }
     }
 
     /// 弹窗输入（NSAlert + accessory TextField，回车确认 / Esc 取消）
-    private static func askUser(question: String, done: @escaping (String?) -> Void) {
+    private static func askUser(question: String) -> String? {
         let alert = NSAlert()
         alert.messageText = "模板需要输入"
         alert.informativeText = question
@@ -285,46 +377,35 @@ enum TemplateRunner {
         alert.accessoryView = field
         alert.window.initialFirstResponder = field
         let resp = alert.runModal()
-        done(resp == .alertFirstButtonReturn ? (field.stringValue.isEmpty ? "" : field.stringValue) : nil)
+        return resp == .alertFirstButtonReturn ? field.stringValue : nil
     }
 
-    /// 串行执行 {{ai:}} 请求；失败槽位保留原文并记录首个错误
-    private static func runAI(plan: TemplateExpansionPlan,
-                              answers: [Int: String],
-                              ais: [Int: String],
-                              firstError: String?,
-                              done: @escaping (String, String?) -> Void) {
-        let pending = plan.ais.keys.filter { ais[$0] == nil }.sorted().first
-        guard let next = pending else {
-            done(TemplateEngine.render(plan, answers: answers, ais: ais), firstError)
-            return
+    /// 全局斜杠通道：入口绑定原笔记与光标，异步完成时拒绝失效目标。
+    @discardableResult
+    static func runInNotes(_ template: TemplateNote,
+                           selection: String,
+                           bridge: NotesBridge = .shared,
+                           clipboard: String? = nil,
+                           ask: Ask? = nil,
+                           complete: Completion? = nil,
+                           isOperationValid: @escaping () -> Bool = { true },
+                           onError: ((String) -> Void)? = nil) -> Task<Void, Never>? {
+        let report: (String) -> Void = onError ?? { NCLog.log("模板执行警告：\($0)") }
+        guard let target = bridge.readTextSnapshot() else {
+            report("无法定位 Notes 原光标，已取消模板写入。")
+            return nil
         }
-        let instruction = plan.ais[next] ?? ""
-        Task { @MainActor in
-            do {
-                let out = try await AIService.complete(instruction: instruction, context: selectionHint)
-                var next2 = ais
-                next2[next] = out
-                runAI(plan: plan, answers: answers, ais: next2, firstError: firstError, done: done)
-            } catch {
-                let msg = "模板 {{ai:\(instruction.prefix(20))}}… 请求失败：\(error.localizedDescription)"
-                runAI(plan: plan, answers: answers, ais: ais,
-                      firstError: firstError ?? msg, done: done)
+        return start(template, selection: selection, clipboard: clipboard, ask: ask, complete: complete,
+                     isOperationValid: isOperationValid, insert: { text, valid in
+            // 保持任务运行直到桥接结束；Task.cancel 会同步使 durable token 失效，
+            // DispatchQueue 的回调只检查 token，不读取自己的 Task.isCancelled。
+            await withCheckedContinuation { continuation in
+                bridge.writeWhenNotesActive(in: target, text: text, isOperationValid: valid) { error in
+                    if let error, valid() { report(error) }
+                    continuation.resume()
+                }
             }
-        }
-    }
-
-    /// {{ai:}} 的上下文取值：跟随 {{selection}} 语义（全局斜杠已在面板/引擎侧设置）
-    nonisolated(unsafe) static var selectionHint: String = ""
-
-    /// 便捷入口：全局斜杠通道（Notes 内直接展开插入，零 UI 除 ask 弹窗外）
-    static func runInNotes(_ template: TemplateNote, selection: String) {
-        selectionHint = selection
-        run(template, selection: selection) { text in
-            NotesBridge.shared.typeExpansion(deleteCount: 0, insert: text)
-        } onError: { msg in
-            NCLog.log("模板执行警告：\(msg)")
-        }
+        }, onError: report)
     }
 }
 

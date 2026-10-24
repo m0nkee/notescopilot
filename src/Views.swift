@@ -149,7 +149,7 @@ struct PromptTextView: NSViewRepresentable {
             guard !token.contains(where: { $0.isWhitespace }) else { close(); return }
             let all = parent.commands()
             let filtered = token.isEmpty ? all
-                : all.filter { $0.name.localizedCaseInsensitiveContains(token) }
+                : all.filter { $0.name.localizedCaseInsensitiveContains(token) || $0.alias.localizedCaseInsensitiveContains(token) }
             suggestions = filtered
             active = !filtered.isEmpty
             parent.onSuggestions(filtered)
@@ -208,43 +208,111 @@ struct PromptTextView: NSViewRepresentable {
 
 // MARK: - 主面板
 
+/// Notes diagnostics stay separate from AI errors so manual input remains usable.
+struct NotesAccessNoticeView: View {
+    let issue: NotesAccessIssue
+    var allowsManualInput = false
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 8) {
+            Image(systemName: "exclamationmark.triangle.fill").foregroundColor(.orange)
+            VStack(alignment: .leading, spacing: 6) {
+                Text(issue.message).font(.caption).textSelection(.enabled)
+                if issue == .accessibilityRequired {
+                    Text("Notes 中的 / 命令和选中加工暂不可用。")
+                        .font(.caption2).foregroundColor(.secondary)
+                }
+                if allowsManualInput {
+                    Text("仍可在这里手动输入上下文和任务，使用 AI。")
+                        .font(.caption2).foregroundColor(.secondary)
+                }
+                if issue == .accessibilityRequired {
+                    Button("打开辅助功能设置") { NotesBridge.shared.openAccessibilityPrefs() }
+                        .buttonStyle(.link).font(.caption)
+                } else if issue.needsAutomationSettings {
+                    Button("打开自动化设置") { NotesBridge.shared.openAutomationPrefs() }
+                        .buttonStyle(.link).font(.caption)
+                } else {
+                    Button("打开 Notes") {
+                        guard let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: NotesBridge.notesBundleID) else { return }
+                        NSWorkspace.shared.openApplication(at: url, configuration: NSWorkspace.OpenConfiguration(), completionHandler: nil)
+                    }
+                    .buttonStyle(.link).font(.caption)
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .padding(10)
+        .background(Color.orange.opacity(0.08), in: RoundedRectangle(cornerRadius: 8))
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("notes.accessIssue")
+    }
+}
+
 struct PanelView: View {
     @ObservedObject var engine: ChatEngine
+    private let notesAccessIssueProvider: () -> NotesAccessIssue?
+
+    init(engine: ChatEngine,
+         notesAccessIssueProvider: @escaping () -> NotesAccessIssue? = { NotesBridge.shared.refreshAccessIssue() }) {
+        self.engine = engine
+        self.notesAccessIssueProvider = notesAccessIssueProvider
+    }
+
     @State private var prompt = ""
     @State private var axTrusted = true
+    @State private var notesAccessIssue: NotesAccessIssue?
     @State private var suggestions: [SlashCommand] = []
     @State private var selectedIdx = 0
     /// 当前生效模型配置（设置页切换后经通知实时刷新）
     @State private var activeProfileLabel = ""
+    @State private var showHistory = false
+    @State private var showRawOutput = false
+    @State private var followOutput = true
+    @State private var writingReview = false
 
     var body: some View {
         VStack(spacing: 12) {
             header
-            if !engine.pendingResult.isEmpty { reviewBanner }
-            contextSection
-            if !suggestions.isEmpty { suggestionsMenu }
-            promptSection
-            quickActionsRow
+            ScrollView {
+                VStack(spacing: 10) {
+                    contextSection
+                    if showHistory { historySection }
+                    if !suggestions.isEmpty { suggestionsMenu }
+                    promptSection
+                    quickActionsRow
+                }
+            }.frame(maxHeight: showHistory || !suggestions.isEmpty || notesAccessIssue != nil ? 340 : engine.images.isEmpty ? 215 : 265)
             outputSection
+            if !engine.pendingResult.isEmpty { reviewBanner }
             footerBar
         }
         .padding(14)
-        .frame(minWidth: 460, minHeight: 680)
+        .frame(minWidth: 520, minHeight: 640)
         .animation(.spring(response: 0.35, dampingFraction: 0.85),
                    value: engine.pendingResult.isEmpty)
         .onAppear {
-            axTrusted = NotesBridge.shared.isTrusted
+            refreshNotesAccess()
             activeProfileLabel = Self.profileLabel()
         }
-        .onReceive(NotificationCenter.default.publisher(for: ProfileStore.changedNotification)) { _ in
+        .onReceive(NotificationCenter.default.publisher(for: ProfileStore.changedNotification).receive(on: DispatchQueue.main)) { _ in
             activeProfileLabel = Self.profileLabel()
+        }
+        .onReceive(engine.$submittedPrompt.receive(on: DispatchQueue.main)) { submitted in
+            prompt = submitted
+        }
+        .onReceive(NotificationCenter.default.publisher(for: NotesBridge.accessChangedNotification, object: NotesBridge.shared).receive(on: DispatchQueue.main)) { _ in
+            refreshNotesAccess()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification).receive(on: DispatchQueue.main)) { _ in
+            refreshNotesAccess()
         }
         .onDrop(of: [UTType.image], isTargeted: nil) { providers in
             var got = false
             for p in providers {
                 p.loadObject(ofClass: NSImage.self) { obj, _ in
-                    if let img = obj as? NSImage, let att = ImageAttachment.make(img) {
-                        DispatchQueue.main.async { engine.images.append(att) }
+                    if let img = obj as? NSImage {
+                        DispatchQueue.main.async { engine.addImage(img) }
                     }
                 }
                 got = true
@@ -256,45 +324,59 @@ struct PanelView: View {
     // MARK: 头部
 
     private var header: some View {
-        HStack(spacing: 8) {
-            Image(systemName: "sparkles").foregroundStyle(.purple)
-            Text("NotesCopilot").font(.headline)
-            if !activeProfileLabel.isEmpty {
-                Text(activeProfileLabel)
-                    .font(.caption2).foregroundColor(.green)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-                    .frame(maxWidth: 110)
-                    .help("当前生效模型配置（设置中可切换）")
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 8) {
+                Image(systemName: "sparkles").foregroundStyle(.purple)
+                Text("NotesCopilot").font(.headline)
+                Spacer()
+                Button { engine.beginSession() } label: { Label("新会话", systemImage: "square.and.pencil") }
+                    .controlSize(.small)
+                Button { showHistory.toggle() } label: { Label("历史 \(engine.history.count / 2)", systemImage: "clock") }
+                    .controlSize(.small)
             }
-            Text("⇧⌘Space")
-                .font(.caption2).foregroundColor(.secondary)
-                .padding(.horizontal, 4).padding(.vertical, 2)
-                .background(RoundedRectangle(cornerRadius: 4).fill(.quaternary))
-            Toggle("连续对话", isOn: $engine.continuous)
-                .toggleStyle(.switch).controlSize(.mini)
-            if engine.continuous && !engine.history.isEmpty {
-                Text("已 \(engine.history.count / 2) 轮")
-                    .font(.caption2).foregroundColor(.secondary)
+            HStack(spacing: 8) {
+                Text(activeProfileLabel.isEmpty ? "尚未配置模型" : activeProfileLabel)
+                    .font(.caption).foregroundColor(.secondary).lineLimit(1).truncationMode(.middle)
+                Spacer(minLength: 4)
+                Toggle("连续对话", isOn: $engine.continuous).toggleStyle(.switch).controlSize(.mini)
             }
-            Spacer()
-            Button {
-                if let sel = NotesBridge.shared.readSelectedText(), !sel.isEmpty {
-                    engine.noteContext = sel
-                }
-            } label: {
-                Label("抓取选中", systemImage: "arrow.down.circle")
+            if let notice = engine.sessionNotice {
+                Text(notice).font(.caption2).foregroundColor(.secondary)
             }
-            .buttonStyle(.link)
-            Button {
-                engine.noteContext = ""
-            } label: {
-                Label("清空", systemImage: "xmark.circle")
-            }
-            .buttonStyle(.link)
         }
     }
 
+    private var historySection: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("连续对话发送最近 6 轮；切换笔记来源或模型配置会开始新会话。")
+                .font(.caption2).foregroundColor(.secondary)
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 10) {
+                    ForEach(Array(engine.history.enumerated()), id: \.offset) { _, message in
+                        let assistant = message["role"] as? String == "assistant"
+                        let content = message["content"] as? String ?? ""
+                        DisclosureGroup(assistant ? "AI 回答" : "我的任务") {
+                            if assistant { MarkdownPreview(text: content) }
+                            else { Text(content).font(.caption).textSelection(.enabled) }
+                        }.font(.caption)
+                    }
+                    if engine.history.isEmpty { Text("当前会话暂无已完成的对话").font(.caption).foregroundColor(.secondary) }
+                }
+            }.frame(maxHeight: 160)
+        }.padding(10).background(Color.primary.opacity(0.04), in: RoundedRectangle(cornerRadius: 8))
+    }
+
+    private func refreshContext() {
+        let target = NotesBridge.shared.readNotesSnapshot()
+        let context = target.flatMap { NotesBridge.context(in: $0) }
+        engine.setContext(context?.text ?? "", source: context?.source ?? "", noteID: target?.noteID)
+        refreshNotesAccess()
+    }
+
+    private func refreshNotesAccess() {
+        notesAccessIssue = notesAccessIssueProvider()
+        axTrusted = notesAccessIssue != .accessibilityRequired
+    }
     // MARK: 笔记上下文
 
     private var contextSection: some View {
@@ -309,17 +391,22 @@ struct PanelView: View {
                         .background(RoundedRectangle(cornerRadius: 4).fill(Color.purple.opacity(0.12)))
                 }
                 Spacer()
+                Button("重新获取", action: refreshContext).buttonStyle(.link).font(.caption)
+                Button("清空") { engine.setContext("", source: "") }.buttonStyle(.link).font(.caption)
+            }
+            if let issue = notesAccessIssue {
+                NotesAccessNoticeView(issue: issue, allowsManualInput: true)
             }
             ZStack(alignment: .topLeading) {
-                TextEditor(text: $engine.noteContext)
+                TextEditor(text: Binding(get: { engine.noteContext }, set: { engine.setContext($0, source: "手动输入") }))
                     .font(.system(size: 11, design: .monospaced))
-                    .frame(height: 72)
+                    .frame(height: 60)
                     .scrollContentBackground(.hidden)
                     .background(RoundedRectangle(cornerRadius: 6)
                         .fill(Color(nsColor: .textBackgroundColor)))
                     .opacity(engine.noteContext.isEmpty ? 0.6 : 1)
                 if engine.noteContext.isEmpty {
-                    Text("在 Notes 中选中文字或用 / 命令会自动带入；无需选中，光标所在段落也会作为上下文。")
+                    Text("回到 Notes 选中文字或放置光标，按 ⇧⌘Space 获取上下文；也可在这里手动输入。")
                         .font(.caption2).foregroundColor(.secondary)
                         .padding(8).allowsHitTesting(false)
                 }
@@ -360,8 +447,10 @@ struct PanelView: View {
     // MARK: 提示词输入 + 图片
 
     private var promptSection: some View {
-        VStack(spacing: 6) {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("任务 · ⌘↩ 生成").font(.caption).foregroundColor(.secondary)
             HStack(alignment: .bottom, spacing: 8) {
+                ZStack(alignment: .topLeading) {
                 PromptTextView(text: $prompt,
                                commands: { buildSlashCommands() },
                                onSuggestions: { list in
@@ -380,6 +469,12 @@ struct PanelView: View {
                                onCancelSuggestions: { suggestions = [] },
                                selectedIndex: { selectedIdx })
                     .frame(height: 64)
+                    .accessibilityLabel("写作任务")
+                    if prompt.isEmpty {
+                        Text("输入想完成的任务，或输入 / 查看命令")
+                            .font(.caption).foregroundColor(.secondary).padding(8).allowsHitTesting(false)
+                    }
+                }.overlay(RoundedRectangle(cornerRadius: 6).strokeBorder(Color.primary.opacity(0.12)))
                 VStack(spacing: 6) {
                     Button {
                         suggestions = []
@@ -441,9 +536,7 @@ struct PanelView: View {
         panel.canChooseDirectories = false
         if panel.runModal() == .OK {
             for u in panel.urls {
-                if let img = NSImage(contentsOf: u), let att = ImageAttachment.make(img) {
-                    engine.images.append(att)
-                }
+                if let img = NSImage(contentsOf: u) { engine.addImage(img) }
             }
         }
     }
@@ -461,6 +554,7 @@ struct PanelView: View {
                     }
                     .buttonStyle(.bordered)
                     .controlSize(.small)
+                    .disabled(engine.busy)
                 }
             }
         }
@@ -468,8 +562,7 @@ struct PanelView: View {
 
     // MARK: AI 结果 review 横幅（斜杠命令完成后确认再写回，防误写）
 
-    /// review 期间是否有选中可替换：进入 review 时读一次（面板夺焦点前）
-    @State private var reviewHasSelection = false
+    private var reviewHasSelection: Bool { (engine.pendingTarget?.range.length ?? 0) > 0 }
 
     private var reviewBanner: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -480,7 +573,7 @@ struct PanelView: View {
                     .font(.system(size: 12, weight: .medium))
                 Spacer()
                 Button {
-                    engine.pendingResult = ""
+                    engine.dismissReview()
                 } label: {
                     Image(systemName: "xmark.circle.fill")
                         .foregroundStyle(.tertiary)
@@ -488,27 +581,34 @@ struct PanelView: View {
                 .buttonStyle(.plain)
                 .help("丢弃结果")
             }
-            // 结果预览（截断）
-            Text(engine.pendingResult)
-                .font(.system(size: 11))
-                .foregroundColor(.secondary)
-                .lineLimit(2)
-                .truncationMode(.middle)
             HStack(spacing: 8) {
                 Button {
-                    _ = NotesBridge.shared.replaceSelectionInNotes(engine.pendingResult)
-                    engine.pendingResult = ""
+                    guard let target = engine.pendingTarget, let reviewID = engine.pendingReviewID else { return }
+                    let result = engine.pendingResult
+                    writingReview = true
+                    NotesBridge.shared.writeWhenNotesActive(in: target, text: result, html: MarkdownDocument.html(result),
+                                                           isOperationValid: { engine.pendingReviewID == reviewID }) { error in
+                        writingReview = false
+                        guard engine.pendingReviewID == reviewID else { return }
+                        if let error {
+                            engine.lastError = error
+                        } else if engine.pendingResult == result,
+                                  engine.pendingTarget?.matches(target) == true {
+                            engine.dismissReview()
+                        }
+                    }
                 } label: {
                     Label(reviewHasSelection ? "替换选中" : "插入光标处",
                           systemImage: reviewHasSelection ? "arrow.triangle.2.circlepath" : "square.and.arrow.down.on.square")
                         .labelStyle(.titleAndIcon)
                 }
                 .controlSize(.small)
+                .disabled(engine.pendingTarget == nil || writingReview)
                 Button {
                     let pb = NSPasteboard.general
                     pb.clearContents()
                     pb.setString(engine.pendingResult, forType: .string)
-                    engine.pendingResult = ""
+                    engine.dismissReview()
                 } label: {
                     Label("复制", systemImage: "doc.on.doc")
                         .labelStyle(.titleAndIcon)
@@ -525,29 +625,53 @@ struct PanelView: View {
                     .strokeBorder(Color.purple.opacity(0.25), lineWidth: 1))
         )
         .transition(.move(edge: .top).combined(with: .opacity))
-        .onAppear {
-            reviewHasSelection = !(NotesBridge.shared.readSelectedText() ?? "").isEmpty
-        }
     }
 
     // MARK: 输出区
 
     private var outputSection: some View {
-        ZStack(alignment: .topLeading) {
-            RoundedRectangle(cornerRadius: 8)
-                .fill(Color(nsColor: .controlBackgroundColor))
-            ScrollView {
-                Text(engine.output.isEmpty ? "AI 结果会显示在这里…（输入 / 查看斜杠命令）" : engine.output)
-                    .font(.system(size: 12))
-                    .textSelection(.enabled)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(10)
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 8) {
+                Text(engine.responseStatus.isEmpty ? "结果" : engine.responseStatus)
+                    .font(.caption).foregroundColor(.secondary)
+                Spacer()
+                Toggle("跟随输出", isOn: $followOutput).toggleStyle(.checkbox).font(.caption2)
+                Picker("显示方式", selection: $showRawOutput) {
+                    Text("预览").tag(false)
+                    Text("原文").tag(true)
+                }.pickerStyle(.segmented).labelsHidden().frame(width: 112)
             }
-        }
-        .overlay(alignment: .topTrailing) {
-            if engine.busy { ProgressView().padding(8) }
-        }
-        .frame(maxHeight: .infinity)
+            ScrollViewReader { proxy in
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 0) {
+                        if engine.output.isEmpty {
+                            Text("输入任务开始写作，或输入 / 选择命令。")
+                                .font(.callout).foregroundColor(.secondary)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                        } else if showRawOutput {
+                            Text(engine.output).font(.system(size: 12, design: .monospaced))
+                                .textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading)
+                        } else {
+                            MarkdownPreview(text: engine.output)
+                        }
+                        Color.clear.frame(height: 1).id("outputBottom")
+                    }.padding(12)
+                }
+                .onChange(of: engine.output) { _ in
+                    if followOutput && engine.busy { proxy.scrollTo("outputBottom", anchor: .bottom) }
+                }
+            }
+            .background(Color(nsColor: .textBackgroundColor), in: RoundedRectangle(cornerRadius: 8))
+            .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(Color.primary.opacity(0.08)))
+            .overlay(alignment: .topTrailing) { if engine.busy { ProgressView().controlSize(.small).padding(8) } }
+            .frame(minHeight: 120, maxHeight: .infinity)
+            if !engine.busy && (engine.canRetry || engine.canContinue) {
+                HStack {
+                    if engine.canRetry { Button("重新生成") { engine.retryLastRequest() } }
+                    if engine.canContinue { Button("继续生成") { engine.continueLastResponse() } }
+                }.controlSize(.small)
+            }
+        }.frame(maxHeight: .infinity)
     }
 
     // MARK: 底栏（结果操作 + token 用量）
@@ -556,27 +680,30 @@ struct PanelView: View {
         VStack(alignment: .leading, spacing: 4) {
             HStack(spacing: 8) {
                 Button {
-                    if let err = NotesBridge.shared.insertIntoNotes(engine.output) {
-                        engine.lastError = err
+                    let generation = engine.operationGeneration
+                    NotesBridge.shared.insertIntoNotes(engine.output, html: MarkdownDocument.html(engine.output),
+                                                       isOperationValid: { engine.operationGeneration == generation }) { error in
+                        guard engine.operationGeneration == generation else { return }
+                        engine.lastError = error
                     }
                 } label: {
                     Label("插入笔记", systemImage: "square.and.arrow.down.on.square")
                 }
-                .disabled(engine.output.isEmpty)
+                .disabled(engine.output.isEmpty || engine.busy)
                 Button("复制") {
                     let pb = NSPasteboard.general
                     pb.clearContents()
                     pb.setString(engine.output, forType: .string)
                 }
-                .disabled(engine.output.isEmpty)
+                .disabled(engine.output.isEmpty || engine.busy)
                 Button {
-                    if let err = NotesBridge.shared.createNewNote(engine.output) {
+                    if let err = NotesBridge.shared.createNewNote(engine.output, html: MarkdownDocument.html(engine.output)) {
                         engine.lastError = err
                     }
                 } label: {
                     Label("存为新笔记", systemImage: "doc.badge.plus")
                 }
-                .disabled(engine.output.isEmpty)
+                .disabled(engine.output.isEmpty || engine.busy)
                 Spacer()
                 if !axTrusted {
                     Button("授权辅助功能") { NotesBridge.shared.requestTrust() }
@@ -592,7 +719,10 @@ struct PanelView: View {
             }
             HStack {
                 if let err = engine.lastError {
-                    Text(err).font(.caption).foregroundColor(.red).lineLimit(2)
+                    ScrollView {
+                        Text(err).font(.caption).foregroundColor(.red).textSelection(.enabled)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }.frame(maxHeight: 56)
                 }
                 Spacer()
                 if engine.promptTokens > 0 || engine.totalPromptTokens > 0 {
@@ -623,30 +753,50 @@ struct PanelView: View {
         case .fill(let p):
             prompt = p
         case .clearContext:
-            engine.noteContext = ""
+            engine.setContext("", source: "")
         case .newSession:
-            engine.resetSession()
+            engine.beginSession()
         case .insertOutput:
-            if let err = NotesBridge.shared.insertIntoNotes(engine.output) {
-                engine.lastError = err
+            let generation = engine.operationGeneration
+            NotesBridge.shared.insertIntoNotes(engine.output, html: MarkdownDocument.html(engine.output),
+                                               isOperationValid: { engine.operationGeneration == generation }) { error in
+                guard engine.operationGeneration == generation else { return }
+                engine.lastError = error
             }
         case .saveAsNote:
-            if let err = NotesBridge.shared.createNewNote(engine.output) {
+            if let err = NotesBridge.shared.createNewNote(engine.output, html: MarkdownDocument.html(engine.output)) {
                 engine.lastError = err
             }
         case .openSettings:
             NotificationCenter.default.post(name: .init("nc.openSettings"), object: nil)
         case .format(let style):
-            _ = FormatBridge.trigger(style)
+            guard let target = NotesBridge.shared.readNotesSnapshot() else {
+                engine.lastError = "请先回到 Notes 正文选择要设置格式的文字。"
+                return
+            }
+            NotesBridge.shared.withNotesTargetActive(in: target) { error in
+                if let error { engine.lastError = error }
+                else if !FormatBridge.trigger(style) { engine.lastError = "当前 Notes 菜单中无法应用此格式。" }
+            }
         case .stopGeneration:
             engine.stop()
         case .insertTemplate(let tpl):
             // 模板：变量引擎展开（{{selection}} 取面板笔记上下文）后插入 Notes
-            TemplateRunner.run(tpl, selection: engine.noteContext) { text in
-                if let err = NotesBridge.shared.insertIntoNotes(text) {
-                    engine.lastError = err
+            guard let target = NotesBridge.shared.readNotesSnapshot() else {
+                engine.lastError = "无法定位 Notes 原光标，请回到笔记正文后重试。"
+                return
+            }
+            engine.stop()
+            let generation = engine.operationGeneration
+            TemplateRunner.run(tpl, selection: engine.noteContext,
+                               isOperationValid: { engine.operationGeneration == generation }) { text in
+                NotesBridge.shared.writeWhenNotesActive(in: target, text: text,
+                                                       isOperationValid: { engine.operationGeneration == generation }) { error in
+                    guard engine.operationGeneration == generation else { return }
+                    if let error { engine.lastError = error }
                 }
             } onError: { msg in
+                guard engine.operationGeneration == generation else { return }
                 engine.lastError = msg
             }
         }
@@ -681,7 +831,7 @@ enum SettingsPage: String, CaseIterable, Identifiable {
         case .prompt: return "AI 的角色设定，随每次请求发送"
         case .markdown: return "在 Notes 里键入 # / ## / [] / > / ``` / - / * / 1. + 空格 自动套格式"
         case .templates: return "在提示词输入框键入 / 即可通过斜杠命令插入"
-        case .expansion: return "在任意应用（含 Notes）键入 /命令 直接用 AI；需「输入监控」授权"
+        case .expansion: return "Notes AI 交互需辅助功能与 Notes 自动化；关键词扩展另需输入监控"
         case .general: return "登录启动、权限检查与连接诊断"
         }
     }
@@ -700,12 +850,22 @@ enum SettingsPage: String, CaseIterable, Identifiable {
 }
 
 struct SettingsView: View {
+    private let discoverLocalModels: Bool
+    private let notesAccessIssueProvider: () -> NotesAccessIssue?
+    init(discoverLocalModels: Bool = true,
+         notesAccessIssueProvider: @escaping () -> NotesAccessIssue? = { NotesBridge.shared.refreshAccessIssue() },
+         initialPage: SettingsPage = .model) {
+        self.discoverLocalModels = discoverLocalModels
+        self.notesAccessIssueProvider = notesAccessIssueProvider
+        _page = State(initialValue: initialPage)
+    }
     // 多配置模型：可保存多份（不同服务商/本地），点选其一作为生效配置
     @State private var profiles: [ModelProfile] = ProfileStore.load()
     @State private var activeID: UUID? = ProfileStore.activeID
     /// 每份配置拉取到的模型列表（id → models）
     @State private var modelsByProfile: [UUID: [String]] = [:]
     @State private var fetchingID: UUID?
+    @State private var modelFetchGeneration = UUID()
     /// 展开编辑中的配置卡
     @State private var expandedIDs: Set<UUID> = []
     /// 本地推理服务探测结果（服务名 → 模型列表）
@@ -714,6 +874,8 @@ struct SettingsView: View {
     @AppStorage("nc.temp") private var temperature = 0.7
     @AppStorage("nc.maxTokens") private var maxTokens = 2048
     @State private var statusText = ""
+    @State private var recoveringCredentials = false
+    @State private var lastSavedProfiles: [ModelProfile]?
 
     // 模板与文本扩展
     @State private var templates: [TemplateNote] = TemplateStore.templates
@@ -739,6 +901,12 @@ struct SettingsView: View {
     @AppStorage("nc.md.numbered") private var mdNumbered = true
     @AppStorage("nc.urltitle.enabled") private var urlTitleEnabled = true
     @State private var launchAtLogin = false
+    @State private var changingLaunchAtLogin = false
+    @State private var testingModel = false
+    @State private var importingTemplates = false
+    @State private var axAuthorized = false
+    @State private var inputAuthorized = false
+    @State private var notesAccessIssue: NotesAccessIssue?
     /// 当前导航页（Magpie 左侧导航）
     @State private var page: SettingsPage = .model
 
@@ -749,10 +917,35 @@ struct SettingsView: View {
             settingsDetail
         }
         .frame(minWidth: 900, minHeight: 620)
+        .disabled(recoveringCredentials)
         .onReceive(NotificationCenter.default.publisher(for: .init("nc.kwStatus"))) { n in
             kwStatus = n.object as? String
         }
-        .onChange(of: profiles) { ProfileStore.save($0) }
+        .onReceive(NotificationCenter.default.publisher(for: ProfileStore.errorNotification).receive(on: DispatchQueue.main)) { note in
+            statusText = note.object as? String ?? "配置保存失败，请检查钥匙串权限。"
+        }
+        .onReceive(NotificationCenter.default.publisher(for: NotesBridge.accessChangedNotification, object: NotesBridge.shared).receive(on: DispatchQueue.main)) { _ in
+            refreshPermissionStatus()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification).receive(on: DispatchQueue.main)) { _ in
+            refreshPermissionStatus()
+        }
+        .onAppear {
+            lastSavedProfiles = profiles
+            refreshPermissionStatus()
+            if let error = ProfileStore.lastError { statusText = error }
+        }
+        .onChange(of: profiles) { list in
+            guard !recoveringCredentials, list != lastSavedProfiles else { return }
+            if ProfileStore.save(list) {
+                lastSavedProfiles = list
+                if let error = ProfileStore.lastError { statusText = error }
+                else if statusText.contains("钥匙串") || statusText.hasPrefix("配置未保存") {
+                    statusText = "配置已保存。"
+                }
+            }
+            else { statusText = ProfileStore.lastError ?? "配置保存失败" }
+        }
         .onChange(of: activeID) { id in
             ProfileStore.activeID = id
             updateActiveStatus()
@@ -761,7 +954,7 @@ struct SettingsView: View {
         .onChange(of: rules) { KeywordStore.rules = $0 }
         .onChange(of: kwEnabled) { on in
             UserDefaults.standard.set(on, forKey: "nc.kw.enabled")
-            if on { KeywordListener.shared.restart() } else { KeywordListener.shared.stop() }
+            KeywordListener.shared.restart()
         }
         .onChange(of: slashGlobal) { on in
             UserDefaults.standard.set(on, forKey: "nc.slash.global")
@@ -818,6 +1011,29 @@ struct SettingsView: View {
             }
 
             Spacer(minLength: 0)
+            VStack(spacing: 8) {
+                Divider().padding(.bottom, 2)
+                Button {
+                    (NSApp.delegate as? AppDelegate)?.showPanel()
+                } label: {
+                    Label("打开 AI 面板", systemImage: "sparkles")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.regular)
+                .accessibilityIdentifier("settings.openAIPanel")
+                Button {
+                    (NSApp.delegate as? AppDelegate)?.showLibrary()
+                } label: {
+                    Label("笔记库", systemImage: "books.vertical")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .accessibilityIdentifier("settings.openLibrary")
+            }
+            .padding(.horizontal, 10)
+            .padding(.bottom, 12)
             Text("v\(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "-")")
                 .font(.caption2)
                 .foregroundColor(.secondary)
@@ -832,16 +1048,60 @@ struct SettingsView: View {
 
     /// ── 右侧内容区：页头 + InfoBar 状态条 + 分页卡片 ──
     private var settingsDetail: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 12) {
-                pageHeader
-                if !statusText.isEmpty { infoBar }
-                pageContent
+        VStack(spacing: 0) {
+            if page == .model {
+                profileSaveBar
+                    .padding(.horizontal, 20)
+                    .padding(.vertical, 12)
+                Divider()
             }
-            .padding(20)
-            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+            ScrollView {
+                VStack(alignment: .leading, spacing: 12) {
+                    pageHeader
+                    if !statusText.isEmpty { infoBar }
+                    pageContent
+                }
+                .padding(20)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+            }
         }
         .background(Color(nsColor: .windowBackgroundColor))
+    }
+
+    private var profileSaveStatus: (text: String, icon: String, color: Color) {
+        if recoveringCredentials { return ("保存中…", "arrow.clockwise", .secondary) }
+        if needsCredentialRecovery { return ("未保存 · 需要钥匙串授权", "exclamationmark.triangle.fill", .orange) }
+        guard let saved = lastSavedProfiles else { return ("正在读取配置…", "ellipsis.circle", .secondary) }
+        if profiles != saved { return ("未保存的更改", "circle.fill", .orange) }
+        if profiles.isEmpty { return ("尚无模型配置", "tray", .secondary) }
+        return ("已保存", "checkmark.circle.fill", .green)
+    }
+
+    /// Keep the explicit save action reachable while the model list scrolls.
+    private var profileSaveBar: some View {
+        let status = profileSaveStatus
+        return HStack(spacing: 16) {
+            VStack(alignment: .leading, spacing: 3) {
+                Label(status.text, systemImage: status.icon)
+                    .font(.callout)
+                    .foregroundColor(status.color)
+                    .accessibilityIdentifier("settings.profileSaveStatus")
+                Text("修改后自动保存，也可点击按钮手动保存。")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+            }
+            Spacer(minLength: 8)
+            Button { recoverCredentials() } label: {
+                HStack(spacing: 6) {
+                    if recoveringCredentials { ProgressView().controlSize(.small) }
+                    Label(recoveringCredentials ? "保存中…" : "保存配置", systemImage: "square.and.arrow.down")
+                }
+            }
+            .buttonStyle(.borderedProminent)
+            .controlSize(.regular)
+            .disabled(recoveringCredentials)
+            .accessibilityIdentifier("settings.saveProfiles")
+        }
     }
 
     private var pageHeader: some View {
@@ -915,6 +1175,20 @@ struct SettingsView: View {
             card("checkmark.seal", "生效状态") {
                 activeStatusRow
             }
+            if needsCredentialRecovery || recoveringCredentials {
+                card("key.fill", "保存配置需要钥匙串授权", note: "完成系统认证后重试保存；取消可继续编辑当前草稿。") {
+                    HStack(spacing: 10) {
+                        Button("授权钥匙串并保存") { recoverCredentials() }
+                            .buttonStyle(.borderedProminent)
+                            .accessibilityIdentifier("settings.authorizeCredentials")
+                        if recoveringCredentials {
+                            ProgressView().controlSize(.small)
+                            Text("请在系统提示中完成授权或取消。")
+                                .font(.caption).foregroundColor(.secondary)
+                        }
+                    }
+                }
+            }
             ForEach($profiles) { $p in
                 profileCard($p)
             }
@@ -931,7 +1205,7 @@ struct SettingsView: View {
             }
         }
         .onAppear {
-            guard localServices.isEmpty else { return }
+            guard discoverLocalModels, localServices.isEmpty else { return }
             LocalAIProbe.discover { name, port, ids in
                 if !localServices.contains(where: { $0.port == port }) {
                     localServices.append((name, port, ids))
@@ -940,10 +1214,39 @@ struct SettingsView: View {
         }
     }
 
+    private var needsCredentialRecovery: Bool {
+        let error = ProfileStore.lastError ?? ""
+        return !profiles.isEmpty && (profiles.contains { $0.credentialUnavailable }
+            || (error.contains("钥匙串") && !error.hasPrefix("配置已保存")))
+    }
+
+    private func recoverCredentials() {
+        guard !recoveringCredentials else { return }
+        // A model-list response from before authorization must not mutate the
+        // captured draft while the user is completing the system prompt.
+        modelFetchGeneration = UUID()
+        fetchingID = nil
+        let drafts = profiles
+        recoveringCredentials = true
+        DispatchQueue.global(qos: .userInitiated).async {
+            let saved = ProfileStore.authorizeAndSave(drafts)
+            DispatchQueue.main.async {
+                if let saved {
+                    // The interactive transaction already persisted this exact list.
+                    lastSavedProfiles = saved
+                    profiles = saved
+                    statusText = ProfileStore.lastError ?? "配置已保存到系统钥匙串。"
+                } else {
+                    statusText = ProfileStore.lastError ?? "配置尚未保存，当前编辑内容已保留。"
+                }
+                recoveringCredentials = false
+            }
+        }
+    }
+
     /// 快速添加：云端预设 + 本地探测到的推理服务 + 手动新建
     private var quickAddRow: some View {
-        ScrollView(.horizontal, showsIndicators: false) {
-            HStack(spacing: 8) {
+        LazyVGrid(columns: [GridItem(.adaptive(minimum: 140), alignment: .leading)], alignment: .leading, spacing: 8) {
                 ForEach(presets, id: \.name) { p in
                     Button {
                         let prof = ModelProfile(name: p.name, baseURL: p.base,
@@ -982,20 +1285,25 @@ struct SettingsView: View {
                     Label("手动新建", systemImage: "square.and.pencil")
                 }
                 .buttonStyle(.bordered).controlSize(.small)
-            }
         }
     }
 
     /// 生效状态行：一眼看出当前用的是哪份配置
     @ViewBuilder private var activeStatusRow: some View {
         if let active = profiles.first(where: { $0.id == activeID }) ?? profiles.first {
-            HStack(spacing: 6) {
-                Image(systemName: "checkmark.circle.fill")
-                    .foregroundStyle(.green).font(.caption)
-                Text("当前生效：\(active.name.isEmpty ? "未命名" : active.name) ｜ \(active.baseURL) ｜ \(active.model.isEmpty ? "未填模型名" : active.model)")
-                    .font(.caption).foregroundColor(.secondary)
-                    .textSelection(.enabled)
-                    .lineLimit(1).truncationMode(.middle)
+            HStack(alignment: .top, spacing: 6) {
+                Image(systemName: active.credentialUnavailable ? "exclamationmark.triangle.fill" : "checkmark.circle.fill")
+                    .foregroundStyle(active.credentialUnavailable ? Color.orange : Color.green).font(.caption)
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("\(active.credentialUnavailable ? "当前选择" : "当前生效")：\(active.name.isEmpty ? "未命名" : active.name) ｜ \(active.baseURL) ｜ \(active.model.isEmpty ? "未填模型名" : active.model)")
+                        .font(.caption).foregroundColor(.secondary)
+                        .textSelection(.enabled)
+                        .lineLimit(1).truncationMode(.middle)
+                    if active.credentialUnavailable {
+                        Text("API Key 暂时无法读取，请授权钥匙串后使用。")
+                            .font(.caption).foregroundColor(.orange)
+                    }
+                }
             }
         } else {
             Text("尚无生效配置，AI 功能不可用。")
@@ -1007,8 +1315,9 @@ struct SettingsView: View {
     /// 展开区＝带标签的字段栅格（Base URL / API Key / 模型），编辑体验优先
     private func profileCard(_ binding: Binding<ModelProfile>) -> some View {
         let p = binding.wrappedValue
-        let isActive = p.id == activeID
+        let isActive = p.id == (activeID ?? profiles.first?.id)
         let isExpanded = expandedIDs.contains(p.id)
+        let activeColor: Color = p.credentialUnavailable ? .orange : .green
         return VStack(alignment: .leading, spacing: 10) {
             // ── 头部（常显）：单选 + 名称 + 摘要 + 操作 ──
             HStack(spacing: 10) {
@@ -1017,7 +1326,7 @@ struct SettingsView: View {
                 } label: {
                     Image(systemName: isActive ? "largecircle.fill.circle" : "circle")
                         .font(.system(size: 15))
-                        .foregroundStyle(isActive ? Color.green : Color.secondary)
+                        .foregroundStyle(isActive ? activeColor : Color.secondary)
                 }
                 .buttonStyle(.plain)
                 .help("设为生效配置")
@@ -1034,10 +1343,10 @@ struct SettingsView: View {
                 Spacer()
 
                 if isActive {
-                    Text("生效中")
-                        .font(.caption2).foregroundColor(.green)
+                    Text(p.credentialUnavailable ? "待授权" : "生效中")
+                        .font(.caption2).foregroundColor(activeColor)
                         .padding(.horizontal, 7).padding(.vertical, 2)
-                        .background(Capsule().fill(Color.green.opacity(0.12)))
+                        .background(Capsule().fill(activeColor.opacity(0.12)))
                 }
                 Button {
                     toggleExpand(p.id)
@@ -1079,7 +1388,7 @@ struct SettingsView: View {
                             .font(.caption).foregroundColor(.secondary)
                             .frame(width: 58, alignment: .leading)
                         HStack(spacing: 4) {
-                            SecureField("仅保存在本机，本地服务可留空", text: binding.apiKey)
+                            SecureField("存储于系统钥匙串，本地服务可留空", text: binding.apiKey)
                                 .contextMenu { pasteMenuItems(for: binding.apiKey) }
                             Button {
                                 if let s = NSPasteboard.general.string(forType: .string) {
@@ -1131,9 +1440,9 @@ struct SettingsView: View {
         }
         .padding(12)
         .background(RoundedRectangle(cornerRadius: 10)
-            .fill(isActive ? Color.green.opacity(0.06) : Color.primary.opacity(0.04)))
+            .fill(isActive ? activeColor.opacity(0.06) : Color.primary.opacity(0.04)))
         .overlay(RoundedRectangle(cornerRadius: 10)
-            .stroke(isActive ? Color.green.opacity(0.45) : Color.primary.opacity(0.08), lineWidth: 1))
+            .stroke(isActive ? activeColor.opacity(0.45) : Color.primary.opacity(0.08), lineWidth: 1))
     }
 
     /// 卡片摘要：host:port · 模型名
@@ -1153,9 +1462,9 @@ struct SettingsView: View {
     }
 
     private func deleteProfile(_ id: UUID) {
-        if activeID == id { activeID = nil }
         expandedIDs.remove(id)
         profiles.removeAll { $0.id == id }
+        if activeID == id { activeID = profiles.first?.id }
         statusText = "已删除该配置。"
     }
 
@@ -1252,6 +1561,12 @@ struct SettingsView: View {
 
     private var templatesPage: some View {
         VStack(alignment: .leading, spacing: 12) {
+            card("folder", "从 Apple Notes 导入") {
+                Text("读取 Notes 的 Templates 文件夹，新增本地模板；同名模板保留现有版本。导入后独立编辑，需要更新时可删除本地版本再导入。")
+                    .font(.caption).foregroundColor(.secondary)
+                Button(importingTemplates ? "正在导入…" : "导入 Templates 文件夹") { importNotesTemplates() }
+                    .disabled(importingTemplates).controlSize(.small)
+            }
             // 内置模板（对齐 ProNotes _defaultTemplates）
             let builtin = templates.filter(\.isBuiltin)
             if !builtin.isEmpty {
@@ -1381,19 +1696,19 @@ struct SettingsView: View {
                 Toggle("在 Notes 选中文字后自动弹出快捷加工条", isOn: $selAIEnabled)
                     .toggleStyle(.switch)
                 if selAIEnabled {
-                    Text("选中文字并保持约 0.4 秒，选区下方弹出悬浮条：〔润色 · 总结 · 翻译 · 解释 · 精简〕或输入自定义指令回车。AI 完成后弹出结果卡，可「替换选区」（直接覆盖原文字）、「追加到后」（插到选区末尾之后）、「复制」或关闭。仅辅助功能权限，无剪贴板污染优先 AX 直写。")
+                    Text("选中文字并保持约 0.4 秒，选区下方弹出悬浮条：〔润色 · 总结 · 翻译 · 解释 · 精简〕或输入自定义指令回车。AI 完成后弹出结果卡，可「替换选区」（直接覆盖原文字）、「追加到后」（插到选区末尾之后）、「复制」或关闭。需要辅助功能与 Notes 自动化权限（用于确认笔记身份），无需输入监控；优先 AX 直写。")
                         .font(.caption).foregroundColor(.secondary)
                     Text("切换选区会自动重新弹出；取消选区面板自动消失。")
                         .font(.caption2).foregroundColor(.secondary)
                 }
             }
-            card("slash.circle", "全局斜杠命令") {
-                Toggle("在任意应用（含 Notes）中键入 /命令 直接用 AI", isOn: $slashGlobal)
+            card("slash.circle", "Notes 斜杠命令") {
+                Toggle("在 Notes 正文键入 / 显示命令菜单", isOn: $slashGlobal)
                     .toggleStyle(.switch)
                 if slashGlobal {
-                    Text("在 Notes 里选中文字，键入命令+空格即可：/runse 润色 · /zongjie 总结 · /fanyi 翻译 · /xuxie 续写 · /jieshi 解释 · /kuoxie 扩写 · /yaodian 要点 · /biaoti 标题 · 英文命名模板也可直接键入。命中后自动抓取选中作上下文。")
+                    Text("输入 / 后可点击命令，或键入 /runse、/zongjie、/fanyi 等别名加空格。上下文使用当前选区或光标段落；AI 完成后确认写回。获取笔记上下文与写回需辅助功能及 Notes 自动化权限，以确认当前笔记身份。")
                         .font(.caption).foregroundColor(.secondary)
-                    Text("注：中文命令名经输入法组合后无法逐键捕获，请使用拼音别名；建议英文输入模式。")
+                    Text("中文名称与拼音别名均可筛选；键盘 ↑↓ / 回车导航需要输入监控，未授权时仍可点击命令。")
                         .font(.caption2).foregroundColor(.secondary)
                 }
             }
@@ -1449,40 +1764,61 @@ struct SettingsView: View {
     private var generalPage: some View {
         VStack(alignment: .leading, spacing: 12) {
             card("power", "登录启动") {
-                Toggle("登录时启动 NotesCopilot", isOn: $launchAtLogin)
+                Toggle("登录时启动 NotesCopilot", isOn: Binding(get: { launchAtLogin }, set: { on in
+                    changingLaunchAtLogin = true
+                    Task { @MainActor in
+                        defer { changingLaunchAtLogin = false }
+                        do {
+                            try await Self.setLaunchAtLogin(on)
+                            launchAtLogin = Self.isLaunchAtLogin()
+                            statusText = launchAtLogin == on ? "登录启动设置已更新。" : "请在系统设置中允许登录启动。"
+                        } catch {
+                            launchAtLogin = Self.isLaunchAtLogin()
+                            statusText = "登录启动设置失败：\(error.localizedDescription)"
+                        }
+                    }
+                }))
                     .toggleStyle(.switch)
-                    .onAppear {
-                        launchAtLogin = Self.isLaunchAtLogin()
-                    }
-                    .onChange(of: launchAtLogin) { on in
-                        Task { await Self.setLaunchAtLogin(on) }
-                    }
+                    .disabled(changingLaunchAtLogin)
+                    .onAppear { launchAtLogin = Self.isLaunchAtLogin() }
             }
-            card("lock.shield", "权限说明") {
-                Text("· 快捷键与读取选中文本需要「辅助功能」权限\n· 插入/新建笔记需要「自动化」权限（Apple Notes、系统事件）")
+            card("lock.shield", "功能与权限") {
+                Label(axAuthorized ? "辅助功能：已授权（不代表 Notes 自动化已授权）" : "辅助功能：未授权，Notes 中的 / 命令与选中加工不可用",
+                      systemImage: axAuthorized ? "checkmark.circle" : "exclamationmark.circle")
+                    .font(.caption).foregroundColor(axAuthorized ? .secondary : .orange)
+                if let issue = notesAccessIssue { NotesAccessNoticeView(issue: issue) }
+                Label(inputAuthorized ? "命令键盘导航与关键词扩展：已授权" : "命令键盘导航与关键词扩展：输入监控未授权（可用鼠标点击命令）",
+                      systemImage: inputAuthorized ? "checkmark.circle" : "info.circle").font(.caption).foregroundColor(.secondary)
+                Text("笔记库及模板导入需要完全磁盘访问权限；创建笔记、读取笔记身份及浏览器标题会在首次使用时请求自动化权限。")
                     .font(.caption).foregroundColor(.secondary)
                 HStack {
                     Button("打开辅助功能设置") {
                         NotesBridge.shared.openAccessibilityPrefs()
                     }
-                    .controlSize(.small)
-                }
+                    Button("自动化设置") { NotesBridge.shared.openAutomationPrefs() }
+                    Button("输入监控") { openPrivacy("Privacy_ListenEvent") }
+                    Button("完全磁盘访问") { openPrivacy("Privacy_AllFiles") }
+                    Button("重新检查") { refreshPermissionStatus() }
+                }.controlSize(.small)
             }
             card("antenna.radiowaves.left.and.right", "连接诊断") {
                 HStack {
                     Button {
-                        if let id = activeID ?? profiles.first?.id { fetchModels(for: id) }
+                        testActiveModel()
                     } label: {
-                        Label("测试当前生效配置", systemImage: "bolt.horizontal")
+                        Label(testingModel ? "正在测试生成…" : "测试当前模型生成", systemImage: "bolt.horizontal")
                     }
                     .buttonStyle(.borderedProminent)
                     .controlSize(.small)
+                    .disabled(testingModel || profiles.isEmpty)
                     Spacer()
                     if let p = Config.activeProfile {
                         Text("\(p.name.isEmpty ? "未命名" : p.name) · \(p.model.isEmpty ? "未填模型" : p.model)")
                             .font(.caption).foregroundColor(.secondary)
                     }
                 }
+                Text("发送一次简短生成请求验证模型、凭据及生成参数；“拉取列表”仅验证模型列表端点。")
+                    .font(.caption2).foregroundColor(.secondary)
                 if let st = kwStatus {
                     Text(st).font(.caption).foregroundColor(.orange)
                 }
@@ -1513,25 +1849,61 @@ struct SettingsView: View {
         SMAppService.mainApp.status == .enabled
     }
 
-    static func setLaunchAtLogin(_ on: Bool) async {
-        do {
-            if on {
-                try await SMAppService.mainApp.register()
-            } else {
-                try await SMAppService.mainApp.unregister()
+    static func setLaunchAtLogin(_ on: Bool) async throws {
+        if on { try SMAppService.mainApp.register() }
+        else { try await SMAppService.mainApp.unregister() }
+    }
+
+    private func refreshPermissionStatus() {
+        notesAccessIssue = notesAccessIssueProvider()
+        axAuthorized = notesAccessIssue != .accessibilityRequired
+        inputAuthorized = CGPreflightListenEventAccess()
+    }
+
+    private func openPrivacy(_ pane: String) {
+        if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?\(pane)") { NSWorkspace.shared.open(url) }
+    }
+
+    private func testActiveModel() {
+        testingModel = true
+        statusText = "正在验证当前模型是否可以生成…"
+        Task { @MainActor in
+            defer { testingModel = false }
+            do {
+                let configuration = try AIRequestConfiguration.current()
+                _ = try await AIService.complete(instruction: "请只回复 OK。", context: "", configuration: configuration)
+                statusText = "\(configuration.model)：生成成功，当前模型与参数可用。"
+            } catch { statusText = "生成测试失败：\(error.localizedDescription)" }
+        }
+    }
+
+    private func importNotesTemplates() {
+        guard let delegate = NSApp.delegate as? AppDelegate, let store = delegate.notesStore else {
+            statusText = (NSApp.delegate as? AppDelegate)?.notesStoreError ?? "笔记库尚未就绪，请在菜单栏打开笔记库并完成授权后重试。"
+            return
+        }
+        importingTemplates = true
+        DispatchQueue.global(qos: .userInitiated).async {
+            let candidates = NotesTemplateImporter.read(from: store)
+            DispatchQueue.main.async {
+                let result = NotesTemplateImporter.merging(candidates, into: templates)
+                templates = result.templates
+                importingTemplates = false
+                statusText = "已导入 \(result.addedCount) 个模板，跳过 \(result.skippedCount) 个同名或空模板。"
+                    + (candidates.isEmpty ? "请确认 Notes 中存在 Templates 文件夹和可完整读取的笔记。" : "")
             }
-        } catch {
-            print("launchAtLogin 失败：\(error.localizedDescription)")
         }
     }
 
     /// 拉取指定配置的模型列表（GET /models），写入该配置的模型菜单；
     /// 模型名为空时自动填第一个
     private func fetchModels(for id: UUID) {
-        guard let idx = profiles.firstIndex(where: { $0.id == id }) else { return }
+        guard !recoveringCredentials, let idx = profiles.firstIndex(where: { $0.id == id }) else { return }
         let raw = profiles[idx].baseURL
         let key = profiles[idx].apiKey
         let name = profiles[idx].name.isEmpty ? "未命名" : profiles[idx].name
+        modelFetchGeneration = UUID()
+        let generation = modelFetchGeneration
         fetchingID = id
         statusText = "正在请求 \(name) 的模型列表…"
         Task {
@@ -1541,6 +1913,12 @@ struct SettingsView: View {
                 }
                 let list = try await AIService.fetchModels(base: base, key: key)
                 await MainActor.run {
+                    guard modelFetchGeneration == generation, !recoveringCredentials else { return }
+                    guard let current = profiles.first(where: { $0.id == id }),
+                          current.baseURL == raw, current.apiKey == key else {
+                        fetchingID = nil
+                        return
+                    }
                     modelsByProfile[id] = list
                     if let i = profiles.firstIndex(where: { $0.id == id }),
                        profiles[i].model.isEmpty {
@@ -1553,6 +1931,7 @@ struct SettingsView: View {
                 }
             } catch {
                 await MainActor.run {
+                    guard modelFetchGeneration == generation, !recoveringCredentials else { return }
                     statusText = "\(name)：失败：\(error.localizedDescription)"
                     fetchingID = nil
                 }

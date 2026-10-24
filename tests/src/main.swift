@@ -2,6 +2,7 @@ import Foundation
 import AppKit
 import SQLite3
 import Compression
+import zlib
 
 // notescopilot v3 端到端验证：合成 NoteStore fixture → NotesStore 查询 → topotext 解码 → Markdown
 
@@ -112,7 +113,7 @@ func insObj(_ pk: Int64, _ ent: Int64, _ cols: [String: Any]) {
         case let v as String: sqlite3_bind_text(stmt, Int32(i + 1), v, -1, SQLITE_TRANSIENT_FIX)
         case let v as Double: sqlite3_bind_double(stmt, Int32(i + 1), v)
         case let v as Data:
-            v.withUnsafeBytes { p in
+            _ = v.withUnsafeBytes { p in
                 sqlite3_bind_blob(stmt, Int32(i + 1), p.baseAddress, Int32(v.count), SQLITE_TRANSIENT_FIX)
             }
         default: break
@@ -160,7 +161,7 @@ check("笔记列表软删除过滤（2条）", list.count == 2, "got \(list.coun
 check("置顶优先排序", list.first?.pk == 11, "first=\(list.first?.pk ?? -1)")
 check("标题读取", list.first?.title == "会议纪要")
 check("文件夹 JOIN", list.first?.folder == "工作")
-check("CoreData 时间戳解码", list.first?.modified != nil)
+check("CoreData 时间戳保持2001纪元", abs((list.first?.modified?.timeIntervalSinceReferenceDate ?? 0) - now) < 0.01)
 check("创建时间列读取", list.first?.created != nil, "created=\(String(describing: list.first?.created))")
 
 let folders = store.folders()
@@ -179,7 +180,7 @@ check("Backlinks 反链", bl.count == 1 && bl.first?.pk == 11, "got \(bl.count)"
 
 // ---------- 4. FTS 全文搜索 ----------
 let hit = store.search("会议")
-check("FTS 中文命中", hit.count == 1 && hit.first?.pk == 11, "got \(hit.map(\.pk))")
+check("中文搜索同时命中标题和正文", Set(hit.map(\.pk)) == [11, 12], "got \(hit.map(\.pk))")
 let hit2 = store.search("牛奶")
 check("FTS snippet 命中", hit2.count == 1 && hit2.first?.pk == 12)
 let miss = store.search("不存在的词")
@@ -187,7 +188,7 @@ check("FTS 无命中", miss.isEmpty)
 let multi = store.search("购物清单")
 check("FTS 多词合并后前缀命中", multi.count == 1 && multi.first?.pk == 12, "got \(multi.map(\.pk))")
 let multiAND = store.search("牛奶 鸡蛋")
-check("FTS CJK连写多词(中段不可前缀)", multiAND.isEmpty, "got \(multiAND.map(\.pk)) — 预期空：unicode61 下「牛奶鸡蛋」是单token")
+check("中文连写中段多词搜索", multiAND.map(\.pk) == [12], "got \(multiAND.map(\.pk))")
 
 // ---------- 5. topotext 解码 + Markdown ----------
 let blob1 = store.noteBodyData(pk: 11)
@@ -233,226 +234,145 @@ do {
     check("不存在路径应抛错", true)
 }
 
+// ---------- 7. 正文检索、中文子串与真实 Notes 存储格式 ----------
+check("正文独有文本参与全文索引", store.search("正文内容").map(\.pk) == [11, 12])
+check("中文标题和正文中段可以搜索", Set(store.search("议纪").map(\.pk)) == [11, 12])
+let folderQuery = LibraryQuery(searchText: "纪要", folderPK: 1, sort: .createdAscending)
+check("文件夹搜索与排序组合不丢筛选", folderQuery.execute(in: store).map(\.pk) == [11])
+check("标签搜索只返回该标签笔记", LibraryQuery(searchText: "牛奶", hashtag: "生活").execute(in: store).map(\.pk) == [12])
+check("搜索结果不会穿透文件夹筛选", LibraryQuery(searchText: "牛奶", folderPK: 1).execute(in: store).isEmpty)
+check("刷新重用相同条件仍保留筛选", folderQuery.execute(in: store).map(\.pk) == [11])
+check("兼容恢复结果明确标记不完整", !store.content(for: list[0]).isComplete
+      && store.content(for: list[0]).warning != nil)
+
+func gzip(_ data: Data) -> Data {
+    let src = [UInt8](data)
+    var dst = [UInt8](repeating: 0, count: data.count + 1024)
+    let count = src.withUnsafeBufferPointer { input in
+        dst.withUnsafeMutableBufferPointer { output in
+            compression_encode_buffer(output.baseAddress!, output.count,
+                                      input.baseAddress!, input.count, nil, COMPRESSION_ZLIB)
+        }
+    }
+    precondition(count > 0)
+    var result = Data([0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 3])
+    result.append(contentsOf: dst.prefix(count))
+    let checksum = UInt32(src.withUnsafeBufferPointer { crc32(0, $0.baseAddress, uInt($0.count)) })
+    for value in [checksum, UInt32(data.count)] {
+        result.append(contentsOf: (0..<4).map { UInt8((value >> (8 * $0)) & 255) })
+    }
+    return result
+}
+
+let nativeText = "😀粗体正常\n待办事项\n尾段正文深处 café 100%"
+let boldRun = fieldVar(1, 4) + fieldVar(5, 1)
+let normalRun = fieldVar(1, 3)
+let checklistStyle = fieldVar(1, 103) + fieldVar(4, 1) + field(5, field(1, [0, 1, 2, 3]) + fieldVar(2, 1))
+let todoRun = fieldVar(1, 5) + field(2, checklistStyle)
+let tailRun = fieldVar(1, UInt64("尾段正文深处 café 100%".utf16.count))
+let nativeNote = fieldStr(2, nativeText) + field(5, boldRun) + field(5, normalRun)
+    + field(5, todoRun) + field(5, tailRun)
+let nativeProto = Data(field(2, fieldVar(2, 1) + field(3, nativeNote)))
+let nativeGzip = gzip(nativeProto)
+check("gzip容器校验与解压", ProtoWire.gzipInflate(nativeGzip) == nativeProto)
+let nativeDoc = TopotextDecoder.decode(nativeGzip)
+check("真实Notes protobuf字段映射", nativeDoc?.text == nativeText && nativeDoc?.isComplete == true)
+check("真实Notes样式/核对清单", nativeDoc?.runs[0].bold == true
+      && nativeDoc?.runs[2].isTodo == true && nativeDoc?.runs[2].todoDone == true
+      && nativeDoc?.runs[2].listLevel == 1)
+let nativeMarkdown = nativeDoc.map(MarkdownConverter.applyRuns) ?? ""
+check("UTF16表情与加粗结束边界", nativeMarkdown.hasPrefix("**😀粗体**正常\n"), nativeMarkdown)
+check("核对清单缩进与完成状态", nativeMarkdown.contains("  - [x] 待办事项"), nativeMarkdown)
+check("正文尾段不会丢失", nativeMarkdown.hasSuffix("尾段正文深处 café 100%"))
+let attachmentProto = Data(field(2, fieldVar(2, 1) + field(3,
+    fieldStr(2, "\u{FFFC}") + field(5, fieldVar(1, 1) + field(12, fieldStr(2, "public.image"))))))
+let attachmentDoc = TopotextDecoder.decode(gzip(attachmentProto))
+check("无法导出的附件明确警告", attachmentDoc?.isComplete == false
+      && attachmentDoc?.warnings.first?.contains("附件") == true)
+let signedStyleProto = Data(field(2, fieldVar(2, 1) + field(3,
+    fieldStr(2, "a") + field(5, fieldVar(1, 1) + field(2, fieldVar(1, UInt64.max) + fieldVar(4, UInt64.max))))))
+check("负数protobuf样式值不会溢出崩溃", TopotextDecoder.decode(signedStyleProto)?.text == "a")
+var corruptGzip = nativeGzip
+corruptGzip[corruptGzip.count - 8] ^= 0xff
+check("gzip校验失败拒绝返回截断正文", ProtoWire.gzipInflate(corruptGzip) == nil)
+
+sqlite3_open(fixturePath, &db)
+exec("CREATE TABLE ZICNOTEDATA (Z_PK INTEGER PRIMARY KEY, ZNOTE INTEGER, ZDATA BLOB)")
+exec("BEGIN")
+for index in 0..<5005 {
+    insObj(Int64(10000 + index), 12, ["ZIDENTIFIER": "bulk-\(index)", "ZTITLE1": "批量笔记\(index)",
+                                     "ZSNIPPET": index == 5004 ? "beyond_index_limit" : "",
+                                     "ZMODIFICATIONDATE1": now - Double(index + 1000),
+                                     "ZCREATIONDATE1": now - Double(index + 1000)])
+}
+insObj(30004, 12, ["ZIDENTIFIER": "native-1", "ZTITLE1": "原生正文", "ZSNIPPET": "很短的摘要",
+                   "ZMODIFICATIONDATE1": now + 1, "ZCREATIONDATE1": now + 1])
+insObj(30005, 12, ["ZIDENTIFIER": "native-2", "ZTITLE1": "通过外键读取", "ZSNIPPET": "",
+                   "ZNOTEDATA": 701, "ZMODIFICATIONDATE1": now + 2, "ZCREATIONDATE1": now + 2])
+for (pk, notePK) in [(700, 30004), (701, 0)] {
+    var statement: OpaquePointer?
+    sqlite3_prepare_v2(db, "INSERT INTO ZICNOTEDATA (Z_PK,ZNOTE,ZDATA) VALUES (?,?,?)", -1, &statement, nil)
+    sqlite3_bind_int(statement, 1, Int32(pk))
+    if notePK != 0 { sqlite3_bind_int(statement, 2, Int32(notePK)) }
+    _ = nativeGzip.withUnsafeBytes { sqlite3_bind_blob(statement, 3, $0.baseAddress, Int32($0.count), SQLITE_TRANSIENT_FIX) }
+    check("写入真实格式fixture", sqlite3_step(statement) == SQLITE_DONE)
+    sqlite3_finalize(statement)
+}
+exec("COMMIT")
+sqlite3_close(db)
+let nativeStore = try NotesStore(path: fixturePath)
+check("超过500条的全库列表无截断", nativeStore.notes().count == 5009)
+check("超过5000条的索引无截断", nativeStore.indexedCount == 5009
+      && nativeStore.search("beyond_index_limit").count == 1)
+check("ZICNOTEDATA通过ZNOTE读正文", nativeStore.noteBodyData(pk: 30004) == nativeGzip)
+check("ZICNOTEDATA通过ZNOTEDATA外键读正文", nativeStore.noteBodyData(pk: 30005) == nativeGzip)
+let nativeSummary = nativeStore.notes().first { $0.pk == 30004 }!
+check("完整正文与导出状态", nativeStore.content(for: nativeSummary).isComplete
+      && nativeStore.content(for: nativeSummary).warning == nil)
+check("原生正文中段被索引", Set(nativeStore.search("段正文深").map(\.pk)) == [30004, 30005])
+check("音调折叠和字面百分号", nativeStore.search("CAFE 100%").count == 2)
+let plainStore = try NotesStore(path: fixturePath, enableFTS: false)
+check("FTS不可用时仍可搜索正文", plainStore.search("段正文深").count == 2)
+let readsLock = NSLock()
+var concurrentReadsValid = true
+DispatchQueue.concurrentPerform(iterations: 8) { index in
+    if index % 2 == 0 { nativeStore.indexAll() }
+    else if nativeStore.search("段正文深").count != 2 {
+        readsLock.lock(); concurrentReadsValid = false; readsLock.unlock()
+    }
+}
+check("并发重索引不会暴露半成品搜索结果", concurrentReadsValid)
+
+// ---------- 8. 选择状态：鼠标键盘共用同一入口，旧请求不可覆盖 ----------
+var state = LibrarySelectionState()
+let requestA = state.begin(noteID: 1)!
+check("开始加载立即清除旧正文并进入loading", state.isLoading && state.content == nil)
+let requestB = state.begin(noteID: 2)!
+let content = NoteContent(markdown: "B", plainText: "B", warning: nil, isComplete: true)
+check("旧请求不能覆盖新笔记", !state.complete(content, noteID: 1, requestID: requestA) && state.content == nil)
+check("新请求可以提交正文", state.complete(content, noteID: 2, requestID: requestB)
+      && state.content?.markdown == "B" && !state.isLoading)
+let requestB2 = state.begin(noteID: 2)!
+check("同一笔记重新加载也清空旧正文", state.content == nil && state.isLoading)
+check("同一笔记旧代请求也不能提交", !state.complete(content, noteID: 2, requestID: requestB))
+_ = state.begin(noteID: nil)
+check("取消选择后请求不可写回", !state.complete(content, noteID: 2, requestID: requestB2)
+      && state.selectedID == nil && state.content == nil && !state.isLoading)
+
+var bold = TopotextRun(); bold.length = 4; bold.bold = true
+var normal = TopotextRun(); normal.length = 3
+check("加粗关闭发生在下一run之前", MarkdownConverter.applyRuns(TopotextDoc(runs: [bold, normal], text: "boldend", totalLength: 7)) == "**bold**end")
+var bold2 = bold; bold2.length = 3
+check("相邻相同格式合并不产生四星边界", MarkdownConverter.applyRuns(TopotextDoc(runs: [bold, bold2], text: "boldend", totalLength: 7)) == "**boldend**")
+bold.length = 5
+normal.length = 3
+check("行内格式不包裹尾空格", MarkdownConverter.applyRuns(TopotextDoc(runs: [bold, normal], text: "bold end", totalLength: 8)) == "**bold** end")
+normal.length = 1
+check("样式范围不足也保留所有尾文", MarkdownConverter.applyRuns(TopotextDoc(runs: [normal], text: "abcd", totalLength: 1)) == "abcd")
+let failedContent = nativeStore.content(for: nativeStore.notes().first { $0.pk == 10000 }!)
+check("读取失败不得伪装为完整正文", !failedContent.isComplete && failedContent.warning != nil
+      && failedContent.markdown.contains("仅为摘要"))
+
 try? FileManager.default.removeItem(atPath: fixturePath)
-// ---------- 7. 全局斜杠命令匹配（v1.3.0）----------
-// 复刻 KeywordListener.matchSlash 逻辑（静态函数化以便测试）
-func testMatchSlash(_ trigger: String) -> SlashCommand? {
-    guard trigger.hasPrefix("/"), trigger.count > 1 else { return nil }
-    let token = String(trigger.dropFirst()).lowercased()
-    let cmds = buildSlashCommands().filter { !$0.alias.isEmpty }
-    if let exact = cmds.first(where: { $0.alias.lowercased() == token }) { return exact }
-    let prefix = cmds.filter { $0.alias.lowercased().hasPrefix(token) }
-    return prefix.count == 1 ? prefix[0] : nil
-}
-check("slash 精确匹配 runse", testMatchSlash("/runse")?.name == "润色")
-check("slash 精确匹配 zongjie", testMatchSlash("/zongjie")?.name == "总结")
-check("slash 前缀唯一匹配 fany", testMatchSlash("/fany")?.name == "翻译")
-check("slash 前缀唯一匹配 x", testMatchSlash("/x")?.name == "续写")  // 仅 xuxie
-check("slash 前缀歧义不触发", testMatchSlash("/s") == nil)  // stop/set/savenote 多义
-check("slash 单斜杠不匹配", testMatchSlash("/") == nil)
-check("slash 非命令不匹配", testMatchSlash("/zzzz") == nil)
-check("slash 别名小写归一", testMatchSlash("/RUNSE")?.name == "润色")
-// 英文模板名作斜杠命令
-TemplateStore.templates = [TemplateNote(name: "weekly", content: "# Weekly")]
-check("英文模板名全局可匹配", testMatchSlash("/weekly")?.name == "weekly")
-TemplateStore.templates = []
-
-print(failures == 0 ? "\nALL TESTS PASSED" : "\n\(failures) FAILURES")
-
-// ---------- 8. v2.0：搜索四向排序（SearchSort）----------
-do {
-    let n1 = NoteSummary(pk: 1, uuid: "a", title: "A", snippet: "", modified: Date(timeIntervalSinceReferenceDate: 100),
-                         created: Date(timeIntervalSinceReferenceDate: 50), folder: "")
-    let n2 = NoteSummary(pk: 2, uuid: "b", title: "B", snippet: "", modified: Date(timeIntervalSinceReferenceDate: 200),
-                         created: Date(timeIntervalSinceReferenceDate: 150), folder: "")
-    let n3 = NoteSummary(pk: 3, uuid: "c", title: "C", snippet: "", modified: nil, created: nil, folder: "")
-    let list = [n1, n2, n3]
-    check("排序 updated↓ 首条=修改最晚", SearchSort.updatedDescending.sorted(list).first?.pk == 2)
-    check("排序 updated↑ 首条=nil 最前", SearchSort.updatedAscending.sorted(list).first?.pk == 3,
-          "distantPast 排升序最前")
-    check("排序 created↓ 首条=创建最晚", SearchSort.createdDescending.sorted(list).first?.pk == 2)
-    check("排序 created↑ 首条=nil 最前", SearchSort.createdAscending.sorted(list).first?.pk == 3,
-          "distantPast 排升序最前")
-    check("排序 nil 日期排最后（updated↓）", SearchSort.updatedDescending.sorted(list).last?.pk == 3)
-}
-
-// ---------- 9. v2.0：Markdown token 映射（FormatBridge.markdownToken）----------
-check("token # → title", FormatBridge.markdownToken("#") == .title)
-check("token ## → heading", FormatBridge.markdownToken("##") == .heading)
-check("token ### → subheading", FormatBridge.markdownToken("###") == .subheading)
-check("token [] → checklist", FormatBridge.markdownToken("[]") == .checklist)
-check("token ``` → monostyled", FormatBridge.markdownToken("```") == .monostyled)
-check("token > → blockQuote", FormatBridge.markdownToken(">") == .blockQuote)
-check("token - → dashedList", FormatBridge.markdownToken("-") == .dashedList)
-check("token * → bulletedList", FormatBridge.markdownToken("*") == .bulletedList)
-check("token 1. → numberedList", FormatBridge.markdownToken("1.") == .numberedList)
-check("token 非法 → nil", FormatBridge.markdownToken("abc") == nil)
-check("token 空串 → nil", FormatBridge.markdownToken("") == nil)
-
-// ---------- 10. v2.0：行首 Markdown 状态机（MarkdownLineTracker）----------
-do {
-    let t = MarkdownLineTracker.shared
-    t.reset()
-    // 行首 "#" + 空格 → 删 2 字符、触发 title
-    check("状态机: # 不立即触发", t.feed("#") == nil)
-    let hit1 = t.feed(" ")
-    check("状态机: # +空格 → title 删 2 字", hit1 != nil && hit1!.delete == 2 && hit1!.style == .title,
-          "got \(String(describing: hit1))")
-    // 非行首不触发
-    check("状态机: 非行首不触发", t.feed("h") == nil && t.feed("#") == nil && t.feed(" ") == nil)
-    // 换行后回到行首："##" + 空格 → heading
-    _ = t.feed("\n")
-    _ = t.feed("#"); _ = t.feed("#")
-    let hit2 = t.feed(" ")
-    check("状态机: ## +空格 → heading 删 3 字", hit2 != nil && hit2!.delete == 3 && hit2!.style == .heading,
-          "got \(String(describing: hit2))")
-    // "[]" + 空格 → checklist 删 3 字
-    _ = t.feed("\n")
-    _ = t.feed("["); _ = t.feed("]")
-    let hit3 = t.feed(" ")
-    check("状态机: [] +空格 → checklist 删 3 字", hit3 != nil && hit3!.delete == 3 && hit3!.style == .checklist,
-          "got \(String(describing: hit3))")
-    // 退格回退："#"→ 退格 → 空格 不触发
-    t.reset()
-    _ = t.feed("#")
-    t.backspace()
-    let hit4 = t.feed(" ")
-    check("状态机: 退格后空格不触发", hit4 == nil)
-    // token 超 3 字符自动清理
-    t.reset()
-    _ = t.feed("#"); _ = t.feed("#"); _ = t.feed("#"); _ = t.feed("#")
-    let hit5 = t.feed(" ")
-    check("状态机: 超长 token 不触发", hit5 == nil)
-    // 关闭开关后不触发
-    t.reset()
-    UserDefaults.standard.set(false, forKey: "nc.md.enabled")
-    _ = t.feed("#")
-    let hit6 = t.feed(" ")
-    check("状态机: nc.md.enabled=false 不触发", hit6 == nil)
-    UserDefaults.standard.removeObject(forKey: "nc.md.enabled")
-    // expandMarkdown 开关：关闭 headers 后 # 不触发
-    UserDefaults.standard.set(false, forKey: "nc.md.headers")
-    t.reset()
-    _ = t.feed("#")
-    let hit7 = t.feed(" ")
-    check("expandMarkdown headers=false 不触发", hit7 == nil)
-    UserDefaults.standard.removeObject(forKey: "nc.md.headers")
-    // 开关默认开：> 触发 blockQuote
-    t.reset()
-    _ = t.feed(">")
-    let hit8 = t.feed(" ")
-    check("expandMarkdown 默认开启 > → blockQuote", hit8 != nil && hit8!.style == .blockQuote)
-    t.reset()
-}
-
-// ---------- 11. v2.0：格式斜杠命令（/title /bold 等映射 FormatStyle）----------
-check("slash 命令 /bold → format(bold) 可匹配", testMatchSlash("/bold") != nil)
-check("slash 命令 /checklist → format(checklist) 可匹配", testMatchSlash("/checklist") != nil)
-check("slash 命令 /numberedlist → format(numberedList) 可匹配", testMatchSlash("/numberedlist") != nil)
-if let cmd = testMatchSlash("/bold"), case .format(let st) = cmd.action {
-    check("slash /bold action = .format(bold)", st == .bold, "got \(st)")
-} else {
-    check("slash /bold action = .format(bold)", false, "命令不存在或 action 非 format")
-}
-if let cmd = testMatchSlash("/title"), case .format(let st) = cmd.action {
-    check("slash /title action = .format(title)", st == .title, "got \(st)")
-} else {
-    check("slash /title action = .format(title)", false, "命令不存在或 action 非 format")
-}
-
-// ---------- 12. v2.0：deeplink 构造（NotesBridge.deeplink）----------
-check("deeplink: notes://show_note?paster=<id>",
-      NotesBridge.deeplink(forNoteID: "x-coredata://ABC/ICNote/p123")
-        == "notes://show_note?paster=x-coredata://ABC/ICNote/p123")
-
-// ---------- 13. v2.1：AX 通道匹配器（仅靠辅助功能权限的轮询通道）----------
-do {
-    // 斜杠尾部匹配
-    let s1 = AXSlashWatcher.matchAXSlashTail("你好 /runse ")
-    check("AX 斜杠：/runse +空格 命中润色", s1?.cmd.name == "润色" && s1?.deleteCount == 7, "got \(String(describing: s1?.cmd.name)) del=\(s1?.deleteCount ?? -1)")
-    let s2 = AXSlashWatcher.matchAXSlashTail("## " )
-    check("AX 斜杠：无斜杠不命中", s2 == nil)
-    let s3 = AXSlashWatcher.matchAXSlashTail("/runse")
-    check("AX 斜杠：无终止符不命中", s3 == nil)
-    let s4 = AXSlashWatcher.matchAXSlashTail("笔记 ／title ")
-    check("AX 斜杠：全角 ／ 归一命中", s4?.cmd.name.contains("标题") == true, "got \(String(describing: s4?.cmd.name))")
-    let s5 = AXSlashWatcher.matchAXSlashTail("/zzzz ")
-    check("AX 斜杠：未知命令不命中", s5 == nil)
-
-    // 行首 Markdown 匹配
-    let m1 = AXSlashWatcher.matchAXMarkdownTail("行首\n# ")
-    check("AX MD：行首 # +空格 → title 删 2", m1?.style == .title && m1?.delete == 2, "got \(String(describing: m1))")
-    let m2 = AXSlashWatcher.matchAXMarkdownTail("## ")
-    check("AX MD：首行 ## → heading 删 3", m2?.style == .heading && m2?.delete == 3)
-    let m3 = AXSlashWatcher.matchAXMarkdownTail("[] ")
-    check("AX MD：[] → checklist 删 3", m3?.style == .checklist && m3?.delete == 3)
-    let m4 = AXSlashWatcher.matchAXMarkdownTail("前文 # ")
-    check("AX MD：非行首不命中", m4 == nil)
-    let m5 = AXSlashWatcher.matchAXMarkdownTail("#abc ")
-    check("AX MD：token 后有正文不命中", m5 == nil)
-    let m6 = AXSlashWatcher.matchAXMarkdownTail("#")
-    check("AX MD：无空格不命中", m6 == nil)
-    // 开关门控
-    UserDefaults.standard.set(false, forKey: "nc.md.headers")
-    let m7 = AXSlashWatcher.matchAXMarkdownTail("# ")
-    check("AX MD：headers 开关关闭不命中", m7 == nil)
-    UserDefaults.standard.removeObject(forKey: "nc.md.headers")
-    let m8 = AXSlashWatcher.matchAXMarkdownTail("> ")
-    check("AX MD：> → blockQuote", m8?.style == .blockQuote && m8?.delete == 2)
-
-    // 全角 token（中文 IME 默认全角标点，真机取证 [] 打成【】）
-    let fw1 = AXSlashWatcher.matchAXMarkdownTail("【】 ")
-    check("AX MD：全角【】 → checklist 删 3", fw1?.style == .checklist && fw1?.delete == 3)
-    let fw2 = AXSlashWatcher.matchAXMarkdownTail("＃ ")
-    check("AX MD：全角＃ → title", fw2?.style == .title && fw2?.delete == 2)
-    let fw3 = AXSlashWatcher.matchAXMarkdownTail("＞ ")
-    check("AX MD：全角＞ → blockQuote", fw3?.style == .blockQuote)
-    let fw4 = AXSlashWatcher.matchAXMarkdownTail("＊ ")
-    check("AX MD：全角＊ → bulletedList", fw4?.style == .bulletedList)
-    let fw5 = AXSlashWatcher.matchAXMarkdownTail("－ ")
-    check("AX MD：全角－ → dashedList", fw5?.style == .dashedList)
-    let fw6 = AXSlashWatcher.matchAXMarkdownTail("１． ")
-    check("AX MD：全角１．NFKC 归一命中 numberedList", fw6?.style == .numberedList && fw6?.delete == 3)
-    let fw7 = AXSlashWatcher.matchAXMarkdownTail("〖〗 ")
-    check("AX MD：全角〖〗归一命中 checklist", fw7?.style == .checklist && fw7?.delete == 3)
-    let fw8 = AXSlashWatcher.matchAXMarkdownTail("》 ")
-    check("AX MD：全角》归一命中 blockQuote", fw8?.style == .blockQuote)
-
-    // ---------- 17. / 建议下拉（activeSlashQuery + suggestCandidates） ----------
-    let q1 = AXSlashWatcher.activeSlashQuery("你好这是测试/")
-    check("建议：行尾 / → 查询为空命令串", q1 == "/", "got \(String(describing: q1))")
-    let q2 = AXSlashWatcher.activeSlashQuery("你好/runse")
-    check("建议：/runse 未终止 → 查询命中", q2 == "/runse", "got \(String(describing: q2))")
-    check("建议：/runse + 空格已终止不弹", AXSlashWatcher.activeSlashQuery("你好/runse ") == nil)
-    check("建议：URL 中的 / 不弹", AXSlashWatcher.activeSlashQuery("看 https://example.com") == nil)
-    check("建议：行首 / 弹", AXSlashWatcher.activeSlashQuery("\n/xx") == "/xx")
-    check("建议：超长段不弹", AXSlashWatcher.activeSlashQuery("/abcdefghijklmnopqrstuvwxyz") == nil)
-    check("建议：全角 ／ 归一", AXSlashWatcher.activeSlashQuery("你好／run") == "/run")
-    let sug1 = AXSlashWatcher.suggestCandidates(for: "/run")
-    check("建议：/run 前缀命中 runse（润色）", sug1.first?.alias == "runse", "got \(String(describing: sug1.first?.alias))")
-    let sug2 = AXSlashWatcher.suggestCandidates(for: "/")
-    check("建议：裸 / 列全部且限 8 项", sug2.count == 8, "got \(sug2.count)")
-    let sug3 = AXSlashWatcher.suggestCandidates(for: "/list")
-    check("建议：/list 包含命中列表命令", sug3.contains { $0.alias == "bulletedlist" } == true, "got \(sug3.map(\.alias))")
-    let sug4 = AXSlashWatcher.suggestCandidates(for: "/zzzz")
-    check("建议：无匹配返回空", sug4.isEmpty)
-
-    // ---------- 17b. 模板参与下拉与匹配（注入测试模板后跑，最后还原） ----------
-    let savedTemplates = TemplateStore.templates
-    TemplateStore.templates = [
-        TemplateNote(id: UUID(), name: "周报模板", content: "## 进展"),
-        TemplateNote(id: UUID(), name: "meeting-notes", content: "# 纪要"),
-    ]
-    defer { TemplateStore.templates = savedTemplates }
-    let tsug = AXSlashWatcher.suggestCandidates(for: "/周报")
-    check("模板：中文名过滤下拉命中", tsug.contains { $0.name == "周报模板" }, "got \(tsug.map(\.name))")
-    let tsug2 = AXSlashWatcher.suggestCandidates(for: "/meet")
-    check("模板：英文名模板下拉命中", tsug2.contains { $0.name == "meeting-notes" }, "got \(tsug2.map(\.name))")
-    check("模板：中文名模板斜杠匹配（IME 提交场景）",
-          AXSlashWatcher.matchSlashToken("/周报模板")?.name == "周报模板")
-    check("模板：英文名模板别名匹配",
-          AXSlashWatcher.matchSlashToken("/meetingnotes")?.name == "meeting-notes")
-}
-
-print(failures == 0 ? "\nALL v2.0 TESTS PASSED" : "\n\(failures) FAILURES (v2.0)")
+print(failures == 0 ? "\nALL LIBRARY TESTS PASSED" : "\n\(failures) LIBRARY FAILURES")
 exit(failures == 0 ? 0 : 1)

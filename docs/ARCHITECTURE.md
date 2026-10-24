@@ -14,21 +14,27 @@ NotesCopilot 为 Swift 单进程应用（`swiftc` 直编，零第三方依赖）
 | `NotesBridge.swift` | **Notes 桥接核心**：选区/光标读写、`formatMenuItems`（13 项格式菜单）、AX 菜单枚举与 AXPress、快捷键兜底（AXMenuItemCmdChar/Modifiers → CGEvent）、`selectionSignature` |
 | `UrlTitle.swift` | URL → 标题超链：三级抓取（HTTP 直抓 → 共享 Cookie → 浏览器标签页 AppleScript） |
 | `FormatBridge.swift` | 格式菜单缓存层：菜单元素查找与快捷键解析 |
-| `TemplateEngine.swift` | 模板引擎：模板 = Notes「Templates」文件夹里的笔记（ProNotes 取证结论） |
+| `TemplateEngine.swift` | 本地模板变量引擎、串行询问/AI、统一取消与目标绑定 |
 | `Topotext.swift` | 笔记文本数据结构（Topotext 段落模型） |
 | `LiberatorLite.swift` | NotesStore 直读：懒加载 `NoteStore.sqlite`（笔记库浏览），FSEvents 监听自动重索引 |
 | `LibraryView.swift` | 资料库窗口 UI：浏览 Notes 笔记并可直接「问 AI」 |
 | `Views.swift` | 设置页 UI：服务商预设、本地模型探测（`LocalAIProbe`）、多配置管理 |
+| `Markdown.swift` | Markdown 分块、原生预览与安全 HTML 写回；不执行原始 HTML |
+| `NotesTemplateImporter.swift` | 显式从 Notes 的 Templates 文件夹导入，不覆盖同名本地模板 |
 | `FrontmostTracker.swift` | 前台应用追踪（判断 Notes 是否前台、记录最后的外部应用） |
 
 ## 关键机制
 
 ### 1. AX 轮询通道（ProNotes 同款）
 
-- 不依赖「输入监控」权限，仅需辅助功能授权
-- `AXSlashWatcher`（0.12s）轮询 Notes 焦点文本区光标前文本，命中 `/` 触发斜杠面板
+- AX 轮询不依赖「输入监控」权限，需要辅助功能授权；完整快照另通过自动化读取笔记身份，绑定安全的写回目标
+- `AXSlashWatcher`（0.12s）是 Notes 正文斜杠/Markdown/URL 的唯一执行通道，各功能独立读取开关；键盘监听只负责命令导航和关键词扩展
+- 命令删除绑定原 Notes 快照，通过 AX 区间替换并等待删除确认，不向其他应用投递全局退格
+- 主面板、选中加工和模板写回均再次校验笔记、正文、选区与操作有效期；取消期间不执行迟到写入
 - `SelectionWatcher`（0.2s）轮询选区，出现稳定选区后弹出加工条
 - 选区签名（`selectionSignature`）仅取选区起止位置，避免每次全量读文本
+- `SelectionPollingState` 仅在完整快照准备成功后提交已展示状态；失败时同一选区限速重试，换选区或取消选区立即清除失败等待。
+- `NotesBridge.accessIssue` 区分缺少辅助功能、Notes 自动化拒绝及笔记身份不可用；通过去重通知更新面板和诊断页，不把访问问题混入手动 AI 请求错误。
 
 ### 2. Notes 菜单 AX 结构（重要取证结论）
 
@@ -40,7 +46,7 @@ NotesCopilot 为 Swift 单进程应用（`swiftc` 直编，零第三方依赖）
 ### 3. 键盘事件与输入框焦点
 
 - 全局快捷键用 Carbon `RegisterEventHotKey`（⇧⌘Space）
-- 文本插入用 CGEvent `keyboardSetUnicodeString`（纯内存投递，无剪贴板污染/IME 阻塞）
+- 普通文本优先 AX 选区写入；富文本用安全 HTML 粘贴，在准备剪贴板后再次校验目标与操作有效期，并按 changeCount 恢复完整剪贴板
 - **borderless NSPanel 键盘焦点三要素**：`canBecomeKey=true` 的 NSPanel 子类 + 应用内激活（`NSApp.activate(ignoringOtherApps:)`，外部 activate 对 UIElement 应用无效）+ `makeFirstResponder`；面板持 key 期间需挂起选区轮询，防止面板被误收起
 
 ### 4. URL 三级抓取
@@ -53,18 +59,23 @@ HTTP 直抓（UA 伪装） → 共享 Cookie（WKWebView 池） → 浏览器标
 
 ### 5. 模板即笔记
 
-ProNotes v0.7.8.2 二进制取证：模板语法 = Templates 文件夹中的普通笔记，无独立模板存储。NotesCopilot 直接复用该约定。
+模板实际存于 UserDefaults，支持日期、选区、剪贴板、ask 与 AI 变量。NotesTemplateImporter 显式读取 Templates 文件夹中可完整解码的笔记，新增本地模板且不覆盖同名内容。导入后不持续同步。TemplateRunner 注册任务；停止/新会话取消当前模板，并在异步写回前校验有效期。
 
 ## 测试
 
-四套单测（`scripts/run-tests.sh` 一键回归）：
+九套回归（`scripts/run-tests.sh` 对单一源码快照执行）：
 
 | 套件 | 覆盖 |
 |---|---|
 | `selai-tests` | 选中加工条：格式按钮全集/拆行/标签映射、面板逻辑（33 项） |
 | `slashgroup-tests` | 斜杠命令分组与匹配（26 项） |
 | `template-tests` | 模板引擎解析与编解码（41 项） |
-| `urltitle-tests` | URL 抓取解析与误判防护（28 项） |
+| `urltitle-tests` | URL 抓取解析与误判防护 |
+| `writeback-tests` | 原目标绑定、剪贴板准备期取消、选中结果恢复、延迟操作有效期 |
+| `template-runner-tests` | AI 槽串行/失败恢复、配置快照、取消与延迟写回 |
+| `chat-tests` | SSE 异常、重试续写、会话边界、Keychain 迁移和失败补偿 |
+| `library-tests` | 合成 SQLite、真实 gzip/protobuf、全库中文搜索、并发索引与选择竞态 |
+| `product-tests` | Markdown/HTML、模板合并、URL 登录页兜底 |
 
 纯逻辑层（`NotesFormatButton`、模板引擎、URL 解析）与 UI/AX 层解耦，保证可单测性。
 
@@ -74,5 +85,23 @@ ProNotes v0.7.8.2 二进制取证：模板语法 = Templates 文件夹中的普�
 ./build.sh
 ```
 
-- `swiftc -O -D NC_APP` 直编 14 个源文件，自动签名（优先本机「NotesCopilot Dev」证书，TCC 授权跨重建稳定；否则 adhoc）
+- `swiftc -O -D NC_APP` 直编 `src/*.swift`，支持独立构建目录。签名优先 `NC_CODESIGN_IDENTITY`，其次有效的「NotesCopilot Dev」或唯一 Apple Development 身份；未找到身份时使用 adhoc，选定开发身份后签名失败不静默回退。
 - 产物：`build/NotesCopilot.app`；发布打包 `ditto -c -k --keepParent` 出 zip
+
+## 数据与会话边界
+
+API Key 存于 Keychain，偏好配置仅保存标识。旧明文迁移先写密钥后清理偏好；批量写入失败尽力补偿并明确报告失败。每次请求冻结端点、凭据、模型和参数。更换笔记来源或模型配置会开始新会话，连续对话仅发送最近六轮。SSE 必须提供正常完成信号；截断、错误和空输出不会发布完成确认。
+
+钥匙串默认使用不可交互的 `LAContext`。设置中的“授权钥匙串并保存”在后台使用本次专属的交互 backend，恢复不可读凭据后完成整批保存；UI 保留草稿、暂停编辑，并以已保存列表快照避免成功回填后再次自动保存。模型列表请求按代号及端点/密钥快照校验，授权开始前的迟到回调不会覆盖草稿。配置通知在 UI 的主线程接收。
+
+主动授权并成功提交的凭据在当前进程内缓存，使后续配置加载和模型请求可复用已获授权的值；默认 backend 不保留交互上下文。缓存以短锁保护，在配置通知前同步；清空/删除、替换存储作用域、补偿失败会使相关值失效。常规保存的备份预检仍访问 backend，失败草稿不会进入缓存。
+
+资料库在后台只读打开与建索引；SQLite/索引以递归锁串行访问，重索引事务保证读者不见半成品。正文解码支持独立 ZICNOTEDATA 与内嵌数据、gzip 与 zlib；无法完整还原时明确警告。
+
+`scripts/check-ui.sh` 用隔离配置离屏渲染十四种原生布局，包含最小面板、错误/确认态、深浅设置页、钥匙串恢复卡，以及模拟 Notes 辅助功能/自动化/身份诊断。实际 macOS 权限、焦点和系统版本兼容性仍需真机验收。
+
+`main.swift` 冷启动及 `applicationShouldHandleReopen` 均恢复主入口：未配置模型打开设置，已配置打开 AI 面板。窗口呈现统一解除最小化、恢复到现有屏幕并在应用激活后前置；设置/资料库收起浮动面板以免被遮挡。菜单栏可见状态不代表图标未被系统菜单遮挡，启动诊断同时记录其坐标、屏幕数、窗口及热键注册结果。
+
+状态栏及设置侧栏的“打开 AI 面板”使用幂等 `showPanel`，全局热键保留 `togglePanel`。设置侧栏同时提供笔记库入口，避免仅依赖状态栏。诊断将状态栏窗口坐标与 `NSScreen.auxiliaryTopLeftArea/auxiliaryTopRightArea` 之间的刘海区域比对，记录 `statusItemObscuredByNotch`。
+
+`scripts/check-startup.sh` 编译真实 AppDelegate，通过 `startBackgroundServices: false` 禁用 Notes 索引、监听器、权限请求与热键注册，使用隔离配置验证窗口生命周期；需要可连接 WindowServer 的图形会话。

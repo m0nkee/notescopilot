@@ -10,11 +10,21 @@ struct LibraryView: View {
     @State private var tags: [String] = []
     @State private var searchText = ""
     @State private var selectedNote: NoteSummary?
-    @State private var bodyMarkdown = ""
+    @State private var selection = LibrarySelectionState()
     @State private var backlinksList: [NoteSummary] = []
     @State private var storeError: String?
     @State private var busy = false
     @State private var sortOrder: SearchSort = .updatedDescending
+    @State private var selectedFolder: Int64?
+    @State private var selectedTag: String?
+    @State private var listRequestID = UUID()
+    @State private var exportError: String?
+
+    private var bodyMarkdown: String { selection.content?.markdown ?? "" }
+    private var canUseContent: Bool {
+        selectedNote != nil && selectedNote?.pk == selection.selectedID
+            && selection.content != nil && !selection.isLoading
+    }
 
     var body: some View {
         HStack(spacing: 0) {
@@ -35,20 +45,24 @@ struct LibraryView: View {
                 Button {
                     copyMarkdown()
                 } label: { Label("复制 Markdown", systemImage: "doc.on.doc") }
-                .disabled(selectedNote == nil)
+                .disabled(!canUseContent)
             }
             ToolbarItem {
                 Button {
                     exportMarkdown()
                 } label: { Label("导出 .md 文件", systemImage: "square.and.arrow.up") }
-                .disabled(selectedNote == nil)
+                .disabled(!canUseContent)
             }
         }
         .onAppear { reload() }
+        .onReceive(NotificationCenter.default.publisher(for: .init("nc.storeAvailable"))) { _ in reload() }
         // FSEvents 重索引完成后自动刷新（对应 ProNotes 的 Indexing completed → 刷新列表）
         .onReceive(NotificationCenter.default.publisher(for: .init("nc.storeDidReindex"))) { _ in
             reload()
         }
+        .alert("导出失败", isPresented: Binding(get: { exportError != nil }, set: { if !$0 { exportError = nil } })) {
+            Button("好", role: .cancel) { exportError = nil }
+        } message: { Text(exportError ?? "") }
     }
 
     // MARK: 侧栏：文件夹 + 标签
@@ -60,7 +74,8 @@ struct LibraryView: View {
                 .padding(.horizontal, 10).padding(.top, 8)
             Button {
                 searchText = ""
-                reload(folder: nil)
+                selectedFolder = nil; selectedTag = nil
+                reload()
             } label: {
                 Label("全部笔记", systemImage: "tray.full").frame(maxWidth: .infinity, alignment: .leading)
             }
@@ -69,9 +84,11 @@ struct LibraryView: View {
                 VStack(alignment: .leading, spacing: 2) {
                     ForEach(foldersList, id: \.pk) { f in
                         Button {
-                            reload(folder: f.pk)
+                            selectedFolder = f.pk; selectedTag = nil
+                            reload()
                         } label: {
                             Label(f.name, systemImage: "folder").lineLimit(1)
+                                .foregroundStyle(selectedFolder == f.pk ? Color.accentColor : Color.primary)
                                 .frame(maxWidth: .infinity, alignment: .leading)
                         }
                         .buttonStyle(.borderless)
@@ -91,9 +108,11 @@ struct LibraryView: View {
                     }
                     ForEach(tags, id: \.self) { t in
                         Button {
-                            reload(hashtag: t)
+                            selectedTag = t; selectedFolder = nil
+                            reload()
                         } label: {
                             Label("#" + t, systemImage: "tag").lineLimit(1)
+                                .foregroundStyle(selectedTag == t ? Color.accentColor : Color.primary)
                                 .frame(maxWidth: .infinity, alignment: .leading)
                         }
                         .buttonStyle(.borderless)
@@ -112,7 +131,7 @@ struct LibraryView: View {
         VStack(spacing: 0) {
             HStack {
                 Image(systemName: "magnifyingglass").foregroundColor(.secondary)
-                TextField("全文搜索（FTS，支持音调折叠）", text: $searchText)
+                TextField("搜索标题和正文", text: $searchText)
                     .textFieldStyle(.roundedBorder)
                     .onSubmit { reload() }
                 Button("搜") { reload() }
@@ -131,21 +150,40 @@ struct LibraryView: View {
             }
             .padding(8)
             Divider()
-            List(selection: $selectedNote) {
+            List(selection: Binding<Int64?>(get: { selection.selectedID }, set: { id in
+                select(id.flatMap { value in notesList.first { $0.pk == value } })
+            })) {
                 ForEach(notesList) { n in
                     NoteRow(note: n)
-                        .tag(n)
+                        .tag(n.pk)
                         .contentShape(Rectangle())
-                        .onTapGesture {
-                            select(n)
-                        }
                 }
             }
             .listStyle(.plain)
+            .overlay {
+                if !busy && notesList.isEmpty && storeError == nil {
+                    VStack(spacing: 8) {
+                        Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
+                        Text("没有符合条件的笔记").font(.caption).foregroundStyle(.secondary)
+                    }
+                }
+            }
             if let err = storeError {
-                Text(err).font(.caption).foregroundColor(.orange).padding(8)
+                VStack(alignment: .leading, spacing: 8) {
+                    Text(err).font(.caption).foregroundColor(.orange)
+                    if (NSApp.delegate as? AppDelegate)?.notesStoreLoading != true {
+                        Button("打开完全磁盘访问设置") {
+                            if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles") {
+                                NSWorkspace.shared.open(url)
+                            }
+                        }
+                        Button("重新连接笔记库") {
+                            NSApp.sendAction(#selector(AppDelegate.retryNotesStore), to: nil, from: nil)
+                        }
+                    }
+                }.padding(8)
             } else {
-                Text("\(notesList.count) 条笔记")
+                Text(busy ? "正在读取笔记…" : "\(notesList.count) 条笔记")
                     .font(.caption2).foregroundColor(.secondary).padding(4)
             }
         }
@@ -168,15 +206,19 @@ struct LibraryView: View {
                     VStack(spacing: 6) {
                         Button {
                             // 用笔记上下文发起 AI 请求：桥接笔记库与 Ask AI
-                            NSApp.sendAction(#selector(AppDelegate.openPanelWithNote(_:)), to: nil, from: note)
+                            guard canUseContent, let content = selection.content, content.isComplete else { return }
+                            NSApp.sendAction(#selector(AppDelegate.openPanelWithNote(_:)), to: nil,
+                                             from: NoteAIContext(note: note, content: content))
                         } label: {
                             Label("问 AI", systemImage: "sparkles")
                         }
+                        .disabled(!canUseContent || selection.content?.isComplete != true)
                         Button {
                             copyMarkdown()
                         } label: {
                             Label("复制 MD", systemImage: "doc.on.doc")
                         }
+                        .disabled(!canUseContent)
                         // 复制 deeplink（对应 ProNotes 的 CopyDeeplinkButton / copySelectedNoteLink）
                         Button {
                             let pb = NSPasteboard.general
@@ -190,6 +232,13 @@ struct LibraryView: View {
                 }
                 .padding(12)
                 Divider()
+                if selection.isLoading {
+                    ProgressView("正在读取正文…").padding(12)
+                }
+                if let warning = selection.content?.warning {
+                    Label(warning, systemImage: "exclamationmark.triangle")
+                        .font(.caption).foregroundStyle(.orange).padding(12)
+                }
                 ScrollView {
                     Text(bodyMarkdown)
                         .font(.system(size: 12, design: .monospaced))
@@ -221,7 +270,7 @@ struct LibraryView: View {
                 VStack(spacing: 8) {
                     Image(systemName: "sidebar.squares.right")
                         .font(.system(size: 36)).foregroundColor(.secondary)
-                    Text("选择左侧笔记查看正文（topotext → Markdown）")
+                    Text("选择笔记查看正文")
                         .foregroundColor(.secondary)
                 }
                 Spacer()
@@ -243,76 +292,73 @@ struct LibraryView: View {
         (NSApp.delegate as? AppDelegate)?.notesStore
     }
 
-    private func reload(folder: Int64? = nil, hashtag: String? = nil) {
+    private func reload() {
+        let requestID = UUID()
+        listRequestID = requestID
         busy = true
         storeError = nil
-        selectedNote = nil
-        bodyMarkdown = ""
-        backlinksList = []
         // 后台线程读库，主线程更新
         let storeRef = store
-        let q = searchText.trimmingCharacters(in: .whitespaces)
+        let query = LibraryQuery(searchText: searchText, folderPK: selectedFolder,
+                                 hashtag: selectedTag, sort: sortOrder)
         DispatchQueue.global(qos: .userInitiated).async {
             guard let storeRef else {
                 DispatchQueue.main.async {
-                    storeError = "数据库未打开（可能无权限）。"
+                    guard listRequestID == requestID else { return }
+                    let delegate = NSApp.delegate as? AppDelegate
+                    storeError = delegate?.notesStoreLoading == true ? "正在连接笔记库并建立全文索引…"
+                        : (delegate?.notesStoreError ?? "无法读取笔记库。请授权完全磁盘访问后重新连接。")
                     busy = false
                 }
                 return
             }
-            var list: [NoteSummary] = []
-            if !q.isEmpty {
-                list = storeRef.search(q)
-            } else if let tag = hashtag {
-                list = storeRef.notes(hashtag: tag)
-            } else {
-                list = storeRef.notes(folderPK: folder)
-            }
+            let list = query.execute(in: storeRef)
             let tagsAll = storeRef.hashtags()
             let folders = storeRef.folders()
             DispatchQueue.main.async {
-                notesList = sortOrder.sorted(list)
+                guard listRequestID == requestID else { return }
+                notesList = list
                 tags = tagsAll
                 foldersList = folders
                 busy = false
+                if let id = selection.selectedID {
+                    select(notesList.first { $0.pk == id })
+                }
             }
         }
     }
 
-    private func select(_ note: NoteSummary) {
+    private func select(_ note: NoteSummary?) {
         selectedNote = note
-        guard let store else { return }
+        backlinksList = []
+        guard let requestID = selection.begin(noteID: note?.pk), let note, let store else { return }
         DispatchQueue.global(qos: .userInitiated).async {
-            var md = ""
-            if let blob = store.noteBodyData(pk: note.pk),
-               let doc = TopotextDecoder.decode(blob) {
-                md = MarkdownConverter.convert(note: note, doc: doc)
-            } else {
-                md = MarkdownConverter.convert(note: note, doc: nil)
-            }
+            let content = store.content(for: note)
             let bl = store.backlinks(toNoteUUID: note.uuid)
             DispatchQueue.main.async {
-                bodyMarkdown = md
+                guard selection.complete(content, noteID: note.pk, requestID: requestID) else { return }
                 backlinksList = bl
             }
         }
     }
 
     private func copyMarkdown() {
-        guard let note = selectedNote else { return }
+        guard canUseContent else { return }
         let pb = NSPasteboard.general
         pb.clearContents()
-        pb.setString(bodyMarkdown.isEmpty ? note.snippet : bodyMarkdown, forType: .string)
+        pb.setString(bodyMarkdown, forType: .string)
     }
 
     private func exportMarkdown() {
-        guard !bodyMarkdown.isEmpty else { return }
+        guard canUseContent, !bodyMarkdown.isEmpty else { return }
+        let markdown = bodyMarkdown
         let panel = NSSavePanel()
         panel.allowedContentTypes = [UTType(filenameExtension: "md") ?? .plainText]
         panel.nameFieldStringValue = (selectedNote?.title.replacingOccurrences(
             of: "/", with: "-").prefix(60) ?? "note") + ".md"
         if panel.runModal() == .OK, let url = panel.url {
-            try? bodyMarkdown.data(using: .utf8)?.write(to: url)
+            do { try Data(markdown.utf8).write(to: url, options: .atomic) }
+            catch { exportError = error.localizedDescription }
         }
     }
 }

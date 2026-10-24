@@ -102,6 +102,79 @@ do {
     check(NotesFormatButton.splitRows(NotesFormatButton.items(presenting: all), maxPerRow: 3).count == 5, "自定义每行数（13 项 / 3 = 5 行）")
 }
 
+// 总开关对键盘与 AX 通道一致生效；格式菜单标题统一中英文别名。
+do {
+    let defaults = UserDefaults.standard
+    let previous = defaults.volatileDomain(forName: UserDefaults.argumentDomain)
+    defaults.setVolatileDomain(["nc.md.enabled": false, "nc.md.headers": true], forName: UserDefaults.argumentDomain)
+    check(AXSlashWatcher.matchAXMarkdownTail("# ") == nil, "Markdown 总开关关闭时 AX 不删除标题标记")
+    check(AXSlashWatcher.matchAXMarkdownTail("[] ") == nil, "Markdown 总开关关闭时 AX 不删除检查项标记")
+    defaults.setVolatileDomain(["nc.md.enabled": true, "nc.md.headers": true], forName: UserDefaults.argumentDomain)
+    check(AXSlashWatcher.matchAXMarkdownTail("# ")?.style == .title, "重新开启总开关后 AX 即时恢复")
+    defaults.setVolatileDomain(previous, forName: UserDefaults.argumentDomain)
+    check(NotesBridge.formatMenuTitles(for: "标题").contains("Title"), "标题格式支持英文 Notes")
+    check(NotesBridge.formatMenuTitles(for: "块引用").contains("Block Quote"), "块引用格式支持英文 Notes")
+    check(NotesBridge.formatMenuTitles(for: "显示颜色").contains("Show Colors"), "颜色面板支持英文 Notes")
+    check(NotesFormatButton.items(presenting: ["Title", "Body"]).map(\.menuTitle) == ["标题", "正文"],
+          "英文菜单枚举仍构造规范格式按钮")
+}
+
+// The same preparation coordinator is used by SelectionWatcher.poll; no AX or
+// real Notes access is needed to make a snapshot fail and later recover.
+do {
+    var polling = SelectionPollingState()
+    let origin = Date(timeIntervalSinceReferenceDate: 100)
+    var readable = false
+    var snapshotReads = 0
+    func prepareSnapshot() -> Bool { snapshotReads += 1; return readable }
+    _ = polling.poll(currentSig: "10:5", now: origin, prepareShow: prepareSnapshot)
+    let failed = polling.poll(currentSig: "10:5", now: origin.addingTimeInterval(0.2), prepareShow: prepareSnapshot)
+    check(failed == .none && polling.state != .shown(sig: "10:5"),
+          "快照读取失败不能把真实轮询提交为已展示")
+    readable = true
+    let recovered = polling.poll(currentSig: "10:5", now: origin.addingTimeInterval(1.2), prepareShow: prepareSnapshot)
+    check(recovered == .show && polling.state == .shown(sig: "10:5") && snapshotReads == 2,
+          "同一选区权限恢复后无需重新选中文字即可展示")
+    let unchanged = polling.poll(currentSig: "10:5", now: origin.addingTimeInterval(1.4), prepareShow: prepareSnapshot)
+    check(unchanged == .none && snapshotReads == 2, "成功展示后同一选区不重复读快照或弹窗")
+}
+
+do {
+    var polling = SelectionPollingState()
+    let origin = Date(timeIntervalSinceReferenceDate: 200)
+    var snapshotReads = 0
+    func unavailableSnapshot() -> Bool { snapshotReads += 1; return false }
+    _ = polling.poll(currentSig: "10:5", now: origin, prepareShow: unavailableSnapshot)
+    _ = polling.poll(currentSig: "10:5", now: origin.addingTimeInterval(0.2), prepareShow: unavailableSnapshot)
+    for tick in 2...5 {
+        _ = polling.poll(currentSig: "10:5", now: origin.addingTimeInterval(Double(tick) * 0.2), prepareShow: unavailableSnapshot)
+    }
+    check(snapshotReads == 1, "快照失败后一秒内不随0.2秒轮询反复请求权限")
+    _ = polling.poll(currentSig: "10:5", now: origin.addingTimeInterval(1.2), prepareShow: unavailableSnapshot)
+    check(snapshotReads == 2, "节流结束后同一选区仍会自动重试")
+}
+
+do {
+    let origin = Date(timeIntervalSinceReferenceDate: 300)
+    var polling = SelectionPollingState()
+    _ = polling.poll(currentSig: "10:5", now: origin) { false }
+    _ = polling.poll(currentSig: "10:5", now: origin.addingTimeInterval(0.2)) { false }
+    let changed = polling.poll(currentSig: "20:3", now: origin.addingTimeInterval(0.3)) { true }
+    check(changed == .none && polling.state == .watching(sig: "20:3", stable: 1),
+          "失败后换选区会清除旧节流并重新去抖")
+    let ready = polling.poll(currentSig: "20:3", now: origin.addingTimeInterval(0.5)) { true }
+    check(ready == .show && polling.state == .shown(sig: "20:3"), "新选区不继承失败选区的等待时间")
+
+    var deselected = SelectionPollingState()
+    _ = deselected.poll(currentSig: "10:5", now: origin) { false }
+    _ = deselected.poll(currentSig: "10:5", now: origin.addingTimeInterval(0.2)) { false }
+    let hidden = deselected.poll(currentSig: nil, now: origin.addingTimeInterval(0.3)) { true }
+    check(hidden == .hide && deselected.state == .idle, "失败节流中取消选择仍立即隐藏并清除观察状态")
+    _ = deselected.poll(currentSig: "10:5", now: origin.addingTimeInterval(0.4)) { true }
+    let reselected = deselected.poll(currentSig: "10:5", now: origin.addingTimeInterval(0.6)) { true }
+    check(reselected == .show, "取消后重新选择同一范围不残留失败节流")
+}
+
 print("")
 print(fail == 0 ? "全部通过：\(pass) 项" : "失败 \(fail) 项 / 共 \(pass + fail) 项")
 exit(fail == 0 ? 0 : 1)

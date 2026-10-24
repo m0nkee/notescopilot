@@ -265,7 +265,13 @@ final class KeywordListener {
             place: .headInsertEventTap,
             options: .defaultTap,
             eventsOfInterest: mask,
-            callback: { _, _, event, _ in KeywordListener.shared.handle(event) },
+            callback: { _, type, event, _ in
+                if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
+                    if let tap = KeywordListener.shared.tap { CGEvent.tapEnable(tap: tap, enable: true) }
+                    return Unmanaged.passUnretained(event)
+                }
+                return KeywordListener.shared.handle(event)
+            },
             userInfo: nil
         ) else {
             NCLog.log("tapCreate 失败（无输入监控权限或会话 tap 不可用）")
@@ -321,10 +327,8 @@ final class KeywordListener {
         cancelPermissionRetry()
     }
 
-    /// keyDown 回调：
-    /// 1) 斜杠命令缓冲——"/" 后累积别名，空格/回车触发动作（复制 ProNotes 在 Notes 里直接 /命令 的体验）
-    /// 2) 关键词触发词缓冲——命中后删除触发词并展开片段
-    fileprivate func handle(_ event: CGEvent) -> Unmanaged<CGEvent> {
+    /// keyDown 仅路由菜单导航与显式启用的关键词；正文命令统一交给 AX。
+    fileprivate func handle(_ event: CGEvent) -> Unmanaged<CGEvent>? {
         let flags = event.flags
         if !flags.intersection([.maskCommand, .maskAlternate, .maskControl]).isEmpty {
             buffer = ""
@@ -341,8 +345,7 @@ final class KeywordListener {
            }) {
             buffer = ""
             slashBuf = ""
-            // 消费：返回 NULL 让系统丢弃事件（↑↓/⏎/esc 不透传给 Notes）
-            return Unmanaged.passRetained(CGEvent(source: nil)!)
+            return nil
         }
         #endif
         var chars = [UniChar](repeating: 0, count: 4)
@@ -360,60 +363,12 @@ final class KeywordListener {
             return Unmanaged.passUnretained(event)
         }
 
-        // ---- 行首 Markdown 通道（官方 Write in Markdown：# / ## / [] / ``` / > / - / * / 1. ）----
-        // 门控：只在 Notes 前台触发，其他应用的输入不受影响（与 ProNotes 的 Notes-only 定位一致）
-        if NotesBridge.isFrontmostNotes() {
-            if c == "\u{7F}" || s == "\u{8}" {
-                MarkdownLineTracker.shared.backspace()
-                // 不提前返回：下面的斜杠通道也要同步退格
-            } else if let hit = MarkdownLineTracker.shared.feed(c) {
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.06) {
-                    NotesBridge.shared.deleteTyped(count: hit.delete)
-                    _ = FormatBridge.trigger(hit.style)
-                }
-                return Unmanaged.passUnretained(event)
-            }
-        } else {
-            MarkdownLineTracker.shared.reset()
-        }
-
-        // ---- 全局斜杠命令通道 ----
-        if slashGlobal {
-            if c == "/" {
-                slashBuf = "/"
-                NCLog.log("斜杠缓冲开始，前台 = \(NSWorkspace.shared.frontmostApplication?.bundleIdentifier ?? "?")")
-                return Unmanaged.passUnretained(event)
-            }
-            if !slashBuf.isEmpty {
-                if c == " " || c == "\r" || c == "\n" {
-                    // 终止符：尝试匹配斜杠命令（含命令本身，删除 "命令+终止符"）
-                    let trigger = slashBuf
-                    slashBuf = ""
-                    let matched = matchSlash(trigger)
-                    NCLog.log("斜杠触发：\(trigger) → \(matched?.name ?? "无匹配")")
-                    if let cmd = matched {
-                        let del = trigger.count + 1  // +1 = 终止符
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.06) {
-                            Self.performGlobalSlash(cmd, deleteCount: del)
-                        }
-                        return Unmanaged.passUnretained(event)
-                    }
-                } else if c.isLetter && c.isASCII {
-                    slashBuf.append(Character(c.lowercased()))
-                    if slashBuf.count > maxSequenceLength { slashBuf = "/" }
-                    return Unmanaged.passUnretained(event)
-                } else if c == "\u{7F}" || s == "\u{8}" {
-                    // 退格：修正缓冲但不拦截
-                    if slashBuf.count > 1 { slashBuf.removeLast() }
-                    return Unmanaged.passUnretained(event)
-                } else {
-                    slashBuf = ""
-                }
-            }
-        }
+        // 正文斜杠与 Markdown 统一由 AX 通道识别。tap 仅负责菜单导航和关键词，
+        // 避免终止符落地前后两条通道同时删除同一段文字。
+        slashBuf = ""
 
         // ---- 关键词文本扩展通道 ----
-        guard c.isLetter || c.isNumber || ";._-".contains(c) else {
+        guard enabled, c.isLetter || c.isNumber || ";._-".contains(c) else {
             buffer = ""
             return Unmanaged.passUnretained(event)
         }
@@ -425,8 +380,11 @@ final class KeywordListener {
             buffer = ""
             let n = rule.trigger.count
             let text = rule.expansion
+            let trigger = rule.trigger
+            let sourcePID = NSWorkspace.shared.frontmostApplication?.processIdentifier
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.06) {
-                NotesBridge.shared.typeExpansion(deleteCount: n, insert: text)
+                guard self.enabled, NSWorkspace.shared.frontmostApplication?.processIdentifier == sourcePID else { return }
+                NotesBridge.shared.typeExpansion(deleteCount: n, insert: text, expectedTrigger: trigger)
             }
             break
         }
@@ -443,76 +401,110 @@ final class KeywordListener {
         return prefix.count == 1 ? prefix[0] : nil  // 前缀歧义则不触发
     }
 
-    /// 在任意应用（主要呈 Notes）里执行斜杠命令：
-    /// 删除已键入的命令文字 → 读取 AX 选中文本作上下文 → 跑 AI/插入模板 → 结果自动回写
-static func performGlobalSlash(_ cmd: SlashCommand, deleteCount: Int) {
-    NCLog.log("执行斜杠命令：\(cmd.name)，删除 \(deleteCount) 字符")
-    NotesBridge.shared.deleteTyped(count: deleteCount)
-    // deleteTyped 已改为 CGEvent 同步投递（退格立即生效）。
-    // 短暂等待后 revealPanel / 读上下文，防止面板抢前台时删除尚未落地。
-    DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
-        switch cmd.action {
-        case .run(let prompt):
-        #if NC_APP
+    /// 在捕获的 Notes 目标执行斜杠；验证删除完成后再读取上下文和运行命令。
+@MainActor
+static func performGlobalSlash(_ cmd: SlashCommand, deleteCount: Int,
+                               target: NotesBridge.SelectionSnapshot? = nil, expectedToken: String? = nil) {
+    guard let target = target ?? NotesBridge.shared.readTextSnapshot(),
+          NotesBridge.shared.isCurrent(target),
+          let range = NotesBridge.suffixRange(in: target, characterCount: deleteCount) else { return }
+    let token = (target.documentText as NSString).substring(with: NSRange(location: range.location, length: range.length))
+    let normalized = token.replacingOccurrences(of: "／", with: "/")
+    guard normalized.trimmingCharacters(in: .whitespacesAndNewlines).hasPrefix("/"),
+          expectedToken.map({ $0.replacingOccurrences(of: "／", with: "/") == normalized }) ?? true,
+          NotesCommandExecution.shared.claim(target) else { return }
+    SlashSuggestPanel.shared.hide()
+    NotesBridge.shared.removeSuffix(in: target, characterCount: deleteCount) { current, error in
         MainActor.assumeIsolated {
-            guard let delegate = NSApp.delegate as? AppDelegate else { return }
-            let engine = delegate.engine
-            // 上下文自动带入：选中优先，光标段落兕底（此前无选中时上下文空着，AI 瞎答）
-            if let ctx = NotesBridge.shared.readContextAroundCursor(), !ctx.text.isEmpty {
-                engine.noteContext = ctx.text
-                engine.contextSource = ctx.source
+            defer { NotesCommandExecution.shared.release() }
+            guard let current, error == nil, NotesBridge.shared.isCurrent(current) else {
+                NCLog.log("斜杠执行取消：\(error ?? "原目标已变化")")
+                return
             }
-            engine.autoInsertNext = true
-            delegate.revealPanel()
-            engine.run(prompt: prompt)
-        }
-        #endif
-        case .insertTemplate(let tpl):
-        // 模板：变量引擎展开后插入（静态变量/ask 弹窗/ai 请求）
-        #if NC_APP
-        MainActor.assumeIsolated {
-            let sel = NotesBridge.shared.readSelectedText() ?? ""
-            TemplateRunner.runInNotes(tpl, selection: sel)
-        }
-        #endif
-        case .format(let style):
-        // 格式化：触发 Notes 原生菜单/快捷键（对应 ProNotes 的 AX 菜单通道）
-        _ = FormatBridge.trigger(style)
-        case .openSettings:
-        NotificationCenter.default.post(name: .init("nc.openSettings"), object: nil)
-        case .stopGeneration:
-#if NC_APP
-            MainActor.assumeIsolated {
-                (NSApp.delegate as? AppDelegate)?.engine.stop()
-            }
-#endif
-        case .newSession:
-#if NC_APP
-            MainActor.assumeIsolated {
-                (NSApp.delegate as? AppDelegate)?.engine.resetSession()
-            }
-#endif
-        case .clearContext:
-#if NC_APP
-            MainActor.assumeIsolated {
-                (NSApp.delegate as? AppDelegate)?.engine.noteContext = ""
-            }
-#endif
-        case .fill, .insertOutput, .saveAsNote:
-            // 面板内操作：呼出面板展示，同时自动带入上下文（不跑 AI）
-#if NC_APP
-            MainActor.assumeIsolated {
-                if let ctx = NotesBridge.shared.readContextAroundCursor(), !ctx.text.isEmpty,
-                   (NSApp.delegate as? AppDelegate)?.engine.noteContext.isEmpty == true {
-                    (NSApp.delegate as? AppDelegate)?.engine.noteContext = ctx.text
-                    (NSApp.delegate as? AppDelegate)?.engine.contextSource = ctx.source
-                }
-                (NSApp.delegate as? AppDelegate)?.revealPanel()
-            }
-#endif
-        }
+            executeGlobalSlash(cmd, target: current)
         }
     }
+}
+
+@MainActor
+private static func executeGlobalSlash(_ cmd: SlashCommand, target: NotesBridge.SelectionSnapshot) {
+    switch cmd.action {
+    case .run(let prompt):
+        #if NC_APP
+        guard let delegate = NSApp.delegate as? AppDelegate else { return }
+        let engine = delegate.engine
+        let context = NotesBridge.shared.readContextAroundCursor()
+        engine.setContext(context?.text ?? "", source: context?.source ?? "", noteID: target.noteID)
+        engine.autoInsertNext = true
+        delegate.revealPanel(captureContext: false)
+        engine.run(prompt: prompt, writebackTarget: target)
+        #endif
+    case .insertTemplate(let template):
+        #if NC_APP
+        guard let engine = (NSApp.delegate as? AppDelegate)?.engine else { return }
+        engine.stop()
+        let generation = engine.operationGeneration
+        let context = NotesBridge.shared.readContextAroundCursor()?.text ?? ""
+        TemplateRunner.runInNotes(template, selection: context,
+                                  isOperationValid: { engine.operationGeneration == generation })
+        #endif
+    case .format(let style):
+        _ = FormatBridge.trigger(style)
+    case .openSettings:
+        NotificationCenter.default.post(name: .init("nc.openSettings"), object: nil)
+    case .stopGeneration:
+        #if NC_APP
+        (NSApp.delegate as? AppDelegate)?.engine.stop()
+        #endif
+    case .newSession:
+        #if NC_APP
+        (NSApp.delegate as? AppDelegate)?.engine.beginSession()
+        #endif
+    case .clearContext:
+        #if NC_APP
+        (NSApp.delegate as? AppDelegate)?.engine.setContext("", source: "", noteID: target.noteID)
+        #endif
+    case .insertOutput:
+        #if NC_APP
+        guard let engine = (NSApp.delegate as? AppDelegate)?.engine else { return }
+        guard !engine.output.isEmpty else { return }
+        engine.lastError = NotesBridge.shared.replaceSelection(in: target, with: engine.output,
+                                                               html: MarkdownDocument.html(engine.output))
+        #endif
+    case .saveAsNote:
+        #if NC_APP
+        guard let engine = (NSApp.delegate as? AppDelegate)?.engine, !engine.output.isEmpty else { return }
+        engine.lastError = NotesBridge.shared.createNewNote(engine.output, html: MarkdownDocument.html(engine.output))
+        #endif
+    case .fill:
+        #if NC_APP
+        guard let delegate = NSApp.delegate as? AppDelegate else { return }
+        let context = NotesBridge.shared.readContextAroundCursor()
+        delegate.engine.setContext(context?.text ?? "", source: context?.source ?? "", noteID: target.noteID)
+        delegate.revealPanel(captureContext: false)
+        #endif
+    }
+}
+
+}
+
+/// 所有 Notes 正文变更共用仲裁；键盘 tap 不再独立执行正文命令。
+@MainActor
+final class NotesCommandExecution {
+    static let shared = NotesCommandExecution()
+    private(set) var isBusy = false
+    private var previous: NotesBridge.SelectionSnapshot?
+    private var suppressedUntil = Date.distantPast
+
+    func claim(_ target: NotesBridge.SelectionSnapshot) -> Bool {
+        guard !isBusy, !(previous?.matches(target) == true && Date() < suppressedUntil) else { return false }
+        isBusy = true
+        previous = target
+        suppressedUntil = Date().addingTimeInterval(1)
+        return true
+    }
+
+    func release() { isBusy = false }
 }
 
 // MARK: - AX 通道斜杠命令（不依赖「输入监控」权限）
@@ -535,7 +527,7 @@ final class AXSlashWatcher {
     var isRunning: Bool { timer != nil }
 
     func startIfNeeded() {
-        guard timer == nil, slashGlobal else { return }
+        guard timer == nil else { return }
         timer = Timer.scheduledTimer(withTimeInterval: 0.12, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated { self?.poll() }
         }
@@ -578,11 +570,18 @@ final class AXSlashWatcher {
 
     private var pollDiagAt: Date?
     private func poll() {
-        // 注意：不 guard KeywordListener.isRunning——键盘 tap（负责斜杠缓冲/键盘导航）与
-        // AX poll（负责下拉面板/Markdown 扩展/AX 斜杠命令）是互补的两个通道，必须同时跑。
-        guard !cooldown else { return }
-        guard NotesBridge.isFrontmostNotes() else { return }
-        guard let tail = NotesBridge.shared.textBeforeCursor(maxLength: 64) else { return }
+        UrlTitleLinker.cancelIfTargetChanged()
+        // AX 始终独立工作；斜杠、Markdown、URL 各自读取实时开关。
+        guard NotesBridge.isFrontmostNotes() else {
+            SlashSuggestPanel.shared.hide()
+            return
+        }
+        guard !cooldown, !NotesCommandExecution.shared.isBusy else { return }
+        guard !SlashSuggestPanel.isIMEComposing else { return }
+        guard let tail = NotesBridge.shared.textBeforeCursor(maxLength: 8192) else {
+            SlashSuggestPanel.shared.hide()
+            return
+        }
 
         // 通道 0：/ 建议下拉（ProNotes 同款：输入 / 即弹命令菜单，持续输入过滤、点选执行）
         if slashGlobal, let q = Self.activeSlashQuery(tail) {
@@ -603,15 +602,15 @@ final class AXSlashWatcher {
         }
 
         // 通道 1：斜杠命令（含用户模板命令）
-        // 互斥：键盘 tap 通道（slashBuf）正在缓冲同一命令并会自行触发时跳过，防双执行。
-        // tap 不可用（无输入监控权限）时 slashBuf 恒空，AX 通道独立兜底。
-        if slashGlobal, KeywordListener.shared.slashBufIsEmpty,
-           let hit = Self.matchAXSlashTail(tail) {
+        // 唯一识别通道；与菜单点击通过 NotesCommandExecution 仲裁写入。
+        if slashGlobal, let hit = Self.matchAXSlashTail(tail),
+           let target = NotesBridge.shared.readTextSnapshot() {
             cooldown = true
             SlashSuggestPanel.shared.hide()
             pollDiagAt = nil
             NCLog.log("AX 通道命中斜杠：\(String(tail.suffix(24))) → \(hit.cmd.name)")
-            KeywordListener.performGlobalSlash(hit.cmd, deleteCount: hit.deleteCount)
+            KeywordListener.performGlobalSlash(hit.cmd, deleteCount: hit.deleteCount, target: target,
+                                               expectedToken: String(tail.suffix(hit.deleteCount)))
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { [weak self] in
                 self?.cooldown = false
             }
@@ -624,13 +623,19 @@ final class AXSlashWatcher {
             SlashSuggestPanel.shared.hide()
             pollDiagAt = nil
             NCLog.log("AX 通道命中 Markdown：\(hit.style.rawValue)，删 \(hit.delete) 字符")
-            NotesBridge.shared.deleteTyped(count: hit.delete)
-            // 删除确认轮询（替代固定 0.4s）：每 80ms 读一次光标前文本，
-            // token 已删净立即触发——快则 1 拍（~100ms）生效，比固定等待快数倍；
-            // 轮询失败兑底 0.8s 强制触发，确保最终一定生效。
-            let style = hit.style
-            let deadline = Date().addingTimeInterval(0.8)
-            Self.waitDeleteAndTrigger(style: style, deadline: deadline)
+            if let target = NotesBridge.shared.readTextSnapshot(), target.range.length == 0,
+               let before = Self.textBeforeCursor(in: target),
+               let verified = Self.matchAXMarkdownTail(before), verified.style == hit.style,
+               verified.delete == hit.delete, NotesCommandExecution.shared.claim(target) {
+                NotesBridge.shared.removeSuffix(in: target, characterCount: hit.delete) { current, error in
+                    MainActor.assumeIsolated {
+                        defer { NotesCommandExecution.shared.release() }
+                        guard let current, error == nil, NotesBridge.shared.isCurrent(current),
+                              Self.markdownEnabled else { return }
+                        _ = FormatBridge.trigger(hit.style)
+                    }
+                }
+            }
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { [weak self] in
                 self?.cooldown = false
             }
@@ -638,11 +643,10 @@ final class AXSlashWatcher {
         }
 
         // 通道 3：URL + 空格 → 自动取标题转超链（SSO 页/失败回退 URL 文字）
-        if let deleteCount = UrlTitleLinker.hit(tail) {
+        if UrlTitleLinker.hit(tail) {
             cooldown = true
             pollDiagAt = nil
-            NCLog.log("AX 通道命中 URL：删 \(deleteCount) 字符后粘贴标题超链")
-            NotesBridge.shared.deleteTyped(count: deleteCount)
+            NCLog.log("AX 通道命中 URL：原文保留，待标题返回后校验目标并替换")
             DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
                 self?.cooldown = false   // 标题抓取可能耗时数秒，冷却放宽
             }
@@ -650,31 +654,14 @@ final class AXSlashWatcher {
         }
     }
 
-    /// 轮询确认退格已删净 token 后立即触发格式（消灭「慢半拍」）
-    nonisolated(unsafe) static var mdTriggerLog = true   // 测试注入点
-    static func waitDeleteAndTrigger(style: FormatStyle, deadline: Date) {
-        func pollDelete() {
-            // 读光标前文本，若尾部的 token 已不在（行首被清干净）→ 立即触发
-            if NotesBridge.isFrontmostNotes(),
-               let tail = NotesBridge.shared.textBeforeCursor(maxLength: 8),
-               !(Self.matchAXMarkdownTail(tail)?.style == style),
-               Date() < deadline {
-                let t0 = Date()
-                let ok = FormatBridge.trigger(style)
-                if mdTriggerLog {
-                    NCLog.log("Markdown 样式触发（\(style.rawValue)）：\(ok ? "✅ 成功" : "❌ 失败——Notes 菜单/快捷键均未命中")，trigger 耗时 \(Int(Date().timeIntervalSince(t0) * 1000))ms")
-                }
-            } else if Date() < deadline {
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.08, execute: pollDelete)
-            } else {
-                // 兑底：超时也触发（删除可能已生效但读不到）
-                let ok = FormatBridge.trigger(style)
-                if mdTriggerLog {
-                    NCLog.log("Markdown 样式触发（\(style.rawValue) 兑底）：\(ok ? "✅ 成功" : "❌ 失败")")
-                }
-            }
-        }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1, execute: pollDelete)
+    nonisolated static var markdownEnabled: Bool {
+        let defaults = UserDefaults.standard
+        return defaults.object(forKey: "nc.md.enabled") == nil || defaults.bool(forKey: "nc.md.enabled")
+    }
+
+    nonisolated static func textBeforeCursor(in target: NotesBridge.SelectionSnapshot) -> String? {
+        guard target.range.location >= 0, target.range.location <= target.documentText.utf16.count else { return nil }
+        return (target.documentText as NSString).substring(to: target.range.location)
     }
 
     /// 检测光标前是否有一个「正在输入、尚未终止」的 / 命令段（用于建议下拉）。
@@ -686,12 +673,19 @@ final class AXSlashWatcher {
         let before = norm[..<slashIdx]
         // URL 中的斜杠不弹："https:" 后的第一个 /、"//" 的第二个 /
         if before.hasSuffix(":") || before.hasSuffix("/") { return nil }
+        if slashBelongsToURL(before: String(before)) { return nil }
         let after = String(norm[norm.index(after: slashIdx)...])
         // 段内出现空白/换行 = 已输入终止符，交给触发逻辑而非建议
         guard !after.contains(" "), !after.contains("\n"), !after.contains("\t") else { return nil }
         // 查询段过长大概率不是命令输入
         guard after.count <= 24 else { return nil }
         return "/" + after
+    }
+
+    /// URL 的路径名可能恰好是 /title、/body 等合法命令，必须留给 URL 通道。
+    nonisolated private static func slashBelongsToURL(before: String) -> Bool {
+        let token = before.split(whereSeparator: { $0.isWhitespace }).last.map(String.init)?.lowercased() ?? ""
+        return token.contains("://") || token.hasPrefix("www.")
     }
 
     /// 建议列表：前缀命中优先，其次包含命中；
@@ -725,6 +719,8 @@ final class AXSlashWatcher {
         guard let last = tail.last, last == " " || last == "\n" || last == "\t" else { return nil }
         let body = String(tail.dropLast()).replacingOccurrences(of: "／", with: "/")
         guard let slashIdx = body.lastIndex(of: "/") else { return nil }
+        let before = String(body[..<slashIdx])
+        guard !before.hasSuffix(":"), !before.hasSuffix("/"), !slashBelongsToURL(before: before) else { return nil }
         let trigger = String(body[slashIdx...])
         guard trigger.count > 1, let cmd = matchSlashToken(trigger) else { return nil }
         return (cmd, trigger.count + 1)   // +1 = 终止符
@@ -746,7 +742,7 @@ final class AXSlashWatcher {
     }
 
     nonisolated static func matchAXMarkdownTail(_ tail: String) -> (style: FormatStyle, delete: Int)? {
-        guard let last = tail.last, last == " " else { return nil }
+        guard markdownEnabled, let last = tail.last, last == " " else { return nil }
         let body = String(tail.dropLast())
         // 取最后一行（光标所在行）
         let lineStart = body.lastIndex(of: "\n").map { body.index(after: $0) } ?? body.startIndex

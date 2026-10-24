@@ -1,5 +1,6 @@
 import Foundation
 import Compression
+import zlib
 
 // MARK: - Protobuf wire 解析（无依赖手工实现，复刻 ProNotes 的 Topotext_* SwiftProtobuf 通道）
 
@@ -65,6 +66,7 @@ enum ProtoWire {
     /// zlib 解压（0x78 头）：Apple Compression 的 COMPRESSION_ZLIB 实为 raw DEFLATE，
     /// 需剥掉 zlib 容器头（2 字节）与 adler32 尾（4 字节）后解码。
     static func zlibInflate(_ data: Data) -> Data? {
+        if data.starts(with: [0x1f, 0x8b]) { return gzipInflate(data) }
         guard data.count > 8, data[data.startIndex] == 0x78 else { return nil }
         let raw = data.dropFirst(2).dropLast(4)
         var dst = [UInt8](repeating: 0, count: data.count * 16)
@@ -86,6 +88,33 @@ enum ProtoWire {
         }
         return nil
     }
+
+    /// Apple Notes normally stores a gzip container, rather than raw DEFLATE.
+    /// zlib validates the container checksum and enforces a decompression cap.
+    static func gzipInflate(_ data: Data) -> Data? {
+        var stream = z_stream()
+        guard inflateInit2_(&stream, 15 + 32, ZLIB_VERSION, Int32(MemoryLayout<z_stream>.size)) == Z_OK else { return nil }
+        defer { inflateEnd(&stream) }
+        return data.withUnsafeBytes { raw in
+            guard let base = raw.bindMemory(to: Bytef.self).baseAddress else { return nil }
+            stream.next_in = UnsafeMutablePointer(mutating: base)
+            stream.avail_in = uInt(data.count)
+            var output = Data()
+            let chunkSize = 64 * 1024
+            var chunk = [UInt8](repeating: 0, count: chunkSize)
+            while output.count < 64 * 1024 * 1024 {
+                let status = chunk.withUnsafeMutableBufferPointer { buffer -> Int32 in
+                    stream.next_out = buffer.baseAddress
+                    stream.avail_out = uInt(chunkSize)
+                    return inflate(&stream, Z_NO_FLUSH)
+                }
+                output.append(contentsOf: chunk.prefix(chunkSize - Int(stream.avail_out)))
+                if status == Z_STREAM_END { return output }
+                guard status == Z_OK, stream.avail_in > 0 || stream.avail_out == 0 else { return nil }
+            }
+            return nil
+        }
+    }
 }
 
 // MARK: - Topotext 解码（对应 ProNotes 的 Topotext_Document / AttributeRun / CRDT 类型族）
@@ -95,7 +124,7 @@ enum ProtoWire {
 // Document = repeated AttributeRun（length / paragraphStyle / font / todo / attachment）
 // 文本字符以 CRDT Item 树存储，防回退策略：按序收割 UTF-8 字符串
 
-struct TopotextRun {
+struct TopotextRun: Equatable {
     var length = 0
     var paragraphType = 0       // 0=正文 1=标题 2=大标题 3=副标题 4=小标题 5=列表项 …
     var listLevel = 0
@@ -104,12 +133,19 @@ struct TopotextRun {
     var bold = false
     var italic = false
     var strikethrough = false
+    var underline = false
+    var monospaced = false
+    var numbered = false
+    var blockQuote = false
+    var link: String?
 }
 
 struct TopotextDoc {
     var runs: [TopotextRun] = []
     var text = ""
     var totalLength = 0
+    var isComplete = true
+    var warnings: [String] = []
 }
 
 enum TopotextDecoder {
@@ -136,6 +172,9 @@ enum TopotextDecoder {
         // blob 本身可能是 zlib 压缩的 protobuf（整段容器）
         var candidates: [Data] = [blob]
         if let inflated = ProtoWire.zlibInflate(blob) { candidates.append(inflated) }
+        for candidate in candidates {
+            if let document = parseNotesDocument(candidate) { return document }
+        }
         candidates += candidatesFor(blob).dropFirst()
         for cand in candidates {
             if let doc = parseDocument(cand), doc.totalLength > 0 || !doc.text.isEmpty {
@@ -144,11 +183,95 @@ enum TopotextDecoder {
                 }
             }
         }
-        if let b = best { return b }
+        if var b = best {
+            b.isComplete = false
+            b.warnings = ["正文使用兼容解析，格式或附件可能不完整。"]
+            return b
+        }
         // 防回退：纯字符串收割
         var doc = TopotextDoc()
         doc.text = harvest(blob)
+        doc.isComplete = false
+        doc.warnings = ["正文格式无法识别，当前为恢复出的文本，可能不完整。"]
         return doc.text.isEmpty ? nil : doc
+    }
+
+    // Notes' published reverse-engineered protobuf schema:
+    // NoteStoreProto.2 -> Document.3 -> Note { text:2, attribute_run:5 }.
+    // https://github.com/threeplanetssoftware/apple_cloud_notes_parser/blob/master/proto/notestore.proto
+    private static func parseNotesDocument(_ data: Data) -> TopotextDoc? {
+        guard let document = ProtoWire.parse(data).first(where: { $0.number == 2 && $0.wireType == 2 })?.bytes,
+              let note = ProtoWire.parse(document).first(where: { $0.number == 3 && $0.wireType == 2 })?.bytes,
+              let text = ProtoWire.parse(note).first(where: { $0.number == 2 && $0.wireType == 2 })?.string else { return nil }
+        var doc = TopotextDoc()
+        doc.text = text
+        if text.contains("\u{FFFC}") {
+            doc.isComplete = false
+            doc.warnings.append("附件、图片或表格未导出，请在备忘录中查看原件。")
+        }
+        for field in ProtoWire.parse(note) where field.number == 5 && field.wireType == 2 {
+            guard let bytes = field.bytes else { continue }
+            let fields = ProtoWire.parse(bytes)
+            guard let length = fields.first(where: { $0.number == 1 && $0.wireType == 0 })?.varint,
+                  length <= UInt64(Int.max) else { continue }
+            var run = TopotextRun()
+            run.length = Int(length)
+            for attribute in fields {
+                switch attribute.number {
+                case 2:
+                    guard let style = attribute.bytes else { continue }
+                    for value in ProtoWire.parse(style) {
+                        switch value.number {
+                        case 1:
+                            switch value.varint {
+                            case 0: run.paragraphType = 1
+                            case 1: run.paragraphType = 2
+                            case 2: run.paragraphType = 3
+                            case 4: run.monospaced = true
+                            case 100, 101: run.paragraphType = 5
+                            case 102: run.paragraphType = 5; run.numbered = true
+                            case 103: run.paragraphType = 5; run.isTodo = true
+                            default: break
+                            }
+                        case 4: run.listLevel = Int(max(0, min(Int64(bitPattern: value.varint ?? 0), 20)))
+                        case 5:
+                            run.isTodo = true
+                            run.todoDone = value.bytes.map { ProtoWire.parse($0).contains { $0.number == 2 && $0.varint == 1 } } ?? false
+                        case 8: run.blockQuote = (value.varint ?? 0) > 0
+                        default: break
+                        }
+                    }
+                case 3:
+                    if let font = attribute.bytes {
+                        for hint in ProtoWire.parse(font) where hint.number == 3 {
+                            run.bold = run.bold || ((hint.varint ?? 0) & 1) != 0
+                            run.italic = run.italic || ((hint.varint ?? 0) & 2) != 0
+                        }
+                    }
+                case 5:
+                    run.bold = run.bold || ((attribute.varint ?? 0) & 1) != 0
+                    run.italic = run.italic || ((attribute.varint ?? 0) & 2) != 0
+                case 6: run.underline = attribute.varint == 1
+                case 7: run.strikethrough = attribute.varint == 1
+                case 9: run.link = attribute.string
+                case 12:
+                    doc.isComplete = false
+                    if !doc.warnings.contains("附件、图片或表格未导出，请在备忘录中查看原件。") {
+                        doc.warnings.append("附件、图片或表格未导出，请在备忘录中查看原件。")
+                    }
+                default: break
+                }
+            }
+            doc.runs.append(run)
+        }
+        doc.totalLength = doc.runs.reduce(0) { $0 + $1.length }
+        let count = text.utf16.count
+        if !doc.runs.isEmpty && doc.totalLength != count {
+            doc.runs = []
+            doc.isComplete = false
+            doc.warnings.append("正文样式范围不完整，已保留全部纯文本。")
+        }
+        return doc
     }
 
     private static func candidatesFor(_ data: Data) -> [Data] {
@@ -229,7 +352,7 @@ enum TopotextDecoder {
     private static func interpretStyle(_ data: Data, into run: inout TopotextRun) {
         for f in ProtoWire.parse(data) {
             if f.wireType == 0 {
-                let v = Int(f.varint ?? 0)
+                let v = Int(truncatingIfNeeded: f.varint ?? 0)
                 switch f.number {
                 case 1 ... 8 where run.paragraphType == 0:
                     run.paragraphType = v
@@ -240,7 +363,7 @@ enum TopotextDecoder {
                 // 更深一层：list attribute / todo / font traits
                 for g in ProtoWire.parse(b) {
                     if g.wireType == 0 {
-                        let v = Int(g.varint ?? 0)
+                        let v = Int(truncatingIfNeeded: g.varint ?? 0)
                         if v == 1 { run.bold = true }
                         if v == 2 { run.italic = true }
                         if v == 3 { run.strikethrough = true }
@@ -302,49 +425,86 @@ enum MarkdownConverter {
     static func convert(note: NoteSummary, doc: TopotextDoc?) -> String {
         var md = "# " + (note.title.isEmpty ? "无标题" : note.title) + "\n\n"
         if let doc {
+            if !doc.warnings.isEmpty { md += "> 注意：" + doc.warnings.joined(separator: "；") + "\n\n" }
             md += applyRuns(doc)
         } else {
             let snippet = note.snippet.replacingOccurrences(of: "\u{FFFC}", with: "")
-            md += snippet.isEmpty ? "_（正文解码失败或为空）_" : snippet
+            md += "> 注意：无法读取完整正文，以下仅为摘要。\n\n"
+            md += snippet.isEmpty ? "_（无可用摘要）_" : snippet
         }
         return md
     }
 
     static func applyRuns(_ doc: TopotextDoc) -> String {
         var out = ""
-        var cursor = 0
+        var cursor = 0 // Apple Notes attribute lengths are UTF-16 code units.
         let text = doc.text
         if doc.runs.isEmpty {
             return text.isEmpty ? "_（正文解码失败或为空）_" : text
         }
-        var openBold = false, openItalic = false
+        var atLineStart = true
+        var merged: [TopotextRun] = []
         for run in doc.runs {
-            if run.length == 0 { continue }
-            let end = min(cursor + run.length, text.count)
-            guard cursor < end else { continue }
-            let chunk = String(text[text.index(text.startIndex, offsetBy: cursor) ..< text.index(text.startIndex, offsetBy: end)])
-            cursor = end
-            var line = chunk
-            // 行级样式
-            switch run.paragraphType {
-            case 1: line = "# " + line
-            case 2: line = "## " + line
-            case 3: line = "### " + line
-            case 4: line = "#### " + line
-            case 5, 6, 7, 8:
-                let indent = String(repeating: "  ", count: max(0, run.listLevel))
-                line = indent + "- " + (run.isTodo ? (run.todoDone ? "[x] " : "[ ] ") : "") + line
-            default: break
+            if var last = merged.last {
+                let combinedLength = last.length + run.length
+                last.length = run.length
+                if last == run {
+                    merged[merged.count - 1].length = combinedLength
+                    continue
+                }
             }
-            // 行内样式（简化：整块加粗/斜体）
-            if run.bold && !openBold { line = "**" + line; openBold = true }
-            if !run.bold && openBold { line += "**"; openBold = false }
-            if run.italic && !openItalic { line = "_" + line; openItalic = true }
-            if !run.italic && openItalic { line += "_"; openItalic = false }
-            out += line
+            merged.append(run)
         }
-        if openBold { out += "**" }
-        if openItalic { out += "_" }
+        for run in merged {
+            if run.length <= 0 { continue }
+            let end = min(cursor + run.length, text.utf16.count)
+            guard cursor < end else { continue }
+            guard let range = Range(NSRange(location: cursor, length: end - cursor), in: text) else {
+                // Malformed runs must never split a surrogate pair or lose text.
+                return text
+            }
+            let chunk = String(text[range])
+            cursor = end
+            let lines = chunk.components(separatedBy: "\n")
+            for (index, part) in lines.enumerated() {
+                if !part.isEmpty {
+                    if atLineStart {
+                        switch run.paragraphType {
+                        case 1: out += "# "
+                        case 2: out += "## "
+                        case 3: out += "### "
+                        case 4: out += "#### "
+                        case 5, 6, 7, 8:
+                            out += String(repeating: "  ", count: min(20, max(0, run.listLevel)))
+                            out += run.numbered ? "1. " : "- "
+                            if run.isTodo { out += run.todoDone ? "[x] " : "[ ] " }
+                        default: break
+                        }
+                        if run.blockQuote { out += "> " }
+                    }
+                    let leading = String(part.prefix(while: { $0.isWhitespace }))
+                    let content = String(part.dropFirst(leading.count))
+                    let trailing = String(content.reversed().prefix(while: { $0.isWhitespace }).reversed())
+                    var styled = String(content.dropLast(trailing.count))
+                    if styled.isEmpty { out += part; atLineStart = false; continue }
+                    if run.monospaced { styled = "`" + styled.replacingOccurrences(of: "`", with: "\\`") + "`" }
+                    if run.bold { styled = "**" + styled + "**" }
+                    if run.italic { styled = "_" + styled + "_" }
+                    if run.strikethrough { styled = "~~" + styled + "~~" }
+                    if run.underline { styled = "<u>" + styled + "</u>" }
+                    if let link = run.link, !link.isEmpty {
+                        styled = "[" + styled + "](" + link.replacingOccurrences(of: ")", with: "%29") + ")"
+                    }
+                    out += leading + styled + trailing
+                    atLineStart = false
+                }
+                if index < lines.count - 1 { out += "\n"; atLineStart = true }
+            }
+        }
+        if cursor < text.utf16.count,
+           let remainder = Range(NSRange(location: cursor, length: text.utf16.count - cursor), in: text) {
+            out += text[remainder]
+        }
         return out.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 }

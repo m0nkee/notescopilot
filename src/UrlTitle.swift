@@ -118,25 +118,52 @@ enum UrlTitleLinker {
     private static var recentProcessed: [String: Date] = [:]
     private static let recentWindow: TimeInterval = 30
 
-    /// 由 AXSlashWatcher.poll 调用；返回应删除的字符数（nil = 未命中）
+    @MainActor static var bridge = NotesBridge.shared
+    @MainActor private static var pendingTarget: NotesBridge.SelectionSnapshot?
+    @MainActor private static var pendingID: UUID?
+    @MainActor private(set) static var pendingTask: Task<Void, Never>?
+
+    /// 保留原 URL，抓取完成且目标未变时才原位替换。
     @MainActor
-    static func hit(_ tail: String) -> Int? {
-        guard enabled, let (url, deleteCount) = lastURLToken(in: tail) else { return nil }
+    static func hit(_ tail: String) -> Bool {
+        guard enabled, let (url, _) = lastURLToken(in: tail),
+              let target = bridge.readTextSnapshot(), target.range.length == 0 else { return false }
+        let before = (target.documentText as NSString).substring(to: target.range.location)
+        guard let token = lastURLToken(in: before), token.url == url,
+              let last = before.last, last == " " || last == "\n" || last == "\t" else { return false }
+        let whitespace = String(before.reversed().prefix(while: { $0 == " " || $0 == "\n" || $0 == "\t" }).reversed())
+        let original = url + whitespace
+        let length = original.utf16.count
+        guard target.range.location >= length, before.hasSuffix(original) else { return false }
+        let range = CFRange(location: target.range.location - length, length: length)
+        let key = "\(target.noteID):\(range.location):\(url)"
         // 30 秒内处理过的 URL 不再触发（回退场景防循环）
         recentProcessed = recentProcessed.filter { Date().timeIntervalSince($0.value) < recentWindow }
-        if recentProcessed[url] != nil { return nil }
-        recentProcessed[url] = Date()
+        guard recentProcessed[key] == nil else { return false }
+        recentProcessed[key] = Date()
 
-        let deleteCountFinal = deleteCount
-        // 标题抓取与删除并行；两者就绪后粘贴超链
-        Task { @MainActor in
+        cancelPending()
+        let id = UUID()
+        pendingID = id
+        pendingTarget = target
+        pendingTask = Task { @MainActor in
             var title = await fetcher(url)
-            if title != nil, isLoginTitle(title!) { title = nil }
+            guard !Task.isCancelled, pendingID == id else { return }
+            defer {
+                pendingID = nil
+                pendingTarget = nil
+                pendingTask = nil
+            }
+            guard enabled, bridge.isCurrent(target) else { return }
+            if let value = title, isLoginTitle(value) { title = nil }
             let linkText = title ?? url
-            let html = makeLinkHTML(title: linkText, url: url)
-            waitDeleteThenPaste(html: html, expect: deleteCountFinal, fallbackDeadline: Date().addingTimeInterval(2.0))
+            let html = makeLinkHTML(title: linkText, url: url) + whitespace
+            if let error = bridge.replaceText(in: target, range: range,
+                                              with: linkText + whitespace, html: html) {
+                NCLog.log("URL 超链已取消：\(error)")
+            }
         }
-        return deleteCount
+        return true
     }
 
     private static var enabled: Bool {
@@ -144,24 +171,18 @@ enum UrlTitleLinker {
             ? true : UserDefaults.standard.bool(forKey: "nc.urltitle.enabled")
     }
 
-    /// 确认退格删净后粘贴富文本超链（复用 Markdown 展开的删除确认轮询思路）
     @MainActor
-    private static func waitDeleteThenPaste(html: String, expect: Int, fallbackDeadline: Date) {
-        func pollDelete() {
-            // 删净判据：光标前文本尾部不再以触发空格+URL 结尾（宽松：尾部非空白即算推进）
-            let cleaned: Bool = {
-                guard NotesBridge.isFrontmostNotes(),
-                      let tail = NotesBridge.shared.textBeforeCursor(maxLength: expect + 8) else { return false }
-                return lastURLToken(in: tail) == nil
-            }()
-            if cleaned || Date() >= fallbackDeadline {
-                NotesBridge.shared.typeExpansionRich(html: html, deleteCount: 0)
-                NCLog.log("URL 超链已粘贴（删净=\(cleaned)）")
-            } else {
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.08, execute: pollDelete)
-            }
-        }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1, execute: pollDelete)
+    static func cancelIfTargetChanged() {
+        guard let target = pendingTarget else { return }
+        if !enabled || !bridge.isCurrent(target) { cancelPending() }
+    }
+
+    @MainActor
+    private static func cancelPending() {
+        pendingID = nil
+        pendingTarget = nil
+        pendingTask?.cancel()
+        pendingTask = nil
     }
 
     // MARK: 标题抓取
@@ -169,10 +190,26 @@ enum UrlTitleLinker {
     /// 三级策略：① HTTP 直抓（公网站点）② 共享 Cookie 注入后重抓（内网 WebKit 应用登录过则可用）
     /// ③ 浏览器标签页标题（Safari/Chrome/Edge 正开着该页面——SSO 内网文档最可靠来源）
     nonisolated static func fetchTitle(_ url: String) async -> String? {
-        if let t = await fetchViaHTTP(url, cookies: nil) { return t }
-        let cookieHeader = sharedCookieHeader(for: url)
-        if !cookieHeader.isEmpty, let t = await fetchViaHTTP(url, cookies: cookieHeader) { return t }
-        return fetchViaBrowserTab(url)
+        await firstUsableTitle([
+            { await fetchViaHTTP(url, cookies: nil) },
+            {
+                let cookieHeader = sharedCookieHeader(for: url)
+                return cookieHeader.isEmpty ? nil : await fetchViaHTTP(url, cookies: cookieHeader)
+            },
+            { fetchViaBrowserTab(url) },
+        ])
+    }
+
+    /// A login page is a failed strategy, so an authenticated source still gets a turn.
+    nonisolated static func firstUsableTitle(_ sources: [() async -> String?]) async -> String? {
+        for source in sources {
+            guard !Task.isCancelled else { return nil }
+            guard let title = await source()?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !title.isEmpty, !isLoginTitle(title) else { continue }
+            guard !Task.isCancelled else { return nil }
+            return title
+        }
+        return nil
     }
 
     /// 从系统共享 HTTPCookieStorage 取该域可用 cookie（Cookie 头形式）
@@ -214,7 +251,7 @@ enum UrlTitleLinker {
                 repeat with w in windows
                     repeat with t in tabs of w
                         set u to URL of t
-                        if u starts with "\(NotesBridge.appleScriptEscaped(base))" or u starts with "\(NotesBridge.appleScriptEscaped(base))/" then
+                        if u is "\(NotesBridge.appleScriptEscaped(base))" or u is "\(NotesBridge.appleScriptEscaped(base))/" or u starts with "\(NotesBridge.appleScriptEscaped(base))#" then
                             return name of t
                         end if
                     end repeat
