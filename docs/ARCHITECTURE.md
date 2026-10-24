@@ -19,6 +19,7 @@ NotesCopilot 为 Swift 单进程应用（`swiftc` 直编，零第三方依赖）
 | `LiberatorLite.swift` | NotesStore 直读：懒加载 `NoteStore.sqlite`（笔记库浏览），FSEvents 监听自动重索引 |
 | `LibraryView.swift` | 资料库窗口 UI：浏览 Notes 笔记并可直接「问 AI」 |
 | `Views.swift` | 设置页 UI：服务商预设、本地模型探测（`LocalAIProbe`）、多配置管理 |
+| `AppUpdater.swift` | GitHub 正式发布版本检查、数值版本比较、每日检查与提醒节流、新版本缓存及自动检查开关 |
 | `Markdown.swift` | Markdown 分块、原生预览与安全 HTML 写回；不执行原始 HTML |
 | `NotesTemplateImporter.swift` | 显式从 Notes 的 Templates 文件夹导入，不覆盖同名本地模板 |
 | `FrontmostTracker.swift` | 前台应用追踪（判断 Notes 是否前台、记录最后的外部应用） |

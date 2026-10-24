@@ -28,6 +28,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var handlerRef: EventHandlerRef?
     private var hotkeyHandlerStatus: OSStatus?
     private var hotkeyStatus: OSStatus?
+    private var updateTimer: Timer?
+    private var updateMenuItem: NSMenuItem?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         if startBackgroundServices { FrontmostTracker.shared.start() }
@@ -69,6 +71,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // accessory（LSUIElement）应用没有主菜单，⌘V/⌘C 的快捷键等价物会失效，
         // 导致设置窗口的 SecureField 无法粘贴——构建标准 mainMenu 修复
         NSApp.mainMenu = Self.buildMainMenu()
+        AppUpdater.shared.onCheckCompleted = { [weak self] userInitiated in
+            self?.presentUpdateResult(userInitiated: userInitiated)
+        }
+        if startBackgroundServices {
+            Task { await AppUpdater.shared.checkIfNeeded() }
+            updateTimer = Timer.scheduledTimer(withTimeInterval: 60 * 60, repeats: true) { _ in
+                Task { @MainActor in await AppUpdater.shared.checkIfNeeded() }
+            }
+        }
 
         // 内置模板 seed（对齐 ProNotes _defaultTemplates；幂等，仅首次）
         if startBackgroundServices { TemplateSeeder.ensureSeeded() }
@@ -160,6 +171,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let appMenu = NSMenu()
         appMenu.addItem(withTitle: "关于 NotesCopilot",
                         action: #selector(NSApplication.orderFrontStandardAboutPanel(_:)), keyEquivalent: "")
+        appMenu.addItem(withTitle: "检查更新…", action: #selector(checkForUpdates), keyEquivalent: "")
         appMenu.addItem(.separator())
         appMenu.addItem(withTitle: "隐藏其他", action: #selector(NSApplication.hideOtherApplications(_:)), keyEquivalent: "h")
         appMenu.addItem(.separator())
@@ -220,6 +232,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         add("打开面板（全局快捷键 ⇧⌘Space）", #selector(showPanel), target: self)
         add("笔记库…", #selector(showLibrary), "l", target: self)
         add("设置…", #selector(showSettings), ",", target: self)
+        add("检查更新…", #selector(checkForUpdates), target: self)
+        let updateItem = NSMenuItem(title: "有新版本可下载", action: #selector(openUpdateDownload), keyEquivalent: "")
+        updateItem.target = self
+        updateItem.isHidden = true
+        menu.addItem(updateItem)
+        updateMenuItem = updateItem
         menu.addItem(.separator())
         add("打开辅助功能设置", #selector(openAXSettings), target: self)
         menu.addItem(.separator())
@@ -230,6 +248,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// 菜单展开时刷新监听状态行，让「斜杠不生效」一眼可诊断
     func menuNeedsUpdate(_ menu: NSMenu) {
         guard menu == statusItem.menu, let first = menu.items.first else { return }
+        refreshUpdateMenu()
         let cgRunning = KeywordListener.shared.isRunning
         let axRunning = AXSlashWatcher.shared.isRunning
         let slashOn = UserDefaults.standard.object(forKey: "nc.slash.global") == nil
@@ -246,6 +265,43 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             first.title = "斜杠命令：● AX 通道可用，键盘导航未启动"
         } else {
             first.title = "键盘监听：○ 未启动，请检查辅助功能授权"
+        }
+    }
+
+    @objc func checkForUpdates() {
+        Task { await AppUpdater.shared.check() }
+    }
+
+    @objc func openUpdateDownload() {
+        NSWorkspace.shared.open(AppUpdater.shared.availableRelease?.pageURL ?? AppUpdater.releasesURL)
+    }
+
+    private func refreshUpdateMenu() {
+        let release = AppUpdater.shared.availableRelease
+        updateMenuItem?.isHidden = release == nil
+        updateMenuItem?.title = "下载新版本 v\(release?.version ?? "")…"
+    }
+
+    private func presentUpdateResult(userInitiated: Bool) {
+        let updater = AppUpdater.shared
+        refreshUpdateMenu()
+        guard userInitiated || updater.shouldRemind() else { return }
+        let alert = NSAlert()
+        if updater.status == .available, let release = updater.availableRelease {
+            alert.messageText = "NotesCopilot 有新版本 v\(release.version)"
+            alert.informativeText = "当前版本：v\(updater.currentVersion)\n建议更新以获取最新功能和修复。\n下载 DMG 后，将 NotesCopilot 拖入「Applications」替换旧版本。"
+            alert.addButton(withTitle: "前往下载")
+            alert.addButton(withTitle: "稍后提醒")
+            updater.markReminded()
+            NSApp.activate(ignoringOtherApps: true)
+            if alert.runModal() == .alertFirstButtonReturn { openUpdateDownload() }
+        } else {
+            alert.messageText = updater.status == .current ? "已是最新版本" : "检查更新失败"
+            alert.informativeText = updater.statusMessage
+            alert.addButton(withTitle: "好")
+            if updater.status != .current { alert.addButton(withTitle: "打开发布页") }
+            NSApp.activate(ignoringOtherApps: true)
+            if alert.runModal() == .alertSecondButtonReturn { NSWorkspace.shared.open(AppUpdater.releasesURL) }
         }
     }
 

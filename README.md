@@ -1,5 +1,7 @@
 <div align="center">
 
+<img src="assets/AppIcon.png" width="112" alt="NotesCopilot 图标" />
+
 # NotesCopilot
 
 **macOS 原生菜单栏 AI 写作助手，深度集成 Apple Notes**
@@ -59,11 +61,13 @@ NotesCopilot 常驻菜单栏，为 Apple Notes 提供 AI 加工能力：全局�
 ## 📦 安装
 
 ### 下载使用
-1. 从 [GitHub Releases](https://github.com/m0nkee/notescopilot/releases/latest) 下载 `NotesCopilot-2.6.1-arm64.dmg`，打开后将 `NotesCopilot.app` 拖入「Applications」
+1. 从 [GitHub Releases](https://github.com/m0nkee/notescopilot/releases/latest) 下载 `NotesCopilot-2.6.2-arm64.dmg`，打开后将 `NotesCopilot.app` 拖入「Applications」
 2. 首次启动：系统设置 → 隐私与安全性 → **辅助功能** 中授权 NotesCopilot
 3. 未配置模型时打开设置，已配置时打开 AI 面板；之后可用菜单栏图标或 `⇧⌘Space` 呼出
 
 关闭窗口后，重新打开 `NotesCopilot.app` 会恢复设置或主面板。菜单栏图标被刘海或其他菜单遮挡时，也可从设置侧栏直接打开 AI 面板或笔记库，或使用 `⇧⌘Space`。
+
+更新入口位于菜单栏的「检查更新…」、设置侧栏及「通用与诊断 → 版本更新」。默认每天自动检查一次正式发布版本，发现新版本时提醒；选择「稍后提醒」后至少间隔一天再次提醒。可在设置中关闭自动检查，仍可手动检查。点击下载会打开对应 GitHub 发布页，下载 DMG 后将应用拖入「Applications」替换旧版本。
 
 当前发布包支持 Apple Silicon（arm64）、macOS 13 及以上，使用开发证书签名，尚未完成 Apple 公证；其他 Mac 上的 Gatekeeper 可能阻止启动。正式可信分发还需要 Developer ID Application 签名与 Apple 公证。
 
@@ -71,8 +75,8 @@ NotesCopilot 常驻菜单栏，为 Apple Notes 提供 AI 加工能力：全局�
 ```bash
 git clone https://github.com/m0nkee/notescopilot.git && cd notescopilot
 ./build.sh          # 产出 build/NotesCopilot.app
-scripts/run-tests.sh  # 九套逻辑、异步与合成资料库回归
-scripts/check-ui.sh   # 十四种原生界面布局渲染（使用隔离模拟数据）
+scripts/run-tests.sh  # 十套逻辑、异步与合成资料库回归
+scripts/check-ui.sh   # 十六种原生界面布局渲染（使用隔离模拟数据）
 scripts/check-startup.sh # 真实 AppDelegate 窗口生命周期回归（需图形会话，使用隔离模拟数据）
 # 应用正在使用时，可构建到单独目录，稍后再切换
 NC_BUILD_OUTPUT=build/pending/NotesCopilot.app ./build.sh
@@ -115,9 +119,10 @@ Notes 中输入 `/` 或选中文字没有反应时，先查看 AI 面板的笔�
 ```
 notescopilot/
 ├── build.sh              # 一键构建脚本（swiftc 直编，产出 .app）
-├── Info.plist            # Bundle 配置（v2.6.1，LSUIElement）
+├── Info.plist            # Bundle 配置（v2.6.2，LSUIElement）
+├── assets/               # 应用图标 PNG、ICNS 与生成记录
 ├── src/                  # 源码（模块职责，见 docs/ARCHITECTURE.md）
-├── tests/                # 九套回归（含写回、流式、资料库和产品逻辑）
+├── tests/                # 十套回归（含写回、流式、资料库、产品逻辑和更新检查）
 ├── scripts/run-tests.sh  # 测试回归脚本
 ├── tools/                # 开发期调试工具（AX 探针、渲染工具）
 └── docs/                 # 使用说明、架构文档、截图

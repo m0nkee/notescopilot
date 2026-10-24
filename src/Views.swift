@@ -832,7 +832,7 @@ enum SettingsPage: String, CaseIterable, Identifiable {
         case .markdown: return "在 Notes 里键入 # / ## / [] / > / ``` / - / * / 1. + 空格 自动套格式"
         case .templates: return "在提示词输入框键入 / 即可通过斜杠命令插入"
         case .expansion: return "Notes AI 交互需辅助功能与 Notes 自动化；键盘导航与关键词扩展使用辅助功能授权"
-        case .general: return "登录启动、权限检查与连接诊断"
+        case .general: return "版本更新、登录启动、权限检查与连接诊断"
         }
     }
 
@@ -850,11 +850,14 @@ enum SettingsPage: String, CaseIterable, Identifiable {
 }
 
 struct SettingsView: View {
+    @ObservedObject private var updater: AppUpdater
     private let discoverLocalModels: Bool
     private let notesAccessIssueProvider: () -> NotesAccessIssue?
     init(discoverLocalModels: Bool = true,
          notesAccessIssueProvider: @escaping () -> NotesAccessIssue? = { NotesBridge.shared.refreshAccessIssue() },
-         initialPage: SettingsPage = .model) {
+         initialPage: SettingsPage = .model,
+         updater: AppUpdater? = nil) {
+        self.updater = updater ?? .shared
         self.discoverLocalModels = discoverLocalModels
         self.notesAccessIssueProvider = notesAccessIssueProvider
         _page = State(initialValue: initialPage)
@@ -1035,7 +1038,29 @@ struct SettingsView: View {
             }
             .padding(.horizontal, 10)
             .padding(.bottom, 12)
-            Text("v\(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "-")")
+            Button {
+                page = .general
+                Task { await updater.check() }
+            } label: {
+                Label(updater.isChecking ? "正在检查…" : "检查更新",
+                      systemImage: "arrow.triangle.2.circlepath")
+            }
+            .buttonStyle(.borderless)
+            .font(.caption)
+            .disabled(updater.isChecking)
+            .accessibilityIdentifier("settings.checkForUpdates")
+            .padding(.horizontal, 14)
+            .padding(.bottom, 8)
+            if let release = updater.availableRelease {
+                Button("新版本 v\(release.version) 可下载") {
+                    NSWorkspace.shared.open(release.pageURL)
+                }
+                .buttonStyle(.borderless)
+                .font(.caption2)
+                .padding(.horizontal, 14)
+                .padding(.bottom, 8)
+            }
+            Text("v\(updater.currentVersion.isEmpty ? "-" : updater.currentVersion)")
                 .font(.caption2)
                 .foregroundColor(.secondary)
                 .padding(.horizontal, 14)
@@ -1764,6 +1789,48 @@ struct SettingsView: View {
 
     private var generalPage: some View {
         VStack(alignment: .leading, spacing: 12) {
+            card("arrow.down.circle", "版本更新") {
+                HStack {
+                    Text("当前版本：v\(updater.currentVersion.isEmpty ? "-" : updater.currentVersion)")
+                        .font(.callout)
+                    Spacer()
+                    Button(updater.isChecking ? "正在检查…" : "检查更新") {
+                        Task { await updater.check() }
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.small)
+                    .disabled(updater.isChecking)
+                    .accessibilityIdentifier("settings.updates.check")
+                }
+                Text(updater.statusMessage)
+                    .font(.caption)
+                    .foregroundColor(updater.availableRelease == nil ? .secondary : .orange)
+                    .accessibilityIdentifier("settings.updates.status")
+                if let release = updater.availableRelease {
+                    Button("下载新版本 v\(release.version)…") { NSWorkspace.shared.open(release.pageURL) }
+                        .controlSize(.small)
+                        .accessibilityIdentifier("settings.updates.download")
+                    Text("下载 DMG 后，将 NotesCopilot 拖入「Applications」替换旧版本。")
+                        .font(.caption2).foregroundColor(.secondary)
+                }
+                Toggle("自动检查更新并提醒", isOn: $updater.automaticallyChecks)
+                    .toggleStyle(.switch)
+                    .onChange(of: updater.automaticallyChecks) { enabled in
+                        if enabled { Task { await updater.checkIfNeeded() } }
+                    }
+                Text("每天最多自动检查一次；发现新版本后提醒，稍后提醒会间隔至少一天。")
+                    .font(.caption2).foregroundColor(.secondary)
+                HStack {
+                    if let date = updater.lastChecked {
+                        Text("上次成功检查：\(date.formatted(date: .abbreviated, time: .shortened))")
+                            .font(.caption2).foregroundColor(.secondary)
+                    }
+                    Spacer()
+                    Button("打开发布页") { NSWorkspace.shared.open(AppUpdater.releasesURL) }
+                        .buttonStyle(.link)
+                        .font(.caption)
+                }
+            }
             card("power", "登录启动") {
                 Toggle("登录时启动 NotesCopilot", isOn: Binding(get: { launchAtLogin }, set: { on in
                     changingLaunchAtLogin = true

@@ -26,10 +26,12 @@ run_suite() {
   "$OUT/$name" | tee "$OUT/$name-test.log"
 }
 
-SUITES=(selai-tests slashgroup-tests template-tests urltitle-tests writeback-tests template-runner-tests chat-tests library-tests product-tests)
+SUITES=(selai-tests slashgroup-tests template-tests urltitle-tests writeback-tests template-runner-tests chat-tests library-tests product-tests update-tests)
 if [ "$#" -gt 0 ]; then SUITES=("$@"); fi
 for suite in "${SUITES[@]}"; do
   case "$suite" in
+    update-tests)
+      run_suite "$suite" tests/update-tests/main.swift src/AppUpdater.swift ;;
     selai-tests|writeback-tests)
       run_suite "$suite" "tests/$suite/main.swift" src/SelectionAI.swift "${COMMON_SOURCES[@]}" ;;
     slashgroup-tests|template-tests|urltitle-tests|template-runner-tests|chat-tests)

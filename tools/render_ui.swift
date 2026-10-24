@@ -35,6 +35,7 @@ struct RenderUI {
         NSApp.setActivationPolicy(.prohibited)
         let delegate = AppDelegate()
         NSApp.delegate = delegate
+        let updater = AppUpdater(currentVersion: "2.6.1", defaults: defaults)
         let engine = ChatEngine()
         try render(PanelView(engine: engine, notesAccessIssueProvider: { nil }), size: NSSize(width: 560, height: 760), name: "panel-empty", directory: output)
         engine.setContext("本周完成编辑器交互优化，下周继续验证笔记写回与模型切换。", source: "选中文本", noteID: "synthetic-note")
@@ -46,15 +47,19 @@ struct RenderUI {
         engine.dismissReview()
         engine.lastError = "响应尚未完成，已保留当前结果。可以继续生成、重新生成，或复制已有内容。写回前请确认目标笔记。"
         try render(PanelView(engine: engine, notesAccessIssueProvider: { nil }), size: NSSize(width: 520, height: 640), name: "panel-error-small", directory: output)
-        try render(SettingsView(discoverLocalModels: false, notesAccessIssueProvider: { nil }), size: NSSize(width: 940, height: 640), name: "settings-light", directory: output)
-        try render(SettingsView(discoverLocalModels: false, notesAccessIssueProvider: { nil }), size: NSSize(width: 940, height: 640), name: "settings-dark", directory: output, dark: true)
+        try render(SettingsView(discoverLocalModels: false, notesAccessIssueProvider: { nil }, updater: updater), size: NSSize(width: 940, height: 640), name: "settings-light", directory: output)
+        try render(SettingsView(discoverLocalModels: false, notesAccessIssueProvider: { nil }, updater: updater), size: NSSize(width: 940, height: 640), name: "settings-dark", directory: output, dark: true)
 
         let manualEngine = ChatEngine()
         manualEngine.output = "可以继续手动输入上下文和任务，使用 AI。"
         try render(PanelView(engine: manualEngine, notesAccessIssueProvider: { .accessibilityRequired }), size: NSSize(width: 560, height: 760), name: "panel-notes-access-ax-light", directory: output)
         try render(PanelView(engine: manualEngine, notesAccessIssueProvider: { .automationDenied }), size: NSSize(width: 560, height: 760), name: "panel-notes-access-automation-dark", directory: output, dark: true)
-        try render(SettingsView(discoverLocalModels: false, notesAccessIssueProvider: { .automationDenied }, initialPage: .general), size: NSSize(width: 940, height: 640), name: "settings-notes-access-light", directory: output)
-        try render(SettingsView(discoverLocalModels: false, notesAccessIssueProvider: { .automationDenied }, initialPage: .general), size: NSSize(width: 940, height: 640), name: "settings-notes-access-dark", directory: output, dark: true)
+        try render(SettingsView(discoverLocalModels: false, notesAccessIssueProvider: { .automationDenied }, initialPage: .general, updater: updater), size: NSSize(width: 940, height: 640), name: "settings-notes-access-light", directory: output)
+        try render(SettingsView(discoverLocalModels: false, notesAccessIssueProvider: { .automationDenied }, initialPage: .general, updater: updater), size: NSSize(width: 940, height: 640), name: "settings-notes-access-dark", directory: output, dark: true)
+        defaults.set("v2.7.0", forKey: "nc.update.availableTag")
+        let availableUpdater = AppUpdater(currentVersion: "2.6.1", defaults: defaults)
+        try render(SettingsView(discoverLocalModels: false, notesAccessIssueProvider: { nil }, initialPage: .general, updater: availableUpdater), size: NSSize(width: 900, height: 620), name: "settings-update-available-light", directory: output)
+        try render(SettingsView(discoverLocalModels: false, notesAccessIssueProvider: { nil }, initialPage: .general, updater: availableUpdater), size: NSSize(width: 900, height: 620), name: "settings-update-available-dark", directory: output, dark: true)
         let notices = VStack(spacing: 12) {
             NotesAccessNoticeView(issue: .accessibilityRequired, allowsManualInput: true)
             NotesAccessNoticeView(issue: .automationDenied, allowsManualInput: true)
@@ -79,9 +84,9 @@ struct RenderUI {
                      "Failed synthetic credential save must preserve existing metadata")
         precondition(failingSecrets.readCount > 0 && UserDefaults.standard.volatileDomain(forName: UserDefaults.argumentDomain)[ProfileStore.key] != nil,
                      "Recovery fixture must use only the isolated store and preserve standard synthetic defaults")
-        try render(SettingsView(discoverLocalModels: false, notesAccessIssueProvider: { nil }), size: NSSize(width: 940, height: 640), name: "settings-keychain-recovery-light", directory: output)
-        try render(SettingsView(discoverLocalModels: false, notesAccessIssueProvider: { nil }), size: NSSize(width: 940, height: 640), name: "settings-keychain-recovery-dark", directory: output, dark: true)
-        print("UI smoke: 14 native layouts rendered with isolated data")
+        try render(SettingsView(discoverLocalModels: false, notesAccessIssueProvider: { nil }, updater: updater), size: NSSize(width: 940, height: 640), name: "settings-keychain-recovery-light", directory: output)
+        try render(SettingsView(discoverLocalModels: false, notesAccessIssueProvider: { nil }, updater: updater), size: NSSize(width: 940, height: 640), name: "settings-keychain-recovery-dark", directory: output, dark: true)
+        print("UI smoke: 16 native layouts rendered with isolated data")
     }
 
     @MainActor static func render<V: View>(_ view: V, size: NSSize, name: String, directory: URL, dark: Bool = false) throws {
