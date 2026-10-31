@@ -75,7 +75,7 @@ enum LocalAIProbe {
 struct PromptTextView: NSViewRepresentable {
     @Binding var text: String
     var commands: () -> [SlashCommand]
-    var onSuggestions: ([SlashCommand]) -> Void
+    var onSuggestions: ([SlashCommand], Int?) -> Void
     var onMove: (Int) -> Void
     var onAccept: (SlashCommand) -> Void
     var onRun: () -> Void
@@ -115,6 +115,7 @@ struct PromptTextView: NSViewRepresentable {
         if tv.string != text {
             tv.string = text
             tv.selectedRange = NSRange(location: (text as NSString).length, length: 0)
+            context.coordinator.suggestionsDismissed = false
             context.coordinator.refreshSuggestions(tv)
         }
     }
@@ -124,12 +125,31 @@ struct PromptTextView: NSViewRepresentable {
         weak var textView: NSTextView?
         var suggestions: [SlashCommand] = []
         var active = false
+        var suggestionsDismissed = false
+        private var currentQuery: String?
 
-        init(_ p: PromptTextView) { parent = p }
+        init(_ p: PromptTextView) {
+            parent = p
+            super.init()
+            NotificationCenter.default.addObserver(self, selector: #selector(templatesDidChange),
+                                                  name: TemplateStore.notesChangedNotification, object: nil)
+        }
+
+        deinit { NotificationCenter.default.removeObserver(self) }
+
+        @objc private func templatesDidChange() {
+            guard Thread.isMainThread else {
+                DispatchQueue.main.async { [weak self] in self?.templatesDidChange() }
+                return
+            }
+            guard !suggestionsDismissed, let tv = textView else { return }
+            refreshSuggestions(tv)
+        }
 
         func textDidChange(_ n: Notification) {
             guard let tv = textView else { return }
             parent.text = tv.string
+            suggestionsDismissed = false
             refreshSuggestions(tv)
         }
 
@@ -146,19 +166,26 @@ struct PromptTextView: NSViewRepresentable {
                 guard prev == " " || prev == "\n" || prev == "\t" else { close(); return }
             }
             let token = String(before[before.index(after: slashIdx)...])
-            guard !token.contains(where: { $0.isWhitespace }) else { close(); return }
-            let all = parent.commands()
-            let filtered = token.isEmpty ? all
-                : all.filter { $0.name.localizedCaseInsensitiveContains(token) || $0.alias.localizedCaseInsensitiveContains(token) }
+            let query = "/" + token
+            let category = SlashQuery.isCategory(query)
+            guard !token.contains("\n"), !token.contains("\t"),
+                  category || !token.contains(where: { $0.isWhitespace }) else { close(); return }
+            let filtered = SlashQuery.candidates(for: query, commands: parent.commands())
+            let sameRows = suggestions.count == filtered.count && zip(suggestions, filtered).allSatisfy {
+                $0.name == $1.name && $0.alias == $1.alias && $0.group == $1.group
+            }
+            let reset: Int? = currentQuery != query || !sameRows ? (category ? -1 : 0) : nil
+            currentQuery = query
             suggestions = filtered
             active = !filtered.isEmpty
-            parent.onSuggestions(filtered)
+            parent.onSuggestions(filtered, reset)
         }
 
         private func close() {
             active = false
+            currentQuery = nil
             suggestions = []
-            parent.onSuggestions([])
+            parent.onSuggestions([], nil)
         }
 
         func textView(_ tv: NSTextView, doCommandBy selector: Selector) -> Bool {
@@ -175,6 +202,7 @@ struct PromptTextView: NSViewRepresentable {
                     return true
                 case #selector(NSResponder.cancelOperation(_:)):
                     parent.onCancelSuggestions()
+                    suggestionsDismissed = true
                     active = false
                     suggestions = []
                     return true
@@ -199,6 +227,7 @@ struct PromptTextView: NSViewRepresentable {
             let idx = parent.selectedIndex()
             guard suggestions.indices.contains(idx) else { return }
             let cmd = suggestions[idx]
+            suggestionsDismissed = true
             active = false
             suggestions = []
             parent.onAccept(cmd)
@@ -278,11 +307,11 @@ struct PanelView: View {
                 VStack(spacing: 10) {
                     contextSection
                     if showHistory { historySection }
-                    if !suggestions.isEmpty { suggestionsMenu }
                     promptSection
-                    quickActionsRow
+                    if suggestions.isEmpty { quickActionsRow }
                 }
-            }.frame(maxHeight: showHistory || !suggestions.isEmpty || notesAccessIssue != nil ? 340 : engine.images.isEmpty ? 215 : 265)
+            }.frame(maxHeight: showHistory || notesAccessIssue != nil ? 340 : engine.images.isEmpty ? 215 : 265)
+            if !suggestions.isEmpty { suggestionsMenu }
             outputSection
             if !engine.pendingResult.isEmpty { reviewBanner }
             footerBar
@@ -417,24 +446,34 @@ struct PanelView: View {
     // MARK: 斜杠命令建议菜单
 
     private var suggestionsMenu: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            ForEach(Array(suggestions.enumerated()), id: \.element.id) { i, cmd in
-                HStack(spacing: 8) {
-                    Text(cmd.name)
-                        .font(.system(size: 12, weight: .medium))
-                    Text("/" + cmd.alias)
-                        .font(.system(size: 11, design: .monospaced))
-                        .foregroundColor(.purple)
-                        .frame(minWidth: 70, alignment: .leading)
-                    Text(cmd.detail)
-                        .font(.caption).foregroundColor(.secondary)
-                        .lineLimit(1)
-                    Spacer()
+        ScrollViewReader { proxy in
+            ScrollView {
+                VStack(alignment: .leading, spacing: 0) {
+                    ForEach(Array(suggestions.enumerated()), id: \.offset) { i, cmd in
+                        HStack(spacing: 8) {
+                            Text(cmd.name)
+                                .font(.system(size: 12, weight: .medium))
+                            Text(cmd.alias.isEmpty ? "模板" : "/" + cmd.alias)
+                                .font(.system(size: 11, design: .monospaced))
+                                .foregroundColor(.purple)
+                                .frame(minWidth: 70, alignment: .leading)
+                            Text(cmd.detail)
+                                .font(.caption).foregroundColor(.secondary)
+                                .lineLimit(1)
+                            Spacer()
+                        }
+                        .padding(.horizontal, 10).padding(.vertical, 5)
+                        .background(i == selectedIdx ? Color.accentColor.opacity(0.25) : .clear)
+                        .contentShape(Rectangle())
+                        .onTapGesture { perform(cmd) }
+                        .id(i)
+                    }
                 }
-                .padding(.horizontal, 10).padding(.vertical, 5)
-                .background(i == selectedIdx ? Color.accentColor.opacity(0.25) : .clear)
-                .contentShape(Rectangle())
-                .onTapGesture { perform(cmd) }
+            }
+            .frame(height: min(140, CGFloat(suggestions.count) * 28))
+            .onChange(of: selectedIdx) { index in
+                guard suggestions.indices.contains(index) else { return }
+                proxy.scrollTo(index, anchor: .center)
             }
         }
         .padding(4)
@@ -453,13 +492,14 @@ struct PanelView: View {
                 ZStack(alignment: .topLeading) {
                 PromptTextView(text: $prompt,
                                commands: { buildSlashCommands() },
-                               onSuggestions: { list in
+                               onSuggestions: { list, reset in
                                    suggestions = list
-                                   selectedIdx = 0
+                                   if let reset { selectedIdx = reset }
                                },
                                onMove: { delta in
                                    guard !suggestions.isEmpty else { return }
-                                   selectedIdx = (selectedIdx + delta + suggestions.count) % suggestions.count
+                                   selectedIdx = selectedIdx < 0 ? (delta > 0 ? 0 : suggestions.count - 1)
+                                       : (selectedIdx + delta + suggestions.count) % suggestions.count
                                },
                                onAccept: { cmd in perform(cmd) },
                                onRun: {
@@ -788,9 +828,9 @@ struct PanelView: View {
             }
             engine.stop()
             let generation = engine.operationGeneration
-            TemplateRunner.run(tpl, selection: engine.noteContext,
-                               isOperationValid: { engine.operationGeneration == generation }) { text in
-                NotesBridge.shared.writeWhenNotesActive(in: target, text: text,
+            TemplateRunner.runRich(tpl, selection: engine.noteContext,
+                               isOperationValid: { engine.operationGeneration == generation }) { text, html in
+                NotesBridge.shared.writeWhenNotesActive(in: target, text: text, html: html,
                                                        isOperationValid: { engine.operationGeneration == generation }) { error in
                     guard engine.operationGeneration == generation else { return }
                     if let error { engine.lastError = error }
@@ -882,6 +922,10 @@ struct SettingsView: View {
 
     // 模板与文本扩展
     @State private var templates: [TemplateNote] = TemplateStore.templates
+    @State private var notesTemplates: [TemplateNote] = TemplateStore.notesTemplates
+    @State private var notesTemplatesLoading = false
+    @State private var notesTemplatesReady = false
+    @State private var notesTemplatesError: String?
     @State private var rules: [KeywordRule] = KeywordStore.rules
     @State private var kwEnabled = UserDefaults.standard.bool(forKey: "nc.kw.enabled")
     @State private var slashGlobal = UserDefaults.standard.object(forKey: "nc.slash.global") == nil
@@ -906,7 +950,6 @@ struct SettingsView: View {
     @State private var launchAtLogin = false
     @State private var changingLaunchAtLogin = false
     @State private var testingModel = false
-    @State private var importingTemplates = false
     @State private var axAuthorized = false
     @State private var keyboardRunning = false
     @State private var notesAccessIssue: NotesAccessIssue?
@@ -928,6 +971,12 @@ struct SettingsView: View {
         .onReceive(NotificationCenter.default.publisher(for: ProfileStore.errorNotification).receive(on: DispatchQueue.main)) { note in
             statusText = note.object as? String ?? "配置保存失败，请检查钥匙串权限。"
         }
+        .onReceive(NotificationCenter.default.publisher(for: TemplateStore.notesChangedNotification).receive(on: DispatchQueue.main)) { _ in
+            refreshNotesTemplatesStatus()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .init("nc.storeAvailable")).receive(on: DispatchQueue.main)) { _ in
+            refreshNotesTemplatesStatus()
+        }
         .onReceive(NotificationCenter.default.publisher(for: NotesBridge.accessChangedNotification, object: NotesBridge.shared).receive(on: DispatchQueue.main)) { _ in
             refreshPermissionStatus()
         }
@@ -937,6 +986,7 @@ struct SettingsView: View {
         .onAppear {
             lastSavedProfiles = profiles
             refreshPermissionStatus()
+            refreshNotesTemplatesStatus()
             if let error = ProfileStore.lastError { statusText = error }
         }
         .onChange(of: profiles) { list in
@@ -1587,11 +1637,39 @@ struct SettingsView: View {
 
     private var templatesPage: some View {
         VStack(alignment: .leading, spacing: 12) {
-            card("folder", "从 Apple Notes 导入") {
-                Text("读取 Notes 的 Templates 文件夹，新增本地模板；同名模板保留现有版本。导入后独立编辑，需要更新时可删除本地版本再导入。")
+            card("folder", "Apple Notes 模板", note: "默认启用 · 自动更新") {
+                Text("Notes 的 Templates 文件夹会自动读取。笔记首行是模板名，第二行起为生成内容，其中首个内容段落是新文档标题。修改、移入或移出笔记后自动更新；同名时优先 Notes 版本，本地模板保留。")
                     .font(.caption).foregroundColor(.secondary)
-                Button(importingTemplates ? "正在导入…" : "导入 Templates 文件夹") { importNotesTemplates() }
-                    .disabled(importingTemplates).controlSize(.small)
+                if notesTemplatesLoading {
+                    Label("正在读取 Notes 模板…", systemImage: "arrow.triangle.2.circlepath")
+                        .font(.caption).foregroundColor(.secondary)
+                } else if let error = notesTemplatesError {
+                    Text(error).font(.caption).foregroundColor(.orange)
+                } else if !notesTemplatesReady {
+                    Text("读取 Notes 模板需要完全磁盘访问权限。授权后点击「重新读取」。")
+                        .font(.caption).foregroundColor(.secondary)
+                } else if notesTemplates.isEmpty {
+                    Text("在 Notes 中新建 Templates 文件夹，将笔记放入其中即可。仅显示可完整读取的非空笔记。")
+                        .font(.caption).foregroundColor(.secondary)
+                }
+                ForEach(notesTemplates) { template in
+                    VStack(alignment: .leading, spacing: 4) {
+                        HStack(spacing: 8) {
+                            Text("/\(template.commandName)")
+                                .font(.system(size: 12, weight: .semibold, design: .monospaced))
+                                .foregroundStyle(Color.accentColor)
+                            varBadges(TemplateEngine.specs(in: template.content))
+                        }
+                        Text(template.content).font(.caption).foregroundColor(.secondary).lineLimit(3)
+                    }.textSelection(.enabled)
+                }
+                HStack {
+                    Button("重新读取") { (NSApp.delegate as? AppDelegate)?.refreshNotesTemplates() }
+                        .disabled(notesTemplatesLoading)
+                    if !notesTemplatesReady || notesTemplatesError != nil {
+                        Button("完全磁盘访问设置") { openPrivacy("Privacy_AllFiles") }
+                    }
+                }.controlSize(.small)
             }
             // 内置模板（对齐 ProNotes _defaultTemplates）
             let builtin = templates.filter(\.isBuiltin)
@@ -1859,7 +1937,7 @@ struct SettingsView: View {
                       systemImage: keyboardRunning ? "checkmark.circle" : "info.circle").font(.caption).foregroundColor(.secondary)
                 Text("键盘导航使用辅助功能授权，无需额外开启输入监控。")
                     .font(.caption).foregroundColor(.secondary)
-                Text("笔记库及模板导入需要完全磁盘访问权限；创建笔记、读取笔记身份及浏览器标题会在首次使用时请求自动化权限。")
+                Text("笔记库及 Notes 模板读取需要完全磁盘访问权限；创建笔记、读取笔记身份及浏览器标题会在首次使用时请求自动化权限。")
                     .font(.caption).foregroundColor(.secondary)
                 HStack {
                     Button("打开辅助功能设置") {
@@ -1946,22 +2024,12 @@ struct SettingsView: View {
         }
     }
 
-    private func importNotesTemplates() {
-        guard let delegate = NSApp.delegate as? AppDelegate, let store = delegate.notesStore else {
-            statusText = (NSApp.delegate as? AppDelegate)?.notesStoreError ?? "笔记库尚未就绪，请在菜单栏打开笔记库并完成授权后重试。"
-            return
-        }
-        importingTemplates = true
-        DispatchQueue.global(qos: .userInitiated).async {
-            let candidates = NotesTemplateImporter.read(from: store)
-            DispatchQueue.main.async {
-                let result = NotesTemplateImporter.merging(candidates, into: templates)
-                templates = result.templates
-                importingTemplates = false
-                statusText = "已导入 \(result.addedCount) 个模板，跳过 \(result.skippedCount) 个同名或空模板。"
-                    + (candidates.isEmpty ? "请确认 Notes 中存在 Templates 文件夹和可完整读取的笔记。" : "")
-            }
-        }
+    private func refreshNotesTemplatesStatus() {
+        notesTemplates = TemplateStore.notesTemplates
+        let delegate = NSApp.delegate as? AppDelegate
+        notesTemplatesLoading = delegate?.notesStoreLoading == true || delegate?.notesTemplatesLoading == true
+        notesTemplatesReady = delegate?.notesStore != nil
+        notesTemplatesError = delegate?.notesStoreError
     }
 
     /// 拉取指定配置的模型列表（GET /models），写入该配置的模型菜单；

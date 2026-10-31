@@ -5,7 +5,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     var notesStore: NotesStore?
     var notesStoreError: String?
     var notesStoreLoading = false
+    var notesTemplatesLoading = false
     @objc func retryNotesStore() {}
+    @objc func refreshNotesTemplates() {}
     @objc func showPanel() {}
     @objc func showLibrary() {}
     @objc func openPanelWithNote(_ note: Any?) {}

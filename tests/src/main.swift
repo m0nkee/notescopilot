@@ -296,6 +296,87 @@ var corruptGzip = nativeGzip
 corruptGzip[corruptGzip.count - 8] ^= 0xff
 check("gzip校验失败拒绝返回截断正文", ProtoWire.gzipInflate(corruptGzip) == nil)
 
+// Inline text attachments use the same object placeholder as images and tables.
+// Only matching metadata may turn those placeholders back into complete text.
+let hashtagUTI = "com.apple.notes.inlinetextattachment.hashtag"
+let noteLinkUTI = "com.apple.notes.inlinetextattachment.link"
+func inlineRun(_ length: Int, id: String, type: String, style: [UInt8] = []) -> [UInt8] {
+    fieldVar(1, UInt64(length)) + style + field(12, fieldStr(1, id) + fieldStr(2, type))
+}
+func inlineProto(_ text: String, runs: [[UInt8]]) -> Data {
+    gzip(Data(field(2, fieldVar(2, 1) + field(3,
+        fieldStr(2, text) + runs.flatMap { field(5, $0) }))))
+}
+let inlineText = "😀前\u{FFFC} 与 \u{FFFC}尾🙂文"
+let inlineGzip = inlineProto(inlineText, runs: [
+    fieldVar(1, UInt64("😀前".utf16.count)),
+    inlineRun(1, id: "tag-id", type: hashtagUTI),
+    fieldVar(1, UInt64(" 与 ".utf16.count)) + fieldVar(5, 1),
+    inlineRun(1, id: "link-id", type: noteLinkUTI, style: fieldVar(5, 2)),
+    fieldVar(1, UInt64("尾🙂文".utf16.count)) + fieldVar(6, 1),
+])
+let inlineMetadata = [
+    "tag-id": TopotextInlineAttachment(typeUTI: hashtagUTI, text: "#项目🚀"),
+    "link-id": TopotextInlineAttachment(typeUTI: noteLinkUTI, text: "计划📘"),
+]
+let inlineDoc = TopotextDecoder.decode(inlineGzip, inlineAttachments: inlineMetadata)
+let expandedInlineText = "😀前#项目🚀 与 计划📘尾🙂文"
+check("元数据还原标签和笔记链接后正文完整", inlineDoc?.text == expandedInlineText
+      && inlineDoc?.isComplete == true && inlineDoc?.warnings.isEmpty == true,
+      "text=\(inlineDoc?.text ?? "nil")")
+check("内联文字替换按UTF16调整run及总长度", inlineDoc?.runs.map(\.length) == [3, 5, 3, 4, 4]
+      && inlineDoc?.totalLength == expandedInlineText.utf16.count)
+let inlineMarkdown = inlineDoc.map(MarkdownConverter.applyRuns) ?? ""
+check("内联文字替换保留相邻加粗斜体下划线边界", inlineMarkdown == "😀前#项目🚀 **与** _计划📘_<u>尾🙂文</u>", inlineMarkdown)
+check("笔记链接仅保留显示文字不编造URL", !inlineMarkdown.contains("](")
+      && inlineDoc?.runs.allSatisfy { $0.link == nil } == true)
+
+let loneTag = inlineProto("\u{FFFC}", runs: [inlineRun(1, id: "tag-id", type: hashtagUTI)])
+let missingInline = TopotextDecoder.decode(loneTag)
+check("缺少内联附件元数据保留占位并标记不完整", missingInline?.text == "\u{FFFC}"
+      && missingInline?.isComplete == false)
+let emptyInline = TopotextDecoder.decode(loneTag, inlineAttachments: [
+    "tag-id": TopotextInlineAttachment(typeUTI: hashtagUTI, text: ""),
+])
+check("空显示文字不能冒充完整内联正文", emptyInline?.text == "\u{FFFC}" && emptyInline?.isComplete == false)
+let mismatchedInline = TopotextDecoder.decode(loneTag, inlineAttachments: [
+    "tag-id": TopotextInlineAttachment(typeUTI: noteLinkUTI, text: "错误类型"),
+])
+check("内联附件UTI不匹配时不替换正文", mismatchedInline?.text == "\u{FFFC}"
+      && mismatchedInline?.isComplete == false)
+for type in ["public.image", "com.apple.notes.inlinetextattachment.unknown"] {
+    let unsupported = TopotextDecoder.decode(inlineProto("\u{FFFC}", runs: [inlineRun(1, id: "other", type: type)]),
+        inlineAttachments: ["other": TopotextInlineAttachment(typeUTI: type, text: "不能当纯文本")])
+    check("未支持附件类型不因存在显示文字而变完整：\(type)", unsupported?.text == "\u{FFFC}"
+          && unsupported?.isComplete == false)
+}
+let mixedInline = TopotextDecoder.decode(inlineProto("\u{FFFC}\u{FFFC}", runs: [
+    inlineRun(1, id: "tag-id", type: hashtagUTI),
+    inlineRun(1, id: "image-id", type: "public.image"),
+]), inlineAttachments: inlineMetadata)
+check("标签与图片混合时仅还原标签并保留不完整状态", mixedInline?.text == "#项目🚀\u{FFFC}"
+      && mixedInline?.isComplete == false)
+let invalidInline = TopotextDecoder.decode(inlineProto("😀\u{FFFC}", runs: [
+    fieldVar(1, 1), inlineRun(2, id: "tag-id", type: hashtagUTI),
+]), inlineAttachments: inlineMetadata)
+check("run切开UTF16代理对时拒绝错误附件替换", invalidInline?.text == "😀\u{FFFC}"
+      && invalidInline?.isComplete == false)
+let oversizedInline = TopotextDecoder.decode(inlineProto("\u{FFFC}", runs: [
+    inlineRun(2, id: "tag-id", type: hashtagUTI),
+]), inlineAttachments: inlineMetadata)
+check("run越界时保留占位和不完整状态", oversizedInline?.text == "\u{FFFC}"
+      && oversizedInline?.isComplete == false)
+let missingPlaceholder = TopotextDecoder.decode(inlineProto("原", runs: [
+    inlineRun(1, id: "tag-id", type: hashtagUTI),
+]), inlineAttachments: inlineMetadata)
+check("附件run缺少占位符时不覆盖原文", missingPlaceholder?.text == "原" && missingPlaceholder?.isComplete == false)
+let malformedAttachment = TopotextDecoder.decode(inlineProto("\u{FFFC}", runs: [
+    field(12, fieldStr(1, "image-id") + fieldStr(2, "public.image")),
+    inlineRun(1, id: "tag-id", type: hashtagUTI),
+]), inlineAttachments: inlineMetadata)
+check("缺失长度的附件run不能被忽略后误标完整", malformedAttachment?.text == "\u{FFFC}"
+      && malformedAttachment?.isComplete == false)
+
 sqlite3_open(fixturePath, &db)
 exec("CREATE TABLE ZICNOTEDATA (Z_PK INTEGER PRIMARY KEY, ZNOTE INTEGER, ZDATA BLOB)")
 exec("BEGIN")
@@ -372,6 +453,108 @@ check("样式范围不足也保留所有尾文", MarkdownConverter.applyRuns(Top
 let failedContent = nativeStore.content(for: nativeStore.notes().first { $0.pk == 10000 }!)
 check("读取失败不得伪装为完整正文", !failedContent.isComplete && failedContent.warning != nil
       && failedContent.markdown.contains("仅为摘要"))
+
+// ---------- 9. 原生模板正文直接生成 HTML，不经 Markdown 往返 ----------
+func nativeHTMLDocument(_ chunks: [(String, TopotextRun)]) -> TopotextDoc {
+    var text = ""
+    var runs: [TopotextRun] = []
+    for (chunk, style) in chunks {
+        text += chunk
+        var run = style
+        run.length = chunk.utf16.count
+        runs.append(run)
+    }
+    return TopotextDoc(runs: runs, text: text, totalLength: text.utf16.count)
+}
+let htmlBody = TopotextRun()
+var htmlTitle = TopotextRun(); htmlTitle.paragraphType = 1
+var htmlHeading = TopotextRun(); htmlHeading.paragraphType = 2
+var htmlSubheading = TopotextRun(); htmlSubheading.paragraphType = 3
+var htmlBold = TopotextRun(); htmlBold.bold = true
+var htmlCode = TopotextRun(); htmlCode.monospaced = true; htmlCode.monospacedBlock = true
+let nativeHTMLDoc = nativeHTMLDocument([
+    ("Native Title\n", htmlTitle), ("Before ", htmlBody), ("bold", htmlBold), (" after\n", htmlBody),
+    ("let a = 1\n", htmlCode), ("  next <tag>\n", htmlCode), ("Section\n", htmlHeading),
+    ("Subsection\n", htmlSubheading), ("Done 😀", htmlBody)
+])
+let renderedNativeHTML = NativeNoteHTML.render(nativeHTMLDoc)
+check("原生模板HTML只包含一次正文标题且使用标题标签", renderedNativeHTML.components(separatedBy: "Native Title").count == 2
+      && renderedNativeHTML.contains("<h1") && renderedNativeHTML.contains("<h2")
+      && !renderedNativeHTML.contains("# Native Title"))
+check("原生模板跨run正文保留加粗且没有Markdown标记", renderedNativeHTML.contains("Before ")
+      && renderedNativeHTML.contains("<strong>bold</strong>") && renderedNativeHTML.contains(" after")
+      && !renderedNativeHTML.contains("**bold**"))
+check("连续原生等宽段落生成单个灰色多行代码块", renderedNativeHTML.components(separatedBy: "<pre").count == 2
+      && renderedNativeHTML.contains("background-color:") && renderedNativeHTML.contains("<code")
+      && renderedNativeHTML.contains("let a = 1\n  next &lt;tag&gt;") && !renderedNativeHTML.contains("```"))
+check("原生HTML保留Unicode和段落顺序", renderedNativeHTML.contains("Done 😀")
+      && renderedNativeHTML.range(of: "Native Title")!.lowerBound < renderedNativeHTML.range(of: "Section")!.lowerBound)
+var htmlInline = TopotextRun(); htmlInline.italic = true; htmlInline.underline = true; htmlInline.strikethrough = true
+var htmlTag = TopotextRun(); htmlTag.inlineAttachmentType = hashtagUTI
+var htmlSafeLink = TopotextRun(); htmlSafeLink.link = "https://example.com?a=1&b=2"
+var htmlBadLink = TopotextRun(); htmlBadLink.link = "javascript:alert(1)"
+let styledHTML = NativeNoteHTML.render(nativeHTMLDocument([
+    ("styled", htmlInline), (" #项目🚀", htmlTag), (" safe", htmlSafeLink), (" <script>&\"", htmlBadLink)
+]))
+check("原生HTML保留斜体下划线删除线和标签颜色", styledHTML.contains("<em>") && styledHTML.contains("<u>")
+      && styledHTML.contains("<s>") && styledHTML.contains("color:") && styledHTML.contains("#项目🚀"))
+check("原生HTML转义文本和链接属性并拒绝活动脚本链接", styledHTML.contains("href=\"https://example.com?a=1&amp;b=2\"")
+      && styledHTML.contains("&lt;script&gt;&amp;&quot;") && !styledHTML.contains("javascript:")
+      && !styledHTML.contains("<script>"))
+var htmlList = TopotextRun(); htmlList.paragraphType = 5
+var htmlNestedList = htmlList; htmlNestedList.listLevel = 1
+var htmlOrdered = htmlList; htmlOrdered.numbered = true
+var htmlTodo = htmlList; htmlTodo.isTodo = true; htmlTodo.todoDone = true
+let listsHTML = NativeNoteHTML.render(nativeHTMLDocument([
+    ("First\n", htmlList), ("Nested\n", htmlNestedList), ("Ordered\n", htmlOrdered), ("Task\n", htmlTodo), ("\nLast", htmlBody)
+]))
+check("原生HTML保留无序有序嵌套列表与待办状态", listsHTML.contains("<ul>") && listsHTML.contains("<ol>")
+      && listsHTML.contains("<li>") && listsHTML.contains("☑ Task") && listsHTML.components(separatedBy: "<ul>").count >= 3)
+check("原生HTML保留空段落", listsHTML.contains("<p><br></p>"))
+let nativeCodeProto = inlineProto("code\n", runs: [fieldVar(1, 5) + field(2, fieldVar(1, 4))])
+let nativeCodeDoc = TopotextDecoder.decode(nativeCodeProto)
+check("原生等宽段落与行内等宽有独立语义", nativeCodeDoc?.runs.first?.monospaced == true
+      && nativeCodeDoc?.runs.first?.monospacedBlock == true)
+check("还原的标签run携带展示类型以保留颜色", inlineDoc?.runs.contains { $0.inlineAttachmentType == hashtagUTI } == true)
+
+for documentType in [NSAttributedString.DocumentType.rtf, .rtfd] {
+do {
+    let attributed = try NSAttributedString(data: Data((renderedNativeHTML + "\n" + styledHTML).utf8),
+        options: [.documentType: NSAttributedString.DocumentType.html,
+                  .characterEncoding: String.Encoding.utf8.rawValue], documentAttributes: nil)
+    let rtf = try attributed.data(from: NSRange(location: 0, length: attributed.length),
+                                  documentAttributes: [.documentType: documentType])
+    let restored = try NSAttributedString(data: rtf,
+        options: [.documentType: documentType], documentAttributes: nil)
+    func attributes(_ text: String) -> [NSAttributedString.Key: Any] {
+        let range = (restored.string as NSString).range(of: text)
+        return range.location == NSNotFound ? [:] : restored.attributes(at: range.location, effectiveRange: nil)
+    }
+    let bodyFont = attributes("Before")[.font] as? NSFont
+    let titleFont = attributes("Native Title")[.font] as? NSFont
+    let headingFont = attributes("Section")[.font] as? NSFont
+    let subheadingFont = attributes("Subsection")[.font] as? NSFont
+    let codeAttributes = attributes("let a = 1")
+    let codeFont = codeAttributes[.font] as? NSFont
+    check("HTML经\(documentType.rawValue)往返后系统CSS使用无衬线正文13pt", bodyFont?.familyName?.lowercased().contains("helvetica") == true
+          && abs((bodyFont?.pointSize ?? 0) - 13) < 0.1,
+          "font=\(bodyFont?.fontName ?? "nil") size=\(bodyFont?.pointSize ?? 0)")
+    check("HTML经\(documentType.rawValue)往返后标题20pt小标题17pt副标题15pt", abs((titleFont?.pointSize ?? 0) - 20) < 0.1
+          && abs((headingFont?.pointSize ?? 0) - 17) < 0.1 && abs((subheadingFont?.pointSize ?? 0) - 15) < 0.1)
+    check("HTML经\(documentType.rawValue)往返后代码固定使用Menlo而非默认Courier", codeFont?.fontName.lowercased().contains("menlo") == true
+          && codeFont?.isFixedPitch == true && abs((codeFont?.pointSize ?? 0) - 13) < 0.1,
+          "font=\(codeFont?.fontName ?? "nil") size=\(codeFont?.pointSize ?? 0) mono=\(codeFont?.isFixedPitch ?? false)")
+    let background = (codeAttributes[.backgroundColor] as? NSColor)?.usingColorSpace(.deviceRGB)
+    check("HTML经\(documentType.rawValue)往返后代码灰色背景保留", background != nil && background!.redComponent > 0.8
+          && abs(background!.redComponent - background!.greenComponent) < 0.05
+          && abs(background!.greenComponent - background!.blueComponent) < 0.05)
+    let tagColor = (attributes("#项目🚀")[.foregroundColor] as? NSColor)?.usingColorSpace(.deviceRGB)
+    check("HTML经\(documentType.rawValue)往返后标签橙色保留", tagColor != nil && tagColor!.redComponent > 0.5
+          && tagColor!.redComponent > tagColor!.greenComponent && tagColor!.greenComponent > tagColor!.blueComponent)
+} catch {
+    check("HTML导入与\(documentType.rawValue)往返成功", false, error.localizedDescription)
+}
+}
 
 try? FileManager.default.removeItem(atPath: fixturePath)
 print(failures == 0 ? "\nALL LIBRARY TESTS PASSED" : "\n\(failures) LIBRARY FAILURES")

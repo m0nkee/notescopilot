@@ -282,6 +282,137 @@ func runTests() async {
     checks.check(writes == ["synthetic-note-A|4:0|captured"] && targetErrors.isEmpty,
                  "全局模板使用入口捕获的零长光标快照写回")
 
+    var richWrites: [(text: String, html: String?)] = []
+    let richBridge = NotesBridge(snapshotReader: { target }, replacementWriter: { _, _, text, html in
+        richWrites.append((text, html))
+        return nil
+    })
+    let markdownTask = TemplateRunner.runInNotes(
+        TemplateNote(name: "formatted-local", content: "# Local heading\n\n**Bold**\n\n```\nline one\nline two\n```"),
+        selection: "", bridge: richBridge, clipboard: "", onError: { targetErrors.append($0) })
+    await markdownTask?.value
+    checks.check(richWrites.count == 1 && richWrites[0].html?.contains("<h1>Local heading</h1>") == true
+                 && richWrites[0].html?.contains("<strong>Bold</strong>") == true
+                 && richWrites[0].html?.contains("<pre><code>line one\nline two</code></pre>") == true,
+                 "模板真实写回桥接同时接收 HTML，标题/加粗/多行代码不以 Markdown 标记插入")
+
+    let nativeText = "Native {{date}}\nBold {{ask:who}}\n{{ai:summary}}\nsecond code line"
+    var nativeHeading = TopotextRun()
+    nativeHeading.length = "Native {{date}}\n".utf16.count
+    nativeHeading.paragraphType = 1
+    var nativeBold = TopotextRun()
+    nativeBold.length = "Bold {{ask:who}}\n".utf16.count
+    nativeBold.bold = true
+    var nativeCode = TopotextRun()
+    nativeCode.length = "{{ai:summary}}\nsecond code line".utf16.count
+    nativeCode.monospaced = true
+    nativeCode.monospacedBlock = true
+    let nativeDocument = TopotextDoc(runs: [nativeHeading, nativeBold, nativeCode], text: nativeText,
+                                     totalLength: nativeText.utf16.count)
+    var nativeAskCount = 0
+    var nativeAICount = 0
+    let nativeTask = TemplateRunner.runInNotes(
+        TemplateNote(name: "native-rich", content: nativeText, sourceNotesID: "native-source", sourceDocument: nativeDocument),
+        selection: "captured", bridge: richBridge, clipboard: "",
+        ask: { _ in nativeAskCount += 1; return "A&B <user>" },
+        complete: { _, _ in nativeAICount += 1; return "AI <script>& *raw*" },
+        onError: { targetErrors.append($0) })
+    await nativeTask?.value
+    let nativeWrite = richWrites.last
+    checks.check(nativeAskCount == 1 && nativeAICount == 1 && richWrites.count == 2,
+                 "富文本模板日期/询问/AI 共享一次执行，不因生成 HTML 重复弹窗或请求")
+    checks.check(nativeWrite?.text.contains("Bold A&B <user>") == true
+                 && nativeWrite?.text.contains("AI <script>& *raw*") == true
+                 && !nativeWrite!.text.contains("{{date}}"),
+                 "原生模板变量展开后保留纯文本回退及原始段落内容")
+    checks.check(nativeWrite?.html?.contains("<h1") == true
+                 && nativeWrite?.html?.contains("<strong>") == true
+                 && nativeWrite?.html?.contains("A&amp;B &lt;user&gt;") == true
+                 && nativeWrite?.html?.contains("<pre") == true
+                 && nativeWrite?.html?.contains("background") == true
+                 && nativeWrite?.html?.contains("AI &lt;script&gt;&amp; *raw*") == true
+                 && nativeWrite?.html?.contains("<script>") == false,
+                 "原生样式直接生成 HTML，保留标题/加粗/灰色等宽块并安全转义变量文本")
+
+    let commandText = "/NativeTemplate"
+    let commandTarget = NotesBridge.SelectionSnapshot(element: syntheticElement,
+        range: CFRange(location: commandText.utf16.count, length: 0), text: "", bounds: .zero,
+        noteID: "synthetic-empty-title", documentText: commandText)
+    var commandCurrent: NotesBridge.SelectionSnapshot? = commandTarget
+    var commandReads = 0
+    var atomicWrites: [(range: CFRange, text: String, html: String?)] = []
+    var atomicErrors: [String] = []
+    let commandBridge = NotesBridge(snapshotReader: { commandReads += 1; return commandCurrent },
+                                   replacementWriter: { snapshot, range, text, html in
+        checks.check(snapshot.matches(commandTarget), "原子模板写回仍使用包含原斜杠命令的同一笔记快照")
+        atomicWrites.append((range, text, html))
+        return nil
+    })
+    let commandRange = CFRange(location: 0, length: commandText.utf16.count)
+    let atomicGate = Suspension()
+    let atomicTask = TemplateRunner.runInNotes(
+        TemplateNote(name: "atomic", content: "# Inserted {{ai:replace}}"), selection: "",
+        bridge: commandBridge, clipboard: "", complete: { _, _ in await atomicGate.wait() },
+        target: commandTarget, replacementRange: commandRange, onError: { atomicErrors.append($0) })
+    checks.check(commandReads == 0, "传入原始命令目标后不先删除或重新抓取空标题光标")
+    await atomicGate.waitUntilSuspended()
+    checks.check(atomicWrites.isEmpty && commandCurrent?.documentText == commandText,
+                 "询问或 AI 等待期间保留原斜杠命令，直到富文本可一次写入")
+    atomicGate.resume("ready")
+    await atomicTask?.value
+    checks.check(atomicWrites.count == 1 && atomicWrites[0].range.location == 0
+                 && atomicWrites[0].range.length == commandText.utf16.count
+                 && atomicWrites[0].text == "# Inserted ready"
+                 && atomicWrites[0].html?.contains("<h1>Inserted ready</h1>") == true && atomicErrors.isEmpty,
+                 "模板以一次带 HTML 的精确范围写回替换整个斜杠命令，支持原本空白标题")
+    let atomicCancelGate = Suspension()
+    let atomicCancelled = TemplateRunner.runInNotes(
+        TemplateNote(name: "atomic-cancel", content: "{{ai:cancel}}"), selection: "",
+        bridge: commandBridge, clipboard: "", complete: { _, _ in await atomicCancelGate.wait() },
+        target: commandTarget, replacementRange: commandRange, onError: { atomicErrors.append($0) })
+    await atomicCancelGate.waitUntilSuspended()
+    atomicCancelled?.cancel()
+    atomicCancelGate.resume("late")
+    await atomicCancelled?.value
+    checks.check(atomicWrites.count == 1 && atomicErrors.isEmpty && commandCurrent?.documentText == commandText,
+                 "取消异步原子模板不删除命令、不写回迟到富文本且保留原始目标")
+    let atomicStaleGate = Suspension()
+    let atomicStale = TemplateRunner.runInNotes(
+        TemplateNote(name: "atomic-stale", content: "{{ai:stale}}"), selection: "",
+        bridge: commandBridge, clipboard: "", complete: { _, _ in await atomicStaleGate.wait() },
+        target: commandTarget, replacementRange: commandRange, onError: { atomicErrors.append($0) })
+    await atomicStaleGate.waitUntilSuspended()
+    commandCurrent = NotesBridge.SelectionSnapshot(element: syntheticElement, range: commandTarget.range,
+        text: "", bounds: .zero, noteID: "different-note", documentText: commandText)
+    atomicStaleGate.resume("late")
+    await atomicStale?.value
+    checks.check(atomicWrites.count == 1 && atomicErrors.count == 1,
+                 "原子模板等待时切换笔记仍拒绝替换命令范围")
+
+    let splitText = "Title {{ask:Name}}\nSafe {{selection}} {{clipboard}} \\{{date}} {{unknown}}"
+    var splitHeading = TopotextRun()
+    splitHeading.length = "Title {{a".utf16.count
+    splitHeading.paragraphType = 1
+    var splitTail = TopotextRun()
+    splitTail.length = "sk:Name}}\n".utf16.count
+    splitTail.paragraphType = 1
+    splitTail.bold = true
+    var splitBody = TopotextRun()
+    splitBody.length = "Safe {{selection}} {{clipboard}} \\{{date}} {{unknown}}".utf16.count
+    let splitDoc = TopotextDoc(runs: [splitHeading, splitTail, splitBody], text: splitText, totalLength: splitText.utf16.count)
+    var splitAsks = 0
+    let splitTask = TemplateRunner.runInNotes(
+        TemplateNote(name: "split-rich", content: splitText, sourceNotesID: "split-source", sourceDocument: splitDoc),
+        selection: "<selected>", bridge: richBridge, clipboard: "A&B", ask: { _ in splitAsks += 1; return "X&Y" },
+        onError: { targetErrors.append($0) })
+    await splitTask?.value
+    let splitWrite = richWrites.last
+    checks.check(splitAsks == 1 && splitWrite?.text == "Title X&Y\nSafe <selected> A&B {{date}} {{unknown}}"
+                 && splitWrite?.html?.contains("X&amp;Y") == true
+                 && splitWrite?.html?.contains("&lt;selected&gt; A&amp;B {{date}} {{unknown}}") == true
+                 && splitWrite?.html?.contains("<h1") == true,
+                 "跨多个样式 run 的变量只展开一次，选区/剪贴板安全转义且保留转义及未知变量")
+
     let targetGate = Suspension()
     let staleTask = TemplateRunner.runInNotes(
         TemplateNote(name: "stale-target", content: "{{ai:slow}}"), selection: "captured",
@@ -412,6 +543,64 @@ func runTests() async {
     activation.finish()
     await freshTask.value
     checks.check(delayedWrites == 1 && delayedErrors.isEmpty, "取消后的新模板获得独立有效身份并正常写入")
+
+    // Importer -> expansion -> actual writeback seam: the template name is metadata,
+    // while the second source line becomes the generated document title.
+    let weeklyPrefix = "Weekly Work Templates\n{{date: yyyy-MM-dd}}周记录\n"
+    var weeklyTitleRun = TopotextRun()
+    weeklyTitleRun.length = weeklyPrefix.utf16.count
+    var weeklyBoldRun = TopotextRun()
+    weeklyBoldRun.length = "Bold body\n".utf16.count
+    weeklyBoldRun.bold = true
+    var weeklyCodeRun = TopotextRun()
+    weeklyCodeRun.length = "code one\ncode two\n".utf16.count
+    weeklyCodeRun.monospaced = true
+    weeklyCodeRun.monospacedBlock = true
+    let weeklySourceText = weeklyPrefix + "Bold body\ncode one\ncode two\n"
+    let weeklySource = TopotextDoc(runs: [weeklyTitleRun, weeklyBoldRun, weeklyCodeRun],
+                                  text: weeklySourceText, totalLength: weeklySourceText.utf16.count)
+    if let split = NotesTemplateImporter.splitTemplate(weeklySource) {
+        let weeklyTemplate = TemplateNote(name: split.name, content: split.document.text,
+                                          sourceNotesID: "weekly-fixture", sourceDocument: split.document)
+        let original = "Before\n/templates\nAfter"
+        let commandRange = (original as NSString).range(of: "/templates")
+        let weeklyTarget = NotesBridge.SelectionSnapshot(element: syntheticElement,
+            range: CFRange(location: NSMaxRange(commandRange), length: 0), text: "", bounds: .zero,
+            noteID: "weekly-target", documentText: original)
+        var weeklyResult: String?
+        var weeklyHTML: String?
+        var weeklyErrors: [String] = []
+        let weeklyBridge = NotesBridge(snapshotReader: { weeklyTarget }, replacementWriter: { snap, range, text, html in
+            weeklyResult = (snap.documentText as NSString).replacingCharacters(
+                in: NSRange(location: range.location, length: range.length), with: text)
+            weeklyHTML = html
+            return nil
+        })
+        let weeklyTask = TemplateRunner.runInNotes(weeklyTemplate, selection: "", bridge: weeklyBridge,
+            clipboard: "", target: weeklyTarget,
+            replacementRange: CFRange(location: commandRange.location, length: commandRange.length),
+            onError: { weeklyErrors.append($0) })
+        await weeklyTask?.value
+        checks.check(weeklyErrors.isEmpty && weeklyResult?.range(
+            of: "^Before\\n[0-9]{4}-[0-9]{2}-[0-9]{2}周记录\\nBold body\\ncode one\\ncode two\\n\\nAfter$",
+            options: .regularExpression) != nil && weeklyResult?.contains("Weekly Work Templates") == false,
+            "首行模板名经导入到真实写回不进入文档，第二行日期标题展开且保留命令前后文本")
+        checks.check(weeklyHTML?.contains("<h1 ") == true
+                     && weeklyHTML?.contains("周记录</h1>") == true
+                     && weeklyHTML?.contains("<strong>Bold body</strong>") == true
+                     && weeklyHTML?.contains("<pre ") == true
+                     && weeklyHTML?.contains("Weekly Work Templates") == false,
+                     "去掉模板名后日期标题、正文粗体和多行代码同时进入富文本写回")
+        var panelText = "", panelHTML: String?
+        let panelTask = TemplateRunner.runRich(weeklyTemplate, selection: "", clipboard: "",
+            insert: { panelText = $0; panelHTML = $1 }, onError: { weeklyErrors.append($0) })
+        await panelTask.value
+        checks.check(panelText.range(of: "^[0-9]{4}-[0-9]{2}-[0-9]{2}周记录\\n", options: .regularExpression) != nil
+                     && !panelText.contains("Weekly Work Templates") && panelHTML?.contains("周记录</h1>") == true,
+                     "AI 面板与 Notes 插入共用去除模板名后的载荷及日期标题")
+    } else {
+        checks.check(false, "Weekly Work Templates 示例必须成功拆分为名称和生成内容")
+    }
 
     print(checks.failed == 0 ? "全部通过：\(checks.passed) 项" : "失败 \(checks.failed) 项 / 共 \(checks.passed + checks.failed) 项")
     exit(checks.failed == 0 ? 0 : 1)

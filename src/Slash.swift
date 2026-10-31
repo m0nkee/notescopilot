@@ -10,19 +10,35 @@ struct TemplateNote: Codable, Identifiable, Equatable {
     var content: String
     /// 内置模板（Optional 兼容旧数据：缺 key 反序列化为 nil）
     var builtin: Bool?
+    /// Notes 中的源笔记；这类模板只在内存中读取，不写入本地模板列表。
+    var sourceNotesID: String?
+    /// Notes 去掉首行模板名后的正文与样式，供展开后按富文本插入。
+    var sourceDocument: TopotextDoc?
 
-    init(id: UUID = UUID(), name: String, content: String, builtin: Bool? = nil) {
+    init(id: UUID = UUID(), name: String, content: String, builtin: Bool? = nil, sourceNotesID: String? = nil,
+         sourceDocument: TopotextDoc? = nil) {
         self.id = id
         self.name = name
         self.content = content
         self.builtin = builtin
+        self.sourceNotesID = sourceNotesID
+        self.sourceDocument = sourceDocument
     }
 
     var isBuiltin: Bool { builtin ?? false }
+    var isFromNotes: Bool { sourceNotesID != nil }
+    var commandName: String {
+        name.trimmingCharacters(in: .whitespacesAndNewlines).replacingOccurrences(of: " ", with: "-")
+    }
 }
 
 enum TemplateStore {
     private static let key = "nc.templates"
+    static let notesChangedNotification = Notification.Name("nc.notesTemplatesChanged")
+    private static let notesLock = NSLock()
+    private static var notesSnapshot: [TemplateNote] = []
+
+    /// 本地模板独立保存；Notes 模板随源文件夹刷新，不持久化副本。
     static var templates: [TemplateNote] {
         get {
             guard let d = UserDefaults.standard.data(forKey: key),
@@ -30,6 +46,32 @@ enum TemplateStore {
             return list
         }
         set { UserDefaults.standard.set(try? JSONEncoder().encode(newValue), forKey: key) }
+    }
+
+    static var notesTemplates: [TemplateNote] {
+        notesLock.lock(); defer { notesLock.unlock() }
+        return notesSnapshot
+    }
+
+    static func updateNotesTemplates(_ templates: [TemplateNote]) {
+        notesLock.lock()
+        notesSnapshot = templates
+        notesLock.unlock()
+        NotificationCenter.default.post(name: notesChangedNotification, object: nil)
+    }
+
+    static func commandKey(for name: String) -> String {
+        name.trimmingCharacters(in: .whitespacesAndNewlines)
+            .replacingOccurrences(of: " ", with: "-").lowercased()
+    }
+
+    /// Notes 中的同名命令优先，本地版本仍保留，源笔记移除后自动恢复。
+    static var availableTemplates: [TemplateNote] {
+        var names = Set<String>()
+        return (notesTemplates + templates).filter {
+            let key = commandKey(for: $0.name)
+            return !key.isEmpty && names.insert(key).inserted
+        }
     }
 }
 
@@ -73,6 +115,15 @@ enum SlashGroup: CaseIterable {
         }
     }
 
+    var commandAlias: String {
+        switch self {
+        case .ai: return "ai"
+        case .markdown: return "markdown"
+        case .template: return "templates"
+        case .tool: return "tools"
+        }
+    }
+
     /// 面板分组展示顺序
     static let displayOrder: [SlashGroup] = [.ai, .markdown, .template, .tool]
 }
@@ -93,6 +144,53 @@ struct SlashCommand: Identifiable {
         case .run: return .ai
         default: return .tool
         }
+    }
+}
+
+/// 面板与 Notes 正文共用的分组查询和筛选；分组查询始终展示完整结果。
+enum SlashQuery {
+    private static func parse(_ query: String) -> (group: SlashGroup?, token: String) {
+        let normalized = query.replacingOccurrences(of: "／", with: "/")
+        let body = normalized.hasPrefix("/") ? String(normalized.dropFirst()) : normalized
+        let head = body.prefix { $0 != " " }.lowercased()
+        let group: SlashGroup?
+        switch head {
+        case "templates", "template", "模板", "模版": group = .template
+        case "ai", "智能": group = .ai
+        case "markdown", "格式": group = .markdown
+        case "tools", "tool", "工具": group = .tool
+        default: group = nil
+        }
+        let token = group == nil ? body : String(body.dropFirst(head.count)).trimmingCharacters(in: .whitespaces)
+        return (group, token.lowercased())
+    }
+
+    static func isCategory(_ query: String) -> Bool { parse(query).group != nil }
+
+    static func candidates(for query: String, commands: [SlashCommand], limit: Int? = nil) -> [SlashCommand] {
+        let parsed = parse(query)
+        let commands = parsed.group.map { group in commands.filter { $0.group == group } } ?? commands
+        guard !parsed.token.isEmpty else {
+            if parsed.group != nil || limit == nil { return commands }
+            return SlashGroup.displayOrder.flatMap { group in commands.filter { $0.group == group }.prefix(5) }
+        }
+        let tokens = parsed.group == nil ? [parsed.token]
+            : parsed.token.split(whereSeparator: { $0.isWhitespace }).map(String.init)
+        guard let firstToken = tokens.first else { return [] }
+        let matching = commands.filter { command in
+            tokens.allSatisfy { token in
+                command.name.lowercased().contains(token) || command.alias.lowercased().contains(token)
+            }
+        }
+        let prefix = matching.filter {
+            (!$0.alias.isEmpty && $0.alias.lowercased().hasPrefix(firstToken)) || $0.name.lowercased().hasPrefix(firstToken)
+        }
+        let rest = matching.filter { command in
+            !prefix.contains(where: { $0.id == command.id })
+        }
+        let matches = prefix + rest
+        guard parsed.group == nil, let limit else { return matches }
+        return Array(matches.prefix(max(0, limit)))
     }
 }
 
@@ -141,14 +239,14 @@ SlashCommand(name: "删除线", alias: "strikethrough", detail: "给选中文本
         SlashCommand(name: "设置", alias: "set", detail: "打开设置", action: .openSettings),
     ]
     // 用户模板（ProNotes：模板经斜杠命令插入；NotesCopilot：变量引擎展开后插入）
-    for t in TemplateStore.templates {
-        let safe = t.name.replacingOccurrences(of: " ", with: "-")
+    for t in TemplateStore.availableTemplates {
+        let safe = t.commandName
         guard !safe.isEmpty else { continue }
         let vars = TemplateEngine.specs(in: t.content)
         let varSummary = vars.isEmpty ? "" : " · " + vars.map { "\($0.kind.badge)" }.joined(separator: "/")
         cmds.append(SlashCommand(name: safe,
                                   alias: safe.lowercased().alnum(),
-                                  detail: "\(t.isBuiltin ? "内置模板" : "插入模板")\(varSummary)\(t.isBuiltin ? "" : "：\(t.content.replacingOccurrences(of: "\n", with: " ").prefix(24))" )",
+                                  detail: "\(t.isFromNotes ? "Notes 模板" : (t.isBuiltin ? "内置模板" : "插入模板"))\(varSummary)\(t.isBuiltin ? "" : "：\(t.content.replacingOccurrences(of: "\n", with: " ").prefix(24))" )",
                                   action: .insertTemplate(t)))
     }
     return cmds
@@ -447,7 +545,8 @@ final class KeywordListener {
     /// 在捕获的 Notes 目标执行斜杠；验证删除完成后再读取上下文和运行命令。
 @MainActor
 static func performGlobalSlash(_ cmd: SlashCommand, deleteCount: Int,
-                               target: NotesBridge.SelectionSnapshot? = nil, expectedToken: String? = nil) {
+                               target: NotesBridge.SelectionSnapshot? = nil, expectedToken: String? = nil,
+                               isExplicitSelection: Bool = false) {
     guard let target = target ?? NotesBridge.shared.readTextSnapshot(),
           NotesBridge.shared.isCurrent(target),
           let range = NotesBridge.suffixRange(in: target, characterCount: deleteCount) else { return }
@@ -455,8 +554,35 @@ static func performGlobalSlash(_ cmd: SlashCommand, deleteCount: Int,
     let normalized = token.replacingOccurrences(of: "／", with: "/")
     guard normalized.trimmingCharacters(in: .whitespacesAndNewlines).hasPrefix("/"),
           expectedToken.map({ $0.replacingOccurrences(of: "／", with: "/") == normalized }) ?? true,
-          NotesCommandExecution.shared.claim(target) else { return }
+          NotesCommandExecution.shared.claim(target, allowRepeat: isExplicitSelection) else { return }
     SlashSuggestPanel.shared.hide()
+    if case .insertTemplate(let template) = cmd.action {
+        // 一次替换命令与内容，避免清空新笔记标题时 Notes 暂时撤掉空草稿的身份。
+        defer { NotesCommandExecution.shared.release(suppressUnchangedTarget: true, commandRange: range) }
+        #if NC_APP
+        guard let engine = (NSApp.delegate as? AppDelegate)?.engine else { return }
+        engine.stop()
+        let generation = engine.operationGeneration
+        let contextDocument = (target.documentText as NSString).replacingCharacters(
+            in: NSRange(location: range.location, length: range.length), with: "")
+        let contextTarget = NotesBridge.SelectionSnapshot(element: target.element,
+            range: CFRange(location: range.location, length: 0), text: "", bounds: target.bounds,
+            noteID: target.noteID, documentText: contextDocument)
+        let context = NotesBridge.context(in: contextTarget)?.text ?? ""
+        TemplateRunner.runInNotes(template, selection: context, target: target, replacementRange: range,
+                                 isOperationValid: { engine.operationGeneration == generation }) { error in
+            guard engine.operationGeneration == generation else { return }
+            engine.lastError = error
+        }
+        #endif
+        return
+    }
+    if case .stopGeneration = cmd.action {
+        #if NC_APP
+        // 即使删除唯一标题后 Notes 暂时不可读，停止操作也必须立即生效。
+        (NSApp.delegate as? AppDelegate)?.engine.stop()
+        #endif
+    }
     NotesBridge.shared.removeSuffix(in: target, characterCount: deleteCount) { current, error in
         MainActor.assumeIsolated {
             defer { NotesCommandExecution.shared.release() }
@@ -482,23 +608,14 @@ private static func executeGlobalSlash(_ cmd: SlashCommand, target: NotesBridge.
         delegate.revealPanel(captureContext: false)
         engine.run(prompt: prompt, writebackTarget: target)
         #endif
-    case .insertTemplate(let template):
-        #if NC_APP
-        guard let engine = (NSApp.delegate as? AppDelegate)?.engine else { return }
-        engine.stop()
-        let generation = engine.operationGeneration
-        let context = NotesBridge.shared.readContextAroundCursor()?.text ?? ""
-        TemplateRunner.runInNotes(template, selection: context,
-                                  isOperationValid: { engine.operationGeneration == generation })
-        #endif
+    case .insertTemplate:
+        break // 模板已在删除命令之前绑定原始目标并执行。
     case .format(let style):
         _ = FormatBridge.trigger(style)
     case .openSettings:
         NotificationCenter.default.post(name: .init("nc.openSettings"), object: nil)
     case .stopGeneration:
-        #if NC_APP
-        (NSApp.delegate as? AppDelegate)?.engine.stop()
-        #endif
+        break // 已在删除命令之前停止任务。
     case .newSession:
         #if NC_APP
         (NSApp.delegate as? AppDelegate)?.engine.beginSession()
@@ -538,16 +655,50 @@ final class NotesCommandExecution {
     private(set) var isBusy = false
     private var previous: NotesBridge.SelectionSnapshot?
     private var suppressedUntil = Date.distantPast
+    private struct TemplateSuppression {
+        let target: NotesBridge.SelectionSnapshot
+        let range: CFRange
+        let token: String
+    }
+    private var templateSuppressions: [TemplateSuppression] = []
+    var hasSuppressedTemplates: Bool { !templateSuppressions.isEmpty }
 
-    func claim(_ target: NotesBridge.SelectionSnapshot) -> Bool {
-        guard !isBusy, !(previous?.matches(target) == true && Date() < suppressedUntil) else { return false }
+    func claim(_ target: NotesBridge.SelectionSnapshot, allowRepeat: Bool = false) -> Bool {
+        guard !isBusy else { return false }
+        observe(target)
+        guard allowRepeat || (!templateSuppressions.contains { $0.target.matches(target) }
+            && !(previous?.matches(target) == true && Date() < suppressedUntil)) else { return false }
+        if allowRepeat { templateSuppressions.removeAll { $0.target.matches(target) } }
         isBusy = true
         previous = target
         suppressedUntil = Date().addingTimeInterval(1)
         return true
     }
 
-    func release() { isBusy = false }
+    func observe(_ target: NotesBridge.SelectionSnapshot) {
+        let document = target.documentText as NSString
+        templateSuppressions.removeAll { entry in
+            guard entry.target.noteID == target.noteID, CFEqual(entry.target.element, target.element) else { return false }
+            guard entry.range.location >= 0, entry.range.length > 0,
+                  entry.range.location <= document.length,
+                  entry.range.length <= document.length - entry.range.location else { return true }
+            return document.substring(with: NSRange(location: entry.range.location, length: entry.range.length)) != entry.token
+        }
+    }
+
+    func release(suppressUnchangedTarget: Bool = false, commandRange: CFRange? = nil) {
+        isBusy = false
+        guard suppressUnchangedTarget, let previous else { return }
+        let range = commandRange ?? CFRange(location: 0, length: previous.range.location)
+        let document = previous.documentText as NSString
+        guard range.location >= 0, range.length > 0, range.location <= document.length,
+              range.length <= document.length - range.location else { return }
+        suppressedUntil = .distantPast // 模板由独立记录抑制，编辑命令后可立即重新输入。
+        templateSuppressions.removeAll { $0.target.matches(previous) }
+        templateSuppressions.append(TemplateSuppression(target: previous, range: range,
+            token: document.substring(with: NSRange(location: range.location, length: range.length))))
+        if templateSuppressions.count > 32 { templateSuppressions.removeFirst(templateSuppressions.count - 32) }
+    }
 }
 
 // MARK: - AX 通道斜杠命令（不依赖「输入监控」权限）
@@ -621,6 +772,9 @@ final class AXSlashWatcher {
         }
         guard !cooldown, !NotesCommandExecution.shared.isBusy else { return }
         guard !SlashSuggestPanel.isIMEComposing else { return }
+        if NotesCommandExecution.shared.hasSuppressedTemplates, let target = NotesBridge.shared.readTextSnapshot() {
+            NotesCommandExecution.shared.observe(target)
+        }
         guard let tail = NotesBridge.shared.textBeforeCursor(maxLength: 8192) else {
             SlashSuggestPanel.shared.hide()
             return
@@ -718,6 +872,11 @@ final class AXSlashWatcher {
         if before.hasSuffix(":") || before.hasSuffix("/") { return nil }
         if slashBelongsToURL(before: String(before)) { return nil }
         let after = String(norm[norm.index(after: slashIdx)...])
+        let query = "/" + after
+        if SlashQuery.isCategory(query) {
+            guard !after.contains("\n"), !after.contains("\t"), after.count <= 256 else { return nil }
+            return query
+        }
         // 段内出现空白/换行 = 已输入终止符，交给触发逻辑而非建议
         guard !after.contains(" "), !after.contains("\n"), !after.contains("\t") else { return nil }
         // 查询段过长大概率不是命令输入
@@ -734,27 +893,7 @@ final class AXSlashWatcher {
     /// 建议列表：前缀命中优先，其次包含命中；
     /// 空查询（刚键入 /）时按分组各取前 5 项，分组导航体验一致
     nonisolated static func suggestCandidates(for query: String, limit: Int = 8) -> [SlashCommand] {
-        let token = String(query.dropFirst()).lowercased()
-        let cmds = buildSlashCommands()
-        guard !token.isEmpty else {
-            var out: [SlashCommand] = []
-            for g in SlashGroup.displayOrder {
-                out += cmds.filter { $0.group == g }.prefix(5)
-            }
-            return out
-        }
-        // 英文别名与中文命令名/模板名均可匹配——中文 IME 直接打命令名可命中
-        let pref = cmds.filter { cmd in
-            (!cmd.alias.isEmpty && cmd.alias.lowercased().hasPrefix(token))
-                || cmd.name.lowercased().hasPrefix(token)
-        }
-        let rest = cmds.filter { cmd in
-            !pref.contains(where: { $0.id == cmd.id }) && (
-                (!cmd.alias.isEmpty && cmd.alias.lowercased().contains(token))
-                    || cmd.name.lowercased().contains(token)
-            )
-        }
-        return Array((pref + rest).prefix(limit))
+        SlashQuery.candidates(for: query, commands: buildSlashCommands(), limit: limit)
     }
 
     /// 从光标前文本尾部匹配 “/命令 + 终止符”（全角 ／ 归一为半角）
@@ -803,12 +942,13 @@ final class AXSlashWatcher {
     /// 与 KeywordListener.matchSlash 同逻辑（私有不可访问，此处静态化便于测试）
     nonisolated static func matchSlashToken(_ trigger: String) -> SlashCommand? {
         guard trigger.hasPrefix("/"), trigger.count > 1 else { return nil }
+        guard !SlashQuery.isCategory(trigger) else { return nil }
         let token = String(trigger.dropFirst()).lowercased()
         let cmds = buildSlashCommands()
         if let exact = cmds.first(where: { !$0.alias.isEmpty && $0.alias.lowercased() == token }) { return exact }
         // AX 正文支持直接键入中文命令名/模板名，例如 "/润色"。
         // 命令名匹配让 IME 用户无需切英文输入法；中文名模板（alias 为空）也在此命中。
-        if let byName = cmds.first(where: { $0.name == token }) { return byName }
+        if let byName = cmds.first(where: { $0.name.lowercased() == token }) { return byName }
         let prefix = cmds.filter { !$0.alias.isEmpty && $0.alias.lowercased().hasPrefix(token) }
         return prefix.count == 1 ? prefix[0] : nil
     }

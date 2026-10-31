@@ -454,16 +454,38 @@ final class NotesBridge {
             self.preparePasteboard(text: text, html: html)
         }, postPaste: {
             guard isOperationValid(),
-                  let notes = NSWorkspace.shared.frontmostApplication, notes.bundleIdentifier == Self.notesBundleID,
-                  let down = CGEvent(keyboardEventSource: nil, virtualKey: 9, keyDown: true),
-                  let up = CGEvent(keyboardEventSource: nil, virtualKey: 9, keyDown: false) else {
+                  let notes = NSWorkspace.shared.frontmostApplication, notes.bundleIdentifier == Self.notesBundleID else {
                 return "Notes 不在前台，已取消粘贴。"
             }
-            down.flags = .maskCommand; up.flags = .maskCommand
-            guard isOperationValid() else { return "操作已取消。" }
-            down.postToPid(notes.processIdentifier); up.postToPid(notes.processIdentifier)
-            return nil
+            return Self.dispatchPreparedPaste(preservingStyle: html != nil,
+                isOperationValid: { isOperationValid() && self.isCurrent(target) },
+                triggerMenu: { FormatBridge.triggerMenu(item: $0) },
+                postStandardPaste: {
+                    guard let down = CGEvent(keyboardEventSource: nil, virtualKey: 9, keyDown: true),
+                          let up = CGEvent(keyboardEventSource: nil, virtualKey: 9, keyDown: false) else {
+                        return "无法发送粘贴操作。"
+                    }
+                    down.flags = .maskCommand; up.flags = .maskCommand
+                    guard isOperationValid() else { return "操作已取消。" }
+                    down.postToPid(notes.processIdentifier); up.postToPid(notes.processIdentifier)
+                    return nil
+                })
         }, isOperationValid: isOperationValid)
+    }
+
+    /// Notes 的普通“粘贴”可能沿用目标段落样式；模板和其他富文本必须明确保留源样式。
+    /// 不把保留样式菜单失败降级为普通粘贴，避免静默丢失用户选择的模板格式。
+    static func dispatchPreparedPaste(preservingStyle: Bool,
+                                      isOperationValid: () -> Bool,
+                                      triggerMenu: (String) -> Bool,
+                                      postStandardPaste: () -> String?) -> String? {
+        guard isOperationValid() else { return "操作已取消。" }
+        guard preservingStyle else { return postStandardPaste() }
+        for title in ["Paste and Retain Style", "粘贴并保留样式", "粘贴并保留格式", "貼上並保留樣式"] {
+            guard isOperationValid() else { return "操作已取消。" }
+            if triggerMenu(title) { return nil }
+        }
+        return "无法执行 Notes 的“粘贴并保留样式”，已取消写入。"
     }
 
     /// 剪贴板读取可能阻塞；所有准备工作之后再校验，失效时不发送按键。
@@ -491,11 +513,33 @@ final class NotesBridge {
         return Data(document.utf8)
     }
 
+    /// Notes 使用标准 RTFD/RTF 富文本；两种格式由同一次 HTML 导入生成。
+    /// 输入仅为本应用渲染的 HTML；AppKit HTML 导入必须在主线程运行。
+    private static func richPasteboardData(_ html: String) -> (rtf: Data, rtfd: Data?)? {
+        guard Thread.isMainThread else { return nil }
+        do {
+            let richText = try NSAttributedString(data: htmlPasteboardData(html), options: [
+                .documentType: NSAttributedString.DocumentType.html,
+                .characterEncoding: String.Encoding.utf8.rawValue,
+            ], documentAttributes: nil)
+            let rtf = try richText.data(from: NSRange(location: 0, length: richText.length),
+                                       documentAttributes: [.documentType: NSAttributedString.DocumentType.rtf])
+            let rtfd = try? richText.data(from: NSRange(location: 0, length: richText.length),
+                                         documentAttributes: [.documentType: NSAttributedString.DocumentType.rtfd])
+            return (rtf, rtfd)
+        } catch {
+            return nil
+        }
+    }
+
     func preparePasteboard(text: String, html: String?, pasteboard pb: NSPasteboard = .general) -> () -> Void {
+        let rich = html.flatMap(Self.richPasteboardData)
         let saved = (pb.pasteboardItems ?? []).map { item in
             item.types.compactMap { type in item.data(forType: type).map { (type, $0) } }
         }
         pb.clearContents()
+        if let rtfd = rich?.rtfd { pb.setData(rtfd, forType: .rtfd) }
+        if let rtf = rich?.rtf { pb.setData(rtf, forType: .rtf) }
         if let html { pb.setData(Self.htmlPasteboardData(html), forType: .html) }
         pb.setString(text, forType: .string)
         let changeCount = pb.changeCount

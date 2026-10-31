@@ -50,6 +50,43 @@ DispatchQueue.global().asyncAfter(deadline: .now() + 20) {
 }
 
 Task { @MainActor in
+    var pasteMenus: [String] = []
+    var standardPastes = 0
+    let retainedPaste = NotesBridge.dispatchPreparedPaste(preservingStyle: true,
+        isOperationValid: { true }, triggerMenu: { pasteMenus.append($0); return true },
+        postStandardPaste: { standardPastes += 1; return nil })
+    check(retainedPaste == nil && pasteMenus == ["Paste and Retain Style"] && standardPastes == 0,
+          "rich writeback explicitly dispatches retain-style paste rather than the ordinary paste command")
+    pasteMenus = []
+    let ordinaryPaste = NotesBridge.dispatchPreparedPaste(preservingStyle: false,
+        isOperationValid: { true }, triggerMenu: { pasteMenus.append($0); return true },
+        postStandardPaste: { standardPastes += 1; return nil })
+    check(ordinaryPaste == nil && pasteMenus.isEmpty && standardPastes == 1,
+          "plain text writeback retains the standard paste path")
+    let localizedPaste = NotesBridge.dispatchPreparedPaste(preservingStyle: true,
+        isOperationValid: { true }, triggerMenu: { pasteMenus.append($0); return $0 == "粘贴并保留样式" },
+        postStandardPaste: { standardPastes += 1; return nil })
+    check(localizedPaste == nil && pasteMenus == ["Paste and Retain Style", "粘贴并保留样式"] && standardPastes == 1,
+          "rich writeback supports the localized retain-style menu without invoking standard paste")
+    pasteMenus = []
+    let unavailablePaste = NotesBridge.dispatchPreparedPaste(preservingStyle: true,
+        isOperationValid: { true }, triggerMenu: { pasteMenus.append($0); return false },
+        postStandardPaste: { standardPastes += 1; return nil })
+    check(unavailablePaste != nil && !pasteMenus.isEmpty && standardPastes == 1,
+          "missing retain-style menu reports failure without silently pasting unformatted text")
+    pasteMenus = []
+    let cancelledRetainPaste = NotesBridge.dispatchPreparedPaste(preservingStyle: true,
+        isOperationValid: { false }, triggerMenu: { pasteMenus.append($0); return true },
+        postStandardPaste: { standardPastes += 1; return nil })
+    check(cancelledRetainPaste != nil && pasteMenus.isEmpty && standardPastes == 1,
+          "cancelled rich writeback invokes neither paste path")
+    var stillValid = true
+    let cancelledDuringLookup = NotesBridge.dispatchPreparedPaste(preservingStyle: true,
+        isOperationValid: { stillValid }, triggerMenu: { pasteMenus.append($0); stillValid = false; return false },
+        postStandardPaste: { standardPastes += 1; return nil })
+    check(cancelledDuringLookup != nil && pasteMenus == ["Paste and Retain Style"] && standardPastes == 1,
+          "cancellation after a missing menu prevents all later menu actions")
+
     let htmlText = "用于验证中文😀 & < > \" ' 粗体 链接"
     let htmlFragment = "<p>用于验证中文😀 &amp; &lt; &gt; &quot; &#39; <strong>粗体</strong> <a href=\"https://example.invalid/path?a=1&amp;b=2\">链接</a></p>"
     do {
@@ -105,6 +142,116 @@ Task { @MainActor in
         skip("named pasteboard service is unavailable; no general clipboard access was attempted")
     }
     isolatedPasteboard.releaseGlobally()
+
+    // Validate the native rich payload on an isolated pasteboard; this does not
+    // establish how a focused Notes paragraph imports or displays that payload.
+    let nativePasteboard = NSPasteboard(name: .init("local.notescopilot.rtf-writeback-tests." + UUID().uuidString))
+    let nativeHTML = """
+    <h1 style="font-size:24px;font-weight:bold;">标题中文😀</h1>
+    <p style="font-size:13px;">普通正文 <strong>标记粗体</strong></p>
+    <pre style="background-color:#f2f2f2;padding:12px;font-family:Menlo,monospace;white-space:pre-wrap;"><code>let café = &quot;世界🙂&quot;
+    print(café)</code></pre>
+    <p><span style="color:#ff9500;">#橙色🚀</span></p>
+    """
+    let nativeText = "标题中文😀\n普通正文 标记粗体\nlet café = \"世界🙂\"\nprint(café)\n#橙色🚀"
+    let nativeBridge = NotesBridge()
+    nativePasteboard.clearContents()
+    let restoreEmpty = nativeBridge.preparePasteboard(text: nativeText, html: nativeHTML, pasteboard: nativePasteboard)
+    let nativeRTF = nativePasteboard.data(forType: .rtf)
+    let nativeRTFD = nativePasteboard.data(forType: .rtfd)
+    check(nativeRTF != nil, "rich clipboard transport supplies native RTF alongside HTML and plain text")
+    check(nativeRTFD != nil, "rich clipboard transport supplies standard flat RTFD before the fallbacks")
+    let nativeItems = nativePasteboard.pasteboardItems ?? []
+    check(nativeItems.count == 1 && nativeItems[0].data(forType: .rtfd) == nativeRTFD
+          && nativeItems[0].data(forType: .rtf) == nativeRTF
+          && nativeItems[0].data(forType: .html) == NotesBridge.htmlPasteboardData(nativeHTML)
+          && nativeItems[0].string(forType: .string) == nativeText,
+          "native RTFD RTF HTML and plain text belong to the same clipboard item")
+    for (payload, documentType, formatName) in [(nativeRTF, NSAttributedString.DocumentType.rtf, "RTF"),
+                                               (nativeRTFD, NSAttributedString.DocumentType.rtfd, "RTFD")] {
+        guard let payload else { continue }
+        do {
+            let decoded = try NSAttributedString(data: payload,
+                options: [.documentType: documentType], documentAttributes: nil)
+            func attribute(_ key: NSAttributedString.Key, at text: String) -> Any? {
+                let range = (decoded.string as NSString).range(of: text)
+                return range.location == NSNotFound ? nil : decoded.attribute(key, at: range.location, effectiveRange: nil)
+            }
+            let titleFont = attribute(.font, at: "标题中文😀") as? NSFont
+            let bodyFont = attribute(.font, at: "普通正文") as? NSFont
+            check(titleFont != nil && bodyFont != nil && titleFont!.pointSize > bodyFont!.pointSize
+                  && NSFontManager.shared.traits(of: titleFont!).contains(.boldFontMask)
+                  && !NSFontManager.shared.traits(of: bodyFont!).contains(.boldFontMask),
+                  "native \(formatName) keeps the heading larger and bold while the ordinary paragraph stays unbolded")
+            let spanFont = attribute(.font, at: "标记粗体") as? NSFont
+            check(spanFont.map { NSFontManager.shared.traits(of: $0).contains(.boldFontMask) } == true,
+                  "native \(formatName) preserves bold spans inside the ordinary paragraph")
+            let codeFont = attribute(.font, at: "let café") as? NSFont
+            check(codeFont.map { $0.isFixedPitch || $0.fontName.localizedCaseInsensitiveContains("Menlo") } == true
+                  && decoded.string.contains("let café = \"世界🙂\"\nprint(café)"),
+                  "native \(formatName) preserves the monospace font and multiple lines of the code block")
+            func nonWhite(_ color: NSColor?) -> Bool {
+                guard let rgb = color?.usingColorSpace(.deviceRGB) else { return false }
+                return rgb.alphaComponent > 0.1
+                    && min(rgb.redComponent, min(rgb.greenComponent, rgb.blueComponent)) < 0.99
+            }
+            let codeBackground = attribute(.backgroundColor, at: "let café") as? NSColor
+            let codeParagraph = attribute(.paragraphStyle, at: "let café") as? NSParagraphStyle
+            check(nonWhite(codeBackground) || codeParagraph?.textBlocks.contains { nonWhite($0.backgroundColor) } == true,
+                  "native \(formatName) retains the code block background as a text or paragraph block attribute")
+            let tagColor = (attribute(.foregroundColor, at: "#橙色🚀") as? NSColor)?.usingColorSpace(.deviceRGB)
+            check(tagColor.map { $0.redComponent > 0.8 && $0.greenComponent > 0.25
+                  && $0.greenComponent < 0.8 && $0.blueComponent < 0.2 && $0.alphaComponent > 0.9 } == true,
+                  "native \(formatName) preserves the orange inline tag color")
+            check(decoded.string.contains("标题中文😀") && decoded.string.contains("普通正文 标记粗体")
+                  && decoded.string.contains("#橙色🚀") && !decoded.string.contains("\u{FFFD}")
+                  && !decoded.string.contains("**") && !decoded.string.contains("```")
+                  && !decoded.string.contains("# 标题"),
+                  "native \(formatName) preserves Unicode text and has no generated Markdown formatting markers")
+        } catch {
+            check(false, "native \(formatName) payload cannot be decoded: \(error)")
+        }
+    }
+    restoreEmpty()
+    check((nativePasteboard.pasteboardItems ?? []).isEmpty && nativePasteboard.data(forType: .rtf) == nil
+          && nativePasteboard.data(forType: .rtfd) == nil,
+          "restoring an initially empty clipboard removes every rich payload type including RTF and RTFD")
+
+    do {
+        let oldRTF = try NSAttributedString(string: "旧剪贴板😀").data(from: NSRange(location: 0, length: "旧剪贴板😀".utf16.count),
+            documentAttributes: [.documentType: NSAttributedString.DocumentType.rtf])
+        let firstItem = NSPasteboardItem()
+        firstItem.setString("first original item", forType: .string)
+        firstItem.setData(oldRTF, forType: .rtf)
+        firstItem.setData(originalHTML, forType: .html)
+        let secondItem = NSPasteboardItem()
+        secondItem.setString("second original item", forType: .string)
+        secondItem.setData(originalData, forType: customType)
+        nativePasteboard.clearContents()
+        if nativePasteboard.writeObjects([firstItem, secondItem]) {
+            let restoreMultiple = nativeBridge.preparePasteboard(text: nativeText, html: nativeHTML, pasteboard: nativePasteboard)
+            restoreMultiple()
+            let restoredItems = nativePasteboard.pasteboardItems ?? []
+            check(restoredItems.count == 2 && restoredItems[0].data(forType: .rtf) == oldRTF
+                  && restoredItems[0].data(forType: .html) == originalHTML
+                  && restoredItems[0].string(forType: .string) == "first original item"
+                  && restoredItems[1].data(forType: customType) == originalData
+                  && restoredItems[1].string(forType: .string) == "second original item",
+                  "native rich clipboard restoration preserves multiple items old RTF and unrelated types")
+            let staleNativeRestore = nativeBridge.preparePasteboard(text: nativeText, html: nativeHTML, pasteboard: nativePasteboard)
+            nativePasteboard.clearContents()
+            nativePasteboard.setString("newer copy", forType: .string)
+            staleNativeRestore()
+            check(nativePasteboard.string(forType: .string) == "newer copy"
+                  && nativePasteboard.data(forType: .rtf) == nil && nativePasteboard.data(forType: .html) == nil,
+                  "delayed native rich clipboard restoration leaves a newer copy untouched")
+        } else {
+            skip("named multi-item pasteboard service is unavailable; the general clipboard was not accessed")
+        }
+    } catch {
+        check(false, "cannot build the synthetic original RTF clipboard item: \(error)")
+    }
+    nativePasteboard.releaseGlobally()
 
     let original = snapshot()
     var trusted = false
@@ -400,6 +547,83 @@ Task { @MainActor in
     check(NotesBridge.suffixRange(in: commandTarget, characterCount: 1000) == nil,
           "oversized command cannot delete preceding unrelated text")
 
+    // 模板直接替换捕获的命令范围，避免先删空新笔记标题再尝试重新定位笔记。
+    let titleTrigger = "/会议纪要"
+    let titleTarget = snapshot(noteID: "new-title-note", text: titleTrigger,
+                               location: titleTrigger.utf16.count, length: 0)
+    let titleRange = NotesBridge.suffixRange(in: titleTarget, characterCount: titleTrigger.count)!
+    let expandedTemplate = "新标题😀\n第一段\n- 行动项"
+    let expandedHTML = "<h1>新标题😀</h1><p>第一段</p><ul><li>行动项</li></ul>"
+    var atomicCurrent: NotesBridge.SelectionSnapshot? = titleTarget
+    var atomicWrites: [(target: NotesBridge.SelectionSnapshot, range: CFRange, text: String, html: String?)] = []
+    let atomicBridge = NotesBridge(snapshotReader: { atomicCurrent }, replacementWriter: { target, range, text, html in
+        atomicWrites.append((target, range, text, html))
+        let updated = (target.documentText as NSString).replacingCharacters(
+            in: NSRange(location: range.location, length: range.length), with: text)
+        atomicCurrent = snapshot(noteID: target.noteID, text: updated,
+                                 location: range.location + text.utf16.count, length: 0, element: target.element)
+        return nil
+    })
+    atomicBridge.writeWhenNotesActive(in: titleTarget, text: expandedTemplate, range: titleRange, html: expandedHTML) { error in
+        check(error == nil && atomicWrites.count == 1 && atomicWrites[0].target.matches(titleTarget)
+              && atomicWrites[0].range.location == 0 && atomicWrites[0].range.length == titleTrigger.utf16.count
+              && atomicWrites[0].text == expandedTemplate && atomicWrites[0].html == expandedHTML,
+              "sole title slash template is replaced with rich content in one verified write")
+    }
+    check(atomicCurrent?.noteID == titleTarget.noteID && atomicCurrent?.documentText == expandedTemplate
+          && atomicCurrent?.range.location == expandedTemplate.utf16.count && atomicCurrent?.range.length == 0
+          && atomicWrites.allSatisfy { !$0.text.isEmpty },
+          "atomic title replacement retains note identity and ends at the inserted text without a blank-title write")
+
+    let bodyPrefix = "已有标题\n😀 正文 "
+    let bodyCommand = bodyPrefix + titleTrigger
+    let bodyTarget = snapshot(noteID: "existing-body-note", text: bodyCommand,
+                              location: bodyCommand.utf16.count, length: 0)
+    let bodyRange = NotesBridge.suffixRange(in: bodyTarget, characterCount: titleTrigger.count)!
+    atomicCurrent = bodyTarget
+    atomicBridge.writeWhenNotesActive(in: bodyTarget, text: expandedTemplate, range: bodyRange, html: expandedHTML) { error in
+        check(error == nil && atomicWrites.count == 2 && atomicWrites.last?.range.location == bodyPrefix.utf16.count
+              && atomicCurrent?.documentText == bodyPrefix + expandedTemplate
+              && atomicCurrent?.noteID == bodyTarget.noteID && atomicWrites.last?.html == expandedHTML,
+              "atomic body slash replacement preserves the preceding title and Unicode text")
+    }
+    let writesBeforeStaleTargets = atomicWrites.count
+    atomicCurrent = snapshot(noteID: "other-note", text: bodyCommand,
+                             location: bodyTarget.range.location, length: 0, element: bodyTarget.element)
+    atomicBridge.writeWhenNotesActive(in: bodyTarget, text: expandedTemplate, range: bodyRange, html: expandedHTML) { error in
+        check(error != nil && atomicWrites.count == writesBeforeStaleTargets,
+              "atomic template replacement rejects another note even with identical text and reused AX element")
+    }
+    atomicCurrent = snapshot(noteID: bodyTarget.noteID, text: bodyCommand, location: 0, length: 0,
+                             element: bodyTarget.element)
+    atomicBridge.writeWhenNotesActive(in: bodyTarget, text: expandedTemplate, range: bodyRange, html: expandedHTML) { error in
+        check(error != nil && atomicWrites.count == writesBeforeStaleTargets,
+              "atomic template replacement rejects a moved caret before changing the command range")
+    }
+    atomicCurrent = snapshot(noteID: bodyTarget.noteID, text: bodyCommand.replacingOccurrences(of: "已有", with: "修改"),
+                             location: bodyTarget.range.location, length: 0, element: bodyTarget.element)
+    atomicBridge.writeWhenNotesActive(in: bodyTarget, text: expandedTemplate, range: bodyRange, html: expandedHTML) { error in
+        check(error != nil && atomicWrites.count == writesBeforeStaleTargets,
+              "atomic template replacement rejects same-length edits outside the slash command")
+    }
+    var pendingTitleActivation: (() -> Void)?
+    let delayedTitleBridge = NotesBridge(snapshotReader: { atomicCurrent }, replacementWriter: { target, range, text, html in
+        atomicWrites.append((target, range, text, html))
+        return nil
+    }, activationScheduler: { pendingTitleActivation = $0 })
+    atomicCurrent = titleTarget
+    var delayedTitleCompletion = false
+    delayedTitleBridge.writeWhenNotesActive(in: titleTarget, text: expandedTemplate, range: titleRange, html: expandedHTML) { error in
+        delayedTitleCompletion = true
+        check(error != nil && atomicWrites.count == writesBeforeStaleTargets,
+              "delayed activation revalidates the original title before atomic rich replacement")
+    }
+    check(!delayedTitleCompletion && atomicWrites.count == writesBeforeStaleTargets,
+          "atomic title replacement waits for activation without an early deletion")
+    atomicCurrent = snapshot(noteID: "other-note", text: titleTrigger, location: titleTrigger.utf16.count,
+                             length: 0, element: titleTarget.element)
+    pendingTitleActivation?()
+
     let lease = NotesCommandExecution()
     check(lease.claim(original), "first command claims shared execution")
     check(!lease.claim(nextSelection), "menu and AX cannot claim overlapping command execution")
@@ -407,6 +631,84 @@ Task { @MainActor in
     check(!lease.claim(original), "a repeated delivery of the same command target is suppressed")
     check(lease.claim(nextSelection), "a different command target can execute after release")
     lease.release()
+
+    let templateLease = NotesCommandExecution()
+    check(templateLease.claim(titleTarget) && !templateLease.claim(titleTarget, allowRepeat: true),
+          "an explicit template retry cannot overlap an active command claim")
+    templateLease.release(suppressUnchangedTarget: true, commandRange: titleRange)
+    check(!templateLease.isBusy, "starting an asynchronous template releases global command arbitration")
+    try? await Task.sleep(nanoseconds: 1_100_000_000)
+    check(!templateLease.claim(titleTarget),
+          "the automatic watcher cannot repeat an unchanged template after the ordinary cooldown expires")
+    check(templateLease.claim(titleTarget, allowRepeat: true),
+          "an explicit menu selection can retry the unchanged suppressed template")
+    check(!templateLease.claim(bodyTarget, allowRepeat: true),
+          "an explicit selection of a different target still respects an active command claim")
+    templateLease.release(suppressUnchangedTarget: true, commandRange: titleRange)
+    check(templateLease.claim(bodyTarget), "a different Notes target remains available while a template is pending")
+    templateLease.release(suppressUnchangedTarget: true, commandRange: bodyRange)
+    let stopDocument = bodyTarget.documentText + "\n/stop "
+    let stopTarget = snapshot(noteID: bodyTarget.noteID, text: stopDocument,
+                              location: stopDocument.utf16.count, length: 0, element: bodyTarget.element)
+    check(templateLease.claim(stopTarget),
+          "editing the same note to type stop can claim execution while the earlier template is pending")
+    templateLease.release()
+
+    let pendingTrigger = "/周报 "
+    let pendingTarget = snapshot(noteID: "pending-template-note", text: pendingTrigger,
+                                 location: pendingTrigger.utf16.count, length: 0)
+    let pendingRange = NotesBridge.suffixRange(in: pendingTarget, characterCount: pendingTrigger.count)!
+    @MainActor func reservedTemplateGate() -> NotesCommandExecution {
+        let gate = NotesCommandExecution()
+        _ = gate.claim(pendingTarget)
+        gate.release(suppressUnchangedTarget: true, commandRange: pendingRange)
+        return gate
+    }
+    let appendedStopText = pendingTrigger + "/stop "
+    let appendedStopTarget = snapshot(noteID: pendingTarget.noteID, text: appendedStopText,
+                                      location: appendedStopText.utf16.count, length: 0, element: pendingTarget.element)
+    let observedAppendGate = reservedTemplateGate()
+    observedAppendGate.observe(appendedStopTarget)
+    check(!observedAppendGate.claim(pendingTarget),
+          "observing appended stop text does not discard the original template suppression")
+
+    let restoredAfterStop = reservedTemplateGate()
+    restoredAfterStop.observe(appendedStopTarget)
+    check(restoredAfterStop.claim(appendedStopTarget), "stop can claim arbitration after a template reservation")
+    check(!restoredAfterStop.claim(pendingTarget, allowRepeat: true),
+          "a rejected explicit retry during another command cannot consume the template reservation")
+    restoredAfterStop.release()
+    check(!restoredAfterStop.claim(pendingTarget),
+          "deleting stop back to the original command cannot automatically restart the cancelled template")
+
+    let otherNoteTarget = snapshot(noteID: "another-pending-note", text: pendingTrigger,
+                                   location: pendingTrigger.utf16.count, length: 0, element: pendingTarget.element)
+    let restoredAfterOtherNote = reservedTemplateGate()
+    restoredAfterOtherNote.observe(snapshot(noteID: otherNoteTarget.noteID, text: "", location: 0, length: 0,
+                                            element: pendingTarget.element))
+    restoredAfterOtherNote.observe(otherNoteTarget)
+    check(restoredAfterOtherNote.claim(otherNoteTarget), "another note can execute while the first template remains reserved")
+    restoredAfterOtherNote.release()
+    check(!restoredAfterOtherNote.claim(pendingTarget),
+          "a command in another note cannot erase suppression when returning to the unchanged template")
+
+    let editedTriggerGate = reservedTemplateGate()
+    editedTriggerGate.observe(snapshot(noteID: pendingTarget.noteID, text: "", location: 0, length: 0,
+                                      element: pendingTarget.element))
+    editedTriggerGate.observe(pendingTarget)
+    check(editedTriggerGate.claim(pendingTarget),
+          "removing then retyping the identical trigger permits a fresh automatic template invocation")
+    editedTriggerGate.release()
+
+    let caretOnlyGate = reservedTemplateGate()
+    caretOnlyGate.observe(snapshot(noteID: pendingTarget.noteID, text: pendingTrigger, location: 0, length: 0,
+                                  element: pendingTarget.element))
+    check(!caretOnlyGate.claim(pendingTarget), "moving the caret without editing the trigger retains template suppression")
+    let otherElementGate = reservedTemplateGate()
+    otherElementGate.observe(snapshot(noteID: pendingTarget.noteID, text: "", location: 0, length: 0,
+                                     element: AXUIElementCreateApplication(12346)))
+    check(!otherElementGate.claim(pendingTarget),
+          "observing another AX element cannot invalidate a template reservation for the original editor")
 
     var retriedText = ""
     validRequest.writeResult(using: { _, _, _, completed in completed("write denied") }) { error in

@@ -73,7 +73,7 @@ final class SlashSuggestPanel: NSObject, NSWindowDelegate {
     private var target: NotesBridge.SelectionSnapshot?
     private var dismissedQuery: String?
     /// 键盘导航当前行
-    private var selectedRow = 0
+    private var selectedRow: Int?
     /// 程序性 selectRow 触发的 selectionDidChange 不执行（只有用户点击才执行）
     private var suppressSelection = false
     /// 执行后抑制窗口：点选后已输入的 /xxx 要 0.4s 后才被退格删掉，
@@ -91,16 +91,19 @@ final class SlashSuggestPanel: NSObject, NSWindowDelegate {
         if let until = suppressUntil, Date() < until { return }
         suppressUntil = nil
         guard let target = NotesBridge.shared.readTextSnapshot() else { hide(); return }
+        let queryChanged = query != newQuery
+        let sameItems = itemsEqual(newItems)
         self.target = target
         self.query = newQuery
+        // 即使名称没变，也替换 action 快照，避免执行已修改的旧 Notes 模板正文。
+        items = newItems
+        rows = Self.buildRows(items)
         refreshKeyboardHint()
         // 内容未变且面板已在：仅跟随光标移动，避免每 120ms 重绘
-        if itemsEqual(newItems), let p = panel, p.isVisible {
+        if !queryChanged, sameItems, let p = panel, p.isVisible {
             relocateIfNeeded(cursorRect)
             return
         }
-        items = newItems
-        rows = Self.buildRows(items)
         guard !items.isEmpty else { hide(); return }
 
         let headerCount = rows.filter(\.isHeader).count
@@ -114,11 +117,16 @@ final class SlashSuggestPanel: NSObject, NSWindowDelegate {
         panel.setContentSize(NSSize(width: w, height: h))
 
         place(cursorRect: cursorRect, width: w, height: h)
-        tableView?.reloadData()
-        selectedRow = Self.firstCmdRow(in: rows)
         suppressSelection = true
-        tableView?.selectRowIndexes(IndexSet(integer: selectedRow), byExtendingSelection: false)
+        tableView?.reloadData()
+        selectedRow = Self.initialCmdRow(for: newQuery, rows: rows)
+        if let selectedRow {
+            tableView?.selectRowIndexes(IndexSet(integer: selectedRow), byExtendingSelection: false)
+        } else {
+            tableView?.deselectAll(nil)
+        }
         suppressSelection = false
+        refreshKeyboardHint()
         if !panel.isVisible {
             // nonactivating + canHide 取消：show 不夺焦点、Esc 不自动隐藏
             panel.orderFront(nil)
@@ -139,7 +147,8 @@ final class SlashSuggestPanel: NSObject, NSWindowDelegate {
         hide()
         suppressUntil = Date().addingTimeInterval(1.5)
         NCLog.log("建议面板执行：\(cmd.name)，删除 \(deleteCount) 字符")
-        KeywordListener.performGlobalSlash(cmd, deleteCount: deleteCount, target: target, expectedToken: query)
+        KeywordListener.performGlobalSlash(cmd, deleteCount: deleteCount, target: target, expectedToken: query,
+                                          isExplicitSelection: true)
     }
 
     /// 第一个命令行（初始选中；分组头不可选）
@@ -147,9 +156,15 @@ final class SlashSuggestPanel: NSObject, NSWindowDelegate {
         rows.firstIndex { !$0.isHeader } ?? 0
     }
 
+    /// 分类名打开列表后需先用方向键选中，直接回车只保持列表展开。
+    nonisolated static func initialCmdRow(for query: String, rows: [Row]) -> Int? {
+        SlashQuery.isCategory(query) ? nil : rows.firstIndex { !$0.isHeader }
+    }
+
     /// 从当前行出发按方向找下一个命令行（跳过分组头）
-    nonisolated static func nextCmdRow(from start: Int, delta: Int, rows: [Row]) -> Int? {
-        var i = start + delta
+    nonisolated static func nextCmdRow(from start: Int?, delta: Int, rows: [Row]) -> Int? {
+        guard delta != 0 else { return nil }
+        var i = start.map { $0 + delta } ?? (delta > 0 ? 0 : rows.count - 1)
         while rows.indices.contains(i) {
             if !rows[i].isHeader { return i }
             i += delta
@@ -169,10 +184,11 @@ final class SlashSuggestPanel: NSObject, NSWindowDelegate {
         case 126:   // ↑
             moveSelection(-1); return true
         case 36:    // ⏎
-            if rows.indices.contains(selectedRow), case .cmd(let c) = rows[selectedRow] {
+            if let selectedRow, rows.indices.contains(selectedRow), case .cmd(let c) = rows[selectedRow] {
                 DispatchQueue.main.async { self.perform(c) }
                 return true
             }
+            return SlashQuery.isCategory(query)
         case 53:    // esc：关闭面板，并抑制重弹（用户明确关闭后，光标前残留的 / 不应马上弹回）
             dismissedQuery = query
             hide(); return true
@@ -193,13 +209,15 @@ final class SlashSuggestPanel: NSObject, NSWindowDelegate {
         tableView?.selectRowIndexes(IndexSet(integer: next), byExtendingSelection: false)
         suppressSelection = false
         tableView?.scrollRowToVisible(next)
+        refreshKeyboardHint()
     }
 
     // MARK: - 面板构建
 
     private func itemsEqual(_ newItems: [SlashCommand]) -> Bool {
         guard newItems.count == items.count else { return false }
-        for (a, b) in zip(items, newItems) where a.alias != b.alias || a.name != b.name { return false }
+        for (a, b) in zip(items, newItems)
+            where a.alias != b.alias || a.name != b.name || a.detail != b.detail || a.group != b.group { return false }
         return true
     }
 
@@ -283,7 +301,9 @@ final class SlashSuggestPanel: NSObject, NSWindowDelegate {
 
     private func refreshKeyboardHint() {
         keyboardHint?.stringValue = KeywordListener.shared.isRunning
-            ? "↑↓ 选择    ⏎ 执行    esc 关闭    点击直接执行"
+            ? (SlashQuery.isCategory(query) && selectedRow == nil
+                ? "↑↓ 先选择    ⏎ 执行    esc 关闭    点击直接执行"
+                : "↑↓ 选择    ⏎ 执行    esc 关闭    点击直接执行")
             : "键盘监听未启动 · 可点击命令 · 请检查辅助功能授权"
     }
 
@@ -433,7 +453,7 @@ extension SlashSuggestPanel: NSTableViewDataSource, NSTableViewDelegate {
         if let v = tableView?.makeView(withIdentifier: id, owner: nil) {
             if let t = (v.subviews.first as? NSStackView)?.arrangedSubviews.first as? NSTextField {
                 let count = items.filter { $0.group == g }.count
-                t.stringValue = "\(g.title) · \(count)"
+                t.stringValue = "\(g.title) · \(count)    /\(g.commandAlias)"
             }
             return v
         }
@@ -441,7 +461,7 @@ extension SlashSuggestPanel: NSTableViewDataSource, NSTableViewDelegate {
         title.font = .systemFont(ofSize: 11, weight: .semibold)
         title.textColor = .controlAccentColor
         let count = items.filter { $0.group == g }.count
-        title.stringValue = "\(g.title) · \(count)"
+        title.stringValue = "\(g.title) · \(count)    /\(g.commandAlias)"
         title.setContentHuggingPriority(.required, for: .horizontal)
         let stack = NSStackView(views: [title])
         stack.orientation = .horizontal

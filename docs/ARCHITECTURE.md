@@ -14,14 +14,14 @@ NotesCopilot 为 Swift 单进程应用（`swiftc` 直编，零第三方依赖）
 | `NotesBridge.swift` | **Notes 桥接核心**：选区/光标读写、`formatMenuItems`（13 项格式菜单）、AX 菜单枚举与 AXPress、快捷键兜底（AXMenuItemCmdChar/Modifiers → CGEvent）、`selectionSignature` |
 | `UrlTitle.swift` | URL → 标题超链：三级抓取（HTTP 直抓 → 共享 Cookie → 浏览器标签页 AppleScript） |
 | `FormatBridge.swift` | 格式菜单缓存层：菜单元素查找与快捷键解析 |
-| `TemplateEngine.swift` | 本地模板变量引擎、串行询问/AI、统一取消与目标绑定 |
+| `TemplateEngine.swift` | 模板变量引擎、串行询问/AI、统一取消与目标绑定 |
 | `Topotext.swift` | 笔记文本数据结构（Topotext 段落模型） |
 | `LiberatorLite.swift` | NotesStore 直读：懒加载 `NoteStore.sqlite`（笔记库浏览），FSEvents 监听自动重索引 |
 | `LibraryView.swift` | 资料库窗口 UI：浏览 Notes 笔记并可直接「问 AI」 |
 | `Views.swift` | 设置页 UI：服务商预设、本地模型探测（`LocalAIProbe`）、多配置管理 |
 | `AppUpdater.swift` | GitHub 正式发布版本检查、数值版本比较、每日检查与提醒节流、新版本缓存及自动检查开关 |
 | `Markdown.swift` | Markdown 分块、原生预览与安全 HTML 写回；不执行原始 HTML |
-| `NotesTemplateImporter.swift` | 显式从 Notes 的 Templates 文件夹导入，不覆盖同名本地模板 |
+| `NotesTemplateImporter.swift` | 读取 Notes 的 Templates 文件夹，生成默认可用的 Notes 模板 |
 | `FrontmostTracker.swift` | 前台应用追踪（判断 Notes 是否前台、记录最后的外部应用） |
 
 ## 关键机制
@@ -48,7 +48,7 @@ NotesCopilot 为 Swift 单进程应用（`swiftc` 直编，零第三方依赖）
 ### 3. 键盘事件与输入框焦点
 
 - 全局快捷键用 Carbon `RegisterEventHotKey`（⇧⌘Space）
-- 普通文本优先 AX 选区写入；富文本用安全 HTML 粘贴，在准备剪贴板后再次校验目标与操作有效期，并按 changeCount 恢复完整剪贴板
+- 普通文本优先 AX 选区写入；富文本在主线程由安全 HTML 一次生成带样式内容，同时发布 RTFD、RTF、UTF-8 HTML 和纯文本，并调用 Notes 的“粘贴并保留样式”菜单。在准备剪贴板后及菜单执行前再次校验目标与操作有效期，按 changeCount 恢复完整剪贴板；菜单不可用时明确报错，不静默改为丢失样式的普通粘贴。
 - **borderless NSPanel 键盘焦点三要素**：`canBecomeKey=true` 的 NSPanel 子类 + 应用内激活（`NSApp.activate(ignoringOtherApps:)`，外部 activate 对 UIElement 应用无效）+ `makeFirstResponder`；面板持 key 期间需挂起选区轮询，防止面板被误收起
 
 ### 4. URL 三级抓取
@@ -61,7 +61,13 @@ HTTP 直抓（UA 伪装） → 共享 Cookie（WKWebView 池） → 浏览器标
 
 ### 5. 模板即笔记
 
-模板实际存于 UserDefaults，支持日期、选区、剪贴板、ask 与 AI 变量。NotesTemplateImporter 显式读取 Templates 文件夹中可完整解码的笔记，新增本地模板且不覆盖同名内容。导入后不持续同步。TemplateRunner 注册任务；停止/新会话取消当前模板，并在异步写回前校验有效期。
+本地模板存于 UserDefaults；NotesTemplateImporter 读取所有名称匹配 Templates（不区分大小写）的文件夹，筛选可完整解码且非空的笔记。NotesStore 就绪后在后台首次读取，已有 FSEvents 重索引通知触发后续刷新。每次扫描替换独立的内存缓存，修改、移出和删除均随之生效，缓存访问由锁保护；命令构建只读取缓存，不查询数据库。
+
+NotesStore 兼容原生 `Z_PRIMARYKEY.Z_NAME` 与导出数据的 `ZNAME`，按注册表解析实际实体编号。行内标签和笔记链接按当前笔记所属的附件标识、类型和 `ZALTTEXT` 还原显示文字，校验 UTF-16 范围并调整样式长度；图片、表格及缺失元数据继续标记不完整。
+
+Notes 模板以 `TopotextDoc` 第一行作为模板名，去掉该行和紧随的空白分隔行后生成插入载荷；首个内容段落提升为新文档标题，按 UTF-16 裁切并重新对齐样式范围，正文内部空行及后续样式保留，不使用附加标题的导出 Markdown。变量只对插入载荷执行一次并记录 UTF-16 替换范围，展开值继承变量起点样式，随后由 `NativeNoteHTML` 渲染为富文本。本地 Markdown 模板展开后也通过 HTML 写入。Notes 内的模板命令绑定原始目标并一次替换命令范围，避免新笔记标题暂时清空导致身份丢失；自动轮询抑制未变化命令的重复执行，用户显式选择仍可重试。
+
+可用模板列表合并 Notes 与本地来源，同名命令优先使用 Notes 版本，本地内容继续保留。设置页分开展示两种来源，Notes 模板只读，编辑在 Notes 中完成。两种来源均支持日期、选区、剪贴板、ask 与 AI 变量。TemplateRunner 注册任务；停止/新会话取消当前模板，并在异步写回前校验有效期。
 
 ## 测试
 

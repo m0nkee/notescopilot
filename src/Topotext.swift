@@ -124,7 +124,7 @@ enum ProtoWire {
 // Document = repeated AttributeRun（length / paragraphStyle / font / todo / attachment）
 // 文本字符以 CRDT Item 树存储，防回退策略：按序收割 UTF-8 字符串
 
-struct TopotextRun: Equatable {
+struct TopotextRun: Codable, Equatable {
     var length = 0
     var paragraphType = 0       // 0=正文 1=标题 2=大标题 3=副标题 4=小标题 5=列表项 …
     var listLevel = 0
@@ -135,17 +135,195 @@ struct TopotextRun: Equatable {
     var strikethrough = false
     var underline = false
     var monospaced = false
+    var monospacedBlock = false
     var numbered = false
     var blockQuote = false
     var link: String?
+    var inlineAttachmentType: String?
 }
 
-struct TopotextDoc {
+struct TopotextDoc: Codable, Equatable {
     var runs: [TopotextRun] = []
     var text = ""
     var totalLength = 0
     var isComplete = true
     var warnings: [String] = []
+}
+
+enum NativeNoteHTML {
+    private struct Fragment {
+        let text: String
+        let style: TopotextRun
+    }
+
+    private struct Paragraph {
+        var fragments: [Fragment] = []
+        var style: TopotextRun?
+        var isEmpty: Bool { fragments.allSatisfy { $0.text.isEmpty } }
+    }
+
+    /// Render the actual Notes body. Its native title is already one of the
+    /// paragraphs; adding a synthetic document heading would duplicate it.
+    static func render(_ doc: TopotextDoc) -> String {
+        let paragraphs = paragraphs(in: doc)
+        var result: [String] = []
+        var index = 0
+        while index < paragraphs.count {
+            let paragraph = paragraphs[index]
+            let style = paragraph.style ?? TopotextRun()
+            if style.monospacedBlock {
+                var lines: [String] = []
+                while index < paragraphs.count, paragraphs[index].style?.monospacedBlock == true {
+                    lines.append(inline(paragraphs[index], inCodeBlock: true))
+                    index += 1
+                }
+                result.append("<pre style=\"background-color:#f2f2f2;padding:12px;margin:0;border-radius:6px;white-space:pre-wrap;font-family:Menlo,monospace;font-size:13px;\"><code style=\"font-family:Menlo,monospace;font-size:13px;background-color:#f2f2f2;\">"
+                              + lines.joined(separator: "\n") + "</code></pre>")
+                continue
+            }
+            if isList(style) {
+                var list: [Paragraph] = []
+                while index < paragraphs.count, isList(paragraphs[index].style ?? TopotextRun()) {
+                    list.append(paragraphs[index]); index += 1
+                }
+                var item = 0
+                while item < list.count {
+                    let first = list[item].style ?? TopotextRun()
+                    result.append(renderList(list, index: &item, level: listLevel(first), ordered: first.numbered))
+                }
+                continue
+            }
+            result.append(block(paragraph))
+            index += 1
+        }
+        return "<div style=\"font-family:-apple-system,Helvetica,Arial,sans-serif;font-size:13px;\">"
+            + result.joined(separator: "\n") + "</div>"
+    }
+
+    private static func paragraphs(in doc: TopotextDoc) -> [Paragraph] {
+        let source = doc.text as NSString
+        var fragments: [Fragment] = []
+        var cursor = 0
+        var valid = true
+        for run in doc.runs where run.length != 0 {
+            guard let range = scalarRange(in: doc.text, location: cursor, length: run.length) else {
+                valid = false; break
+            }
+            fragments.append(Fragment(text: String(doc.text[range]), style: run))
+            cursor += run.length
+        }
+        if !valid {
+            fragments = [Fragment(text: doc.text, style: TopotextRun())]
+        } else if cursor < source.length {
+            fragments.append(Fragment(text: source.substring(from: cursor), style: TopotextRun()))
+        }
+        if fragments.isEmpty { fragments = [Fragment(text: doc.text, style: TopotextRun())] }
+        var result: [Paragraph] = []
+        var current = Paragraph()
+        for fragment in fragments {
+            let lines = fragment.text.components(separatedBy: "\n")
+            for (index, line) in lines.enumerated() {
+                if current.style == nil, !line.isEmpty || index < lines.count - 1 { current.style = fragment.style }
+                if !line.isEmpty { current.fragments.append(Fragment(text: line, style: fragment.style)) }
+                if index < lines.count - 1 {
+                    result.append(current)
+                    current = Paragraph()
+                }
+            }
+        }
+        if !current.fragments.isEmpty || result.isEmpty || doc.text.hasSuffix("\n") { result.append(current) }
+        return result
+    }
+
+    private static func scalarRange(in text: String, location: Int, length: Int) -> Range<String.Index>? {
+        let source = text as NSString
+        guard location >= 0, location <= source.length, length >= 0, length <= source.length - location else { return nil }
+        for offset in [location, location + length] where offset < source.length {
+            if (0xdc00...0xdfff).contains(source.character(at: offset)) { return nil }
+        }
+        return Range(NSRange(location: location, length: length), in: text)
+    }
+
+    private static func block(_ paragraph: Paragraph) -> String {
+        guard !paragraph.isEmpty else { return "<p><br></p>" }
+        let style = paragraph.style ?? TopotextRun()
+        let tag: String
+        switch style.paragraphType {
+        case 1...4: tag = "h\(style.paragraphType)"
+        default: tag = "p"
+        }
+        let fontSize: Int
+        switch style.paragraphType {
+        case 1: fontSize = 20
+        case 2: fontSize = 17
+        case 3, 4: fontSize = 15
+        default: fontSize = 13
+        }
+        let content = "<\(tag) style=\"white-space:pre-wrap;font-family:-apple-system,Helvetica,Arial,sans-serif;font-size:\(fontSize)px;margin:0;\">\(inline(paragraph))</\(tag)>"
+        return style.blockQuote ? "<blockquote>\(content)</blockquote>" : content
+    }
+
+    private static func isList(_ style: TopotextRun) -> Bool { (5...8).contains(style.paragraphType) || style.isTodo }
+    private static func listLevel(_ style: TopotextRun) -> Int { min(20, max(0, style.listLevel)) }
+
+    private static func renderList(_ paragraphs: [Paragraph], index: inout Int, level: Int, ordered: Bool) -> String {
+        let tag = ordered ? "ol" : "ul"
+        var html = "<\(tag)>"
+        while index < paragraphs.count {
+            let paragraph = paragraphs[index]
+            let style = paragraph.style ?? TopotextRun()
+            let itemLevel = listLevel(style)
+            if itemLevel < level || (itemLevel == level && style.numbered != ordered) { break }
+            if itemLevel > level {
+                html += "<li>" + renderList(paragraphs, index: &index, level: itemLevel, ordered: style.numbered) + "</li>"
+                continue
+            }
+            let marker = style.isTodo ? (style.todoDone ? "☑ " : "☐ ") : ""
+            let content = marker + inline(paragraph)
+            html += "<li>" + (style.blockQuote ? "<blockquote>\(content)</blockquote>" : content)
+            index += 1
+            while index < paragraphs.count {
+                let nested = paragraphs[index].style ?? TopotextRun()
+                guard listLevel(nested) > level else { break }
+                html += renderList(paragraphs, index: &index, level: listLevel(nested), ordered: nested.numbered)
+            }
+            html += "</li>"
+        }
+        return html + "</\(tag)>"
+    }
+
+    private static func inline(_ paragraph: Paragraph, inCodeBlock: Bool = false) -> String {
+        paragraph.fragments.map { fragment in
+            let style = fragment.style
+            var html = escape(fragment.text)
+            if style.monospaced && !inCodeBlock { html = "<code style=\"font-family:Menlo,monospace;font-size:13px;\">\(html)</code>" }
+            if style.bold { html = "<strong>\(html)</strong>" }
+            if style.italic { html = "<em>\(html)</em>" }
+            if style.underline { html = "<u>\(html)</u>" }
+            if style.strikethrough { html = "<s>\(html)</s>" }
+            if style.inlineAttachmentType == "com.apple.notes.inlinetextattachment.hashtag" {
+                html = "<span style=\"color:#d67700;\">\(html)</span>"
+            } else if style.inlineAttachmentType == "com.apple.notes.inlinetextattachment.link" {
+                html = "<span style=\"color:#007aff;\">\(html)</span>"
+            }
+            if let link = style.link, let url = URL(string: link),
+               let scheme = url.scheme?.lowercased(), ["http", "https", "notes"].contains(scheme) {
+                html = "<a href=\"\(escape(link))\">\(html)</a>"
+            }
+            return html
+        }.joined()
+    }
+
+    private static func escape(_ text: String) -> String {
+        text.replacingOccurrences(of: "&", with: "&amp;")
+            .replacingOccurrences(of: "<", with: "&lt;").replacingOccurrences(of: ">", with: "&gt;")
+            .replacingOccurrences(of: "\"", with: "&quot;").replacingOccurrences(of: "'", with: "&#39;")
+    }
+}
+
+struct TopotextInlineAttachment {
+    let typeUTI: String
+    let text: String
 }
 
 enum TopotextDecoder {
@@ -167,13 +345,15 @@ enum TopotextDecoder {
     }()
 
     /// 主入口：从 NoteStore 的 Z_DATA blob 还原文档
-    static func decode(_ blob: Data) -> TopotextDoc? {
+    static func decode(_ blob: Data) -> TopotextDoc? { decode(blob, inlineAttachments: [:]) }
+
+    static func decode(_ blob: Data, inlineAttachments: [String: TopotextInlineAttachment]) -> TopotextDoc? {
         var best: TopotextDoc?
         // blob 本身可能是 zlib 压缩的 protobuf（整段容器）
         var candidates: [Data] = [blob]
         if let inflated = ProtoWire.zlibInflate(blob) { candidates.append(inflated) }
         for candidate in candidates {
-            if let document = parseNotesDocument(candidate) { return document }
+            if let document = parseNotesDocument(candidate, inlineAttachments: inlineAttachments) { return document }
         }
         candidates += candidatesFor(blob).dropFirst()
         for cand in candidates {
@@ -199,23 +379,31 @@ enum TopotextDecoder {
     // Notes' published reverse-engineered protobuf schema:
     // NoteStoreProto.2 -> Document.3 -> Note { text:2, attribute_run:5 }.
     // https://github.com/threeplanetssoftware/apple_cloud_notes_parser/blob/master/proto/notestore.proto
-    private static func parseNotesDocument(_ data: Data) -> TopotextDoc? {
+    private static func parseNotesDocument(_ data: Data, inlineAttachments: [String: TopotextInlineAttachment]) -> TopotextDoc? {
         guard let document = ProtoWire.parse(data).first(where: { $0.number == 2 && $0.wireType == 2 })?.bytes,
               let note = ProtoWire.parse(document).first(where: { $0.number == 3 && $0.wireType == 2 })?.bytes,
               let text = ProtoWire.parse(note).first(where: { $0.number == 2 && $0.wireType == 2 })?.string else { return nil }
         var doc = TopotextDoc()
         doc.text = text
-        if text.contains("\u{FFFC}") {
-            doc.isComplete = false
-            doc.warnings.append("附件、图片或表格未导出，请在备忘录中查看原件。")
-        }
+        let count = text.utf16.count
+        var cursor = 0
+        var validRanges = true
+        var unresolvedAttachment = false
+        var replacements: [(range: NSRange, text: String)] = []
         for field in ProtoWire.parse(note) where field.number == 5 && field.wireType == 2 {
-            guard let bytes = field.bytes else { continue }
+            guard let bytes = field.bytes else { validRanges = false; continue }
             let fields = ProtoWire.parse(bytes)
             guard let length = fields.first(where: { $0.number == 1 && $0.wireType == 0 })?.varint,
-                  length <= UInt64(Int.max) else { continue }
+                  length <= UInt64(Int.max) else {
+                validRanges = false
+                unresolvedAttachment = unresolvedAttachment || fields.contains { $0.number == 12 }
+                continue
+            }
             var run = TopotextRun()
             run.length = Int(length)
+            let originalLength = run.length
+            let range = scalarRange(in: text, location: cursor, length: originalLength)
+            if range == nil { validRanges = false }
             for attribute in fields {
                 switch attribute.number {
                 case 2:
@@ -227,7 +415,7 @@ enum TopotextDecoder {
                             case 0: run.paragraphType = 1
                             case 1: run.paragraphType = 2
                             case 2: run.paragraphType = 3
-                            case 4: run.monospaced = true
+                            case 4: run.monospaced = true; run.monospacedBlock = true
                             case 100, 101: run.paragraphType = 5
                             case 102: run.paragraphType = 5; run.numbered = true
                             case 103: run.paragraphType = 5; run.isTodo = true
@@ -254,24 +442,71 @@ enum TopotextDecoder {
                 case 6: run.underline = attribute.varint == 1
                 case 7: run.strikethrough = attribute.varint == 1
                 case 9: run.link = attribute.string
-                case 12:
-                    doc.isComplete = false
-                    if !doc.warnings.contains("附件、图片或表格未导出，请在备忘录中查看原件。") {
-                        doc.warnings.append("附件、图片或表格未导出，请在备忘录中查看原件。")
-                    }
                 default: break
                 }
             }
+            let attachments = fields.filter { $0.number == 12 }
+            if !attachments.isEmpty {
+                if attachments.count == 1, let range,
+                   let replacement = inlineTextReplacement(attachments[0].bytes, chunk: String(text[range]),
+                                                           metadata: inlineAttachments) {
+                    replacements.append((NSRange(location: cursor, length: originalLength), replacement))
+                    run.length = replacement.utf16.count
+                    run.inlineAttachmentType = attachments[0].bytes.flatMap {
+                        ProtoWire.parse($0).first { $0.number == 2 && $0.wireType == 2 }?.string
+                    }
+                } else {
+                    unresolvedAttachment = true
+                }
+            }
             doc.runs.append(run)
+            let next = cursor.addingReportingOverflow(originalLength)
+            cursor = next.overflow ? Int.max : next.partialValue
         }
-        doc.totalLength = doc.runs.reduce(0) { $0 + $1.length }
-        let count = text.utf16.count
-        if !doc.runs.isEmpty && doc.totalLength != count {
+        if !validRanges || (!doc.runs.isEmpty && cursor != count) {
             doc.runs = []
             doc.isComplete = false
             doc.warnings.append("正文样式范围不完整，已保留全部纯文本。")
+        } else {
+            // 所有范围基于原始 UTF-16 文本；倒序替换避免较早附件改变后续偏移。
+            let expanded = NSMutableString(string: text)
+            for replacement in replacements.reversed() {
+                expanded.replaceCharacters(in: replacement.range, with: replacement.text)
+            }
+            doc.text = expanded as String
+            doc.totalLength = doc.runs.reduce(0) { $0 + $1.length }
+        }
+        if unresolvedAttachment || doc.text.contains("\u{FFFC}") {
+            doc.isComplete = false
+            doc.warnings.append("附件、图片或表格未导出，请在备忘录中查看原件。")
         }
         return doc
+    }
+
+    private static func scalarRange(in text: String, location: Int, length: Int) -> Range<String.Index>? {
+        let source = text as NSString
+        guard location >= 0, location <= source.length, length >= 0, length <= source.length - location else { return nil }
+        let end = location + length
+        // Foundation 的 Range 转换可能接受代理对中间的位置；附件替换必须在完整标量边界。
+        for offset in [location, end] where offset < source.length {
+            if (0xdc00...0xdfff).contains(source.character(at: offset)) { return nil }
+        }
+        return Range(NSRange(location: location, length: length), in: text)
+    }
+
+    private static func inlineTextReplacement(_ data: Data?, chunk: String,
+                                              metadata: [String: TopotextInlineAttachment]) -> String? {
+        guard let data else { return nil }
+        let fields = ProtoWire.parse(data)
+        guard let identifier = fields.first(where: { $0.number == 1 && $0.wireType == 2 })?.string,
+              !identifier.isEmpty,
+              let type = fields.first(where: { $0.number == 2 && $0.wireType == 2 })?.string,
+              type == "com.apple.notes.inlinetextattachment.hashtag" || type == "com.apple.notes.inlinetextattachment.link",
+              let attachment = metadata[identifier], attachment.typeUTI == type,
+              !attachment.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              !attachment.text.contains("\u{FFFC}"),
+              chunk.utf16.filter({ $0 == 0xfffc }).count == 1 else { return nil }
+        return chunk.replacingOccurrences(of: "\u{FFFC}", with: attachment.text)
     }
 
     private static func candidatesFor(_ data: Data) -> [Data] {

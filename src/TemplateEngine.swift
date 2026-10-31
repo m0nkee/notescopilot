@@ -36,6 +36,13 @@ struct TemplateVarSpec: Equatable {
 
 /// 展开计划：阶段 1 替换静态变量后，ask/ai 以私有区哨兵占位
 /// （U+E000 + 序号 + U+E001，不会与正常文本冲突）
+struct TemplateTextReplacement: Equatable {
+    let range: NSRange
+    let text: String
+    var slot: Int? = nil
+    var fallback: String? = nil
+}
+
 struct TemplateExpansionPlan: Equatable {
     static let sentinelOpen = "\u{E000}"
     static let sentinelClose = "\u{E001}"
@@ -44,6 +51,8 @@ struct TemplateExpansionPlan: Equatable {
     /// 占位序号 -> 问题/指令
     var asks: [Int: String]
     var ais: [Int: String]
+    /// 原始正文范围；富文本展开后按这些范围调整原生样式，避免再次执行变量。
+    var replacements: [TemplateTextReplacement] = []
 
     var hasInteractive: Bool { !asks.isEmpty || !ais.isEmpty }
 }
@@ -116,6 +125,7 @@ enum TemplateEngine {
         }
 
         var result = content
+        var replacements: [TemplateTextReplacement] = []
         for (i, m) in matches.reversed().enumerated() {
             let mi = matches.count - 1 - i
             let body = ns.substring(with: m.range(at: 1))
@@ -123,6 +133,7 @@ enum TemplateEngine {
             if isEscaped(ns, at: m.range.location) {
                 let full = NSRange(location: m.range.location - 1, length: m.range.length + 1)
                 result = (result as NSString).replacingCharacters(in: full, with: "{{" + body + "}}")
+                replacements.append(TemplateTextReplacement(range: full, text: "{{" + body + "}}"))
                 continue
             }
             guard let spec = spec(from: body) else { continue }   // 未知变量原样保留
@@ -142,8 +153,11 @@ enum TemplateEngine {
                 replacement = TemplateExpansionPlan.sentinelOpen + "\(s)" + TemplateExpansionPlan.sentinelClose
             }
             result = (result as NSString).replacingCharacters(in: m.range, with: replacement)
+            replacements.append(TemplateTextReplacement(range: m.range, text: replacement,
+                                                        slot: slotByMatch[mi],
+                                                        fallback: "{{\(spec.kind.rawValue):\(spec.argument)}}"))
         }
-        return TemplateExpansionPlan(text: result, asks: asks, ais: ais)
+        return TemplateExpansionPlan(text: result, asks: asks, ais: ais, replacements: replacements.reversed())
     }
 
     /// m.location 前一个字符是否为转义反斜杠
@@ -180,6 +194,63 @@ enum TemplateEngine {
             }
         }
         return out
+    }
+
+    static func resolvedReplacements(_ plan: TemplateExpansionPlan, answers: [Int: String],
+                                     ais: [Int: String]) -> [TemplateTextReplacement] {
+        plan.replacements.map { replacement in
+            let value = replacement.slot.map { answers[$0] ?? ais[$0] ?? replacement.fallback ?? replacement.text }
+                ?? replacement.text
+            return TemplateTextReplacement(range: replacement.range, text: value)
+        }
+    }
+
+    /// 变量跨越多个字体 run 时，以变量起点样式承载插入值；其余正文逐段保留。
+    static func expanding(_ document: TopotextDoc, replacements: [TemplateTextReplacement]) -> TopotextDoc {
+        let source = document.text as NSString
+        var spans: [(range: NSRange, style: TopotextRun)] = []
+        var offset = 0
+        for run in document.runs where run.length > 0 {
+            guard offset <= source.length, run.length <= source.length - offset else { break }
+            spans.append((NSRange(location: offset, length: run.length), run))
+            offset += run.length
+        }
+        if offset < source.length {
+            var body = TopotextRun()
+            body.length = source.length - offset
+            spans.append((NSRange(location: offset, length: body.length), body))
+        }
+        var output = document
+        output.text = ""
+        output.runs = []
+        func append(_ text: String, style: TopotextRun) {
+            guard !text.isEmpty else { return }
+            var run = style
+            run.length = text.utf16.count
+            output.text += text
+            output.runs.append(run)
+        }
+        func appendOriginal(_ range: NSRange) {
+            for span in spans {
+                let part = NSIntersectionRange(range, span.range)
+                guard part.length > 0 else { continue }
+                append(source.substring(with: part), style: span.style)
+            }
+        }
+        var cursor = 0
+        for replacement in replacements.sorted(by: { $0.range.location < $1.range.location }) {
+            let range = replacement.range
+            guard range.location >= cursor, range.location <= source.length,
+                  range.length <= source.length - range.location else { continue }
+            appendOriginal(NSRange(location: cursor, length: range.location - cursor))
+            let style = spans.first { NSLocationInRange(range.location, $0.range) }?.style
+                ?? spans.last?.style ?? TopotextRun()
+            append(replacement.text, style: style)
+            cursor = NSMaxRange(range)
+        }
+        appendOriginal(NSRange(location: cursor, length: source.length - cursor))
+        output.totalLength = output.text.utf16.count
+        return output
     }
 
     private static func formatDate(_ date: Date, format: String) -> String {
@@ -248,6 +319,7 @@ enum TemplateRunner {
     struct Output {
         let text: String
         let firstError: String?
+        var replacements: [TemplateTextReplacement] = []
     }
 
     private static var tasks: [UUID: Task<Void, Never>] = [:]
@@ -272,13 +344,26 @@ enum TemplateRunner {
                     insert: @escaping (String) -> Void,
                     onError: @escaping (String) -> Void) -> Task<Void, Never> {
         start(template, selection: selection, clipboard: clipboard, ask: ask, complete: complete,
-              isOperationValid: isOperationValid, insert: { text, _ in insert(text) }, onError: onError)
+              isOperationValid: isOperationValid, insert: { text, _, _ in insert(text) }, onError: onError)
+    }
+
+    @discardableResult
+    static func runRich(_ template: TemplateNote,
+                        selection: String,
+                        clipboard: String? = nil,
+                        ask: Ask? = nil,
+                        complete: Completion? = nil,
+                        isOperationValid: @escaping () -> Bool = { true },
+                        insert: @escaping (String, String?) -> Void,
+                        onError: @escaping (String) -> Void) -> Task<Void, Never> {
+        start(template, selection: selection, clipboard: clipboard, ask: ask, complete: complete,
+              isOperationValid: isOperationValid, insert: { text, html, _ in insert(text, html) }, onError: onError)
     }
 
     private static func start(_ template: TemplateNote,
                               selection: String, clipboard: String?, ask: Ask?, complete: Completion?,
                               isOperationValid: @escaping () -> Bool,
-                              insert: @escaping (String, @escaping () -> Bool) async -> Void,
+                              insert: @escaping (String, String?, @escaping () -> Bool) async -> Void,
                               onError: @escaping (String) -> Void) -> Task<Void, Never> {
         let clip = clipboard ?? NSPasteboard.general.string(forType: .string) ?? ""
         let plan = TemplateEngine.plan(template.content, selection: selection, clipboard: clip)
@@ -300,7 +385,17 @@ enum TemplateRunner {
                     if let error = output.firstError { onError(error) }
                     try Task.checkCancellation()
                     guard valid() else { return }
-                    await insert(output.text, valid)
+                    let text: String
+                    let html: String
+                    if let source = template.sourceDocument, source.text == template.content, source.isComplete {
+                        let expanded = TemplateEngine.expanding(source, replacements: output.replacements)
+                        text = expanded.text
+                        html = NativeNoteHTML.render(expanded)
+                    } else {
+                        text = output.text
+                        html = MarkdownDocument.html(output.text)
+                    }
+                    await insert(text, html, valid)
                 } catch is CancellationError {
                     token.cancel()
                 } catch {
@@ -351,7 +446,8 @@ enum TemplateRunner {
             }
         }
         try Task.checkCancellation()
-        return Output(text: TemplateEngine.render(plan, answers: answers, ais: ais), firstError: firstError)
+        return Output(text: TemplateEngine.render(plan, answers: answers, ais: ais), firstError: firstError,
+                      replacements: TemplateEngine.resolvedReplacements(plan, answers: answers, ais: ais))
     }
 
     private static func snapshotCompletion(for plan: TemplateExpansionPlan,
@@ -388,19 +484,22 @@ enum TemplateRunner {
                            clipboard: String? = nil,
                            ask: Ask? = nil,
                            complete: Completion? = nil,
+                           target: NotesBridge.SelectionSnapshot? = nil,
+                           replacementRange: CFRange? = nil,
                            isOperationValid: @escaping () -> Bool = { true },
                            onError: ((String) -> Void)? = nil) -> Task<Void, Never>? {
         let report: (String) -> Void = onError ?? { NCLog.log("模板执行警告：\($0)") }
-        guard let target = bridge.readTextSnapshot() else {
+        guard let target = target ?? bridge.readTextSnapshot() else {
             report("无法定位 Notes 原光标，已取消模板写入。")
             return nil
         }
         return start(template, selection: selection, clipboard: clipboard, ask: ask, complete: complete,
-                     isOperationValid: isOperationValid, insert: { text, valid in
+                     isOperationValid: isOperationValid, insert: { text, html, valid in
             // 保持任务运行直到桥接结束；Task.cancel 会同步使 durable token 失效，
             // DispatchQueue 的回调只检查 token，不读取自己的 Task.isCancelled。
             await withCheckedContinuation { continuation in
-                bridge.writeWhenNotesActive(in: target, text: text, isOperationValid: valid) { error in
+                bridge.writeWhenNotesActive(in: target, text: text, range: replacementRange, html: html,
+                                            isOperationValid: valid) { error in
                     if let error, valid() { report(error) }
                     continuation.resume()
                 }

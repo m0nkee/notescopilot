@@ -119,6 +119,7 @@ final class NotesStore: @unchecked Sendable {
     private var hasFTS = false
     private let enableFTS: Bool
     private var separateDataColumns: Set<String> = []
+    private var hasInlineTextMetadata = false
     let path: String
     private var noteEnt: Int64 = 12
     private var folderEnt: Int64 = 11
@@ -163,16 +164,19 @@ final class NotesStore: @unchecked Sendable {
     // MARK: 运行时 schema 探测（Z_PRIMARYKEY 映射 Z_ENT→实体名 + 列名自适应）
 
     private func detectSchema() throws {
-        // 实体码：Z_PRIMARYKEY(Z_ENT, ZNAME) —— ICFolder / ICNote / ICNoteData
-        if let rows = query("SELECT Z_ENT, ZNAME FROM Z_PRIMARYKEY") {
-            for r in rows {
-                let ent = (r[0] as? Int64) ?? -1
-                let name = (r[1] as? String) ?? ""
-                let n = name.lowercased()
-                if n == "icfolder" { folderEnt = ent }
-                if n == "icnotedata" { dataEnt = ent }
-                if n == "icnote" { noteEnt = ent }
-            }
+        // Core Data 使用 Z_NAME；兼容早期导出数据库中的 ZNAME。
+        let registryColumns = tableColumns("Z_PRIMARYKEY") ?? []
+        guard let entityNameCol = ["Z_NAME", "ZNAME"].first(where: { registryColumns.contains($0) }),
+              let rows = query("SELECT Z_ENT, \(entityNameCol) FROM Z_PRIMARYKEY") else {
+            throw StoreError.corrupted("无法读取 Notes 实体映射表 Z_PRIMARYKEY")
+        }
+        for r in rows {
+            let ent = (r[0] as? Int64) ?? -1
+            let name = (r[1] as? String) ?? ""
+            let n = name.lowercased()
+            if n == "icfolder" || n == "folder" { folderEnt = ent }
+            if n == "icnotedata" || n == "notedata" { dataEnt = ent }
+            if n == "icnote" || n == "note" { noteEnt = ent }
         }
         // 列名自适应（不同 macOS 版本列名有差异）
         guard let cols = tableColumns("ZICCLOUDSYNCINGOBJECT"), !cols.isEmpty else {
@@ -185,6 +189,7 @@ final class NotesStore: @unchecked Sendable {
         noteRefCol = cols.contains("ZNOTEDATA") ? "ZNOTEDATA" : (cols.contains("ZDATA") ? "ZDATA" : noteRefCol)
         blobCol = cols.contains("ZDATA") ? "ZDATA" : "ZNSData"
         separateDataColumns = Set(tableColumns("ZICNOTEDATA") ?? [])
+        hasInlineTextMetadata = ["ZIDENTIFIER", "ZTYPEUTI1", "ZALTTEXT", "ZNOTE1"].allSatisfy { cols.contains($0) }
     }
 
     private func tableColumns(_ table: String) -> [String]? {
@@ -269,6 +274,7 @@ final class NotesStore: @unchecked Sendable {
             return (pk, t == 0 ? name : (name.isEmpty ? "智能文件夹" : name))
         }
     }
+
 
     private static func makeSummary(_ row: [Any?]) -> NoteSummary? {
         guard let pk = row[0] as? Int64 else { return nil }
@@ -357,8 +363,28 @@ final class NotesStore: @unchecked Sendable {
             .first?.first as? Data
     }
 
+    func document(for notePK: Int64) -> TopotextDoc? {
+        guard let blob = noteBodyData(pk: notePK), let decoded = TopotextDecoder.decode(blob) else { return nil }
+        guard !decoded.isComplete, hasInlineTextMetadata else { return decoded }
+        let rows = query("""
+            SELECT ZIDENTIFIER, ZTYPEUTI1, ZALTTEXT FROM ZICCLOUDSYNCINGOBJECT
+            WHERE ZNOTE1 = ? AND COALESCE(ZMARKEDFORDELETION, 0) != 1
+              AND ZTYPEUTI1 IN ('com.apple.notes.inlinetextattachment.hashtag',
+                               'com.apple.notes.inlinetextattachment.link')
+            ORDER BY Z_PK
+            """, [notePK]) ?? []
+        var attachments: [String: TopotextInlineAttachment] = [:]
+        for row in rows {
+            guard let id = row[0] as? String, !id.isEmpty,
+                  let type = row[1] as? String, let text = row[2] as? String,
+                  !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { continue }
+            attachments[id] = TopotextInlineAttachment(typeUTI: type, text: text)
+        }
+        return attachments.isEmpty ? decoded : TopotextDecoder.decode(blob, inlineAttachments: attachments)
+    }
+
     func content(for note: NoteSummary) -> NoteContent {
-        if let blob = noteBodyData(pk: note.pk), let doc = TopotextDecoder.decode(blob) {
+        if let doc = document(for: note.pk) {
             let warning = doc.warnings.isEmpty ? nil : doc.warnings.joined(separator: "；")
             let markdown = MarkdownConverter.convert(note: note, doc: doc)
             return NoteContent(markdown: markdown, plainText: doc.text,
@@ -397,7 +423,7 @@ final class NotesStore: @unchecked Sendable {
         _ = query("DELETE FROM search_documents", on: fts)
         indexCount = 0
         for n in notes() {
-            let body = noteBodyData(pk: n.pk).flatMap(TopotextDecoder.decode)?.text ?? n.snippet
+            let body = document(for: n.pk)?.text ?? n.snippet
             let folded = Self.fold(n.title + "\n" + n.snippet + "\n" + body)
             if query("INSERT INTO search_documents(id, text) VALUES (?,?)", [n.pk, folded], on: fts) != nil {
                 indexCount += 1

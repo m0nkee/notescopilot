@@ -94,6 +94,57 @@ do {
 
 // ---- 6. 过滤查询仍可命中格式检查 ----
 do {
+    let old = TemplateStore.templates
+    let oldNotes = TemplateStore.notesTemplates
+    defer {
+        TemplateStore.templates = old
+        TemplateStore.updateNotesTemplates(oldNotes)
+    }
+    TemplateStore.updateNotesTemplates([])
+    TemplateStore.templates = (1...12).map { TemplateNote(name: "Entry-\($0)", content: "body \($0)") }
+    let category = AXSlashWatcher.suggestCandidates(for: "/templates")
+    check(category.count == 12 && category.allSatisfy { $0.group == .template },
+          "/templates 列出全部模板，超过默认五项与八项上限")
+    let commands = buildSlashCommands()
+    for (query, group) in [("/template", SlashGroup.template), ("/模板", .template), ("/模版", .template),
+                           ("/ai", .ai), ("/markdown", .markdown), ("/tools", .tool), ("/工具", .tool)] {
+        let result = AXSlashWatcher.suggestCandidates(for: query, limit: 1)
+        check(result.count == commands.filter { $0.group == group }.count && result.allSatisfy { $0.group == group },
+              "\(query) 展示完整分类并支持别名")
+    }
+    check(AXSlashWatcher.suggestCandidates(for: "/templates Entry").count == 12
+          && AXSlashWatcher.suggestCandidates(for: "/templates Entry-12").map(\.name) == ["Entry-12"],
+          "分类名后空格筛选模板，结果仍不截断")
+    check(SlashQuery.candidates(for: "/templates", commands: commands).map(\.name) == category.map(\.name),
+          "面板与 Notes 正文共用分类筛选结果")
+    check(AXSlashWatcher.activeSlashQuery("正文 /templates ") == "/templates "
+          && AXSlashWatcher.activeSlashQuery("正文 /templates Entry-12") == "/templates Entry-12",
+          "分类后的空格继续保留菜单及筛选词")
+    TemplateStore.templates.append(TemplateNote(name: "Daily Report", content: "daily body"))
+    check(AXSlashWatcher.suggestCandidates(for: "/templates daily report").map(\.name) == ["Daily-Report"],
+          "分类内可按含空格的原模板标题筛选")
+    TemplateStore.templates.append(TemplateNote(name: "templates", content: "reserved category"))
+    check(AXSlashWatcher.matchSlashToken("/templates") == nil
+          && AXSlashWatcher.matchAXSlashTail("/templates ") == nil
+          && AXSlashWatcher.matchAXSlashTail("/templates\n") == nil,
+          "分类名即使与模板重名也不会由空格或回车直接执行")
+    let rows = SlashSuggestPanel.buildRows(category)
+    let initial = SlashSuggestPanel.initialCmdRow(for: "/templates", rows: rows)
+    check(initial == nil, "分类列表初始不选中模板，直接回车不执行首项")
+    var cursor = initial
+    var visited: [String] = []
+    while let next = SlashSuggestPanel.nextCmdRow(from: cursor, delta: 1, rows: rows) {
+        cursor = next
+        if case .cmd(let command) = rows[next] { visited.append(command.name) }
+    }
+    check(visited == category.map(\.name), "分类列表下方向键可遍历全部十二个模板并跳过标题")
+    let last = SlashSuggestPanel.nextCmdRow(from: initial, delta: -1, rows: rows)
+    check(last == rows.count - 1, "未选中时上方向键可从最后一个模板开始导航")
+    check(SlashSuggestPanel.initialCmdRow(for: "/Entry", rows: rows) == 1,
+          "普通命令查询保持默认选中首项")
+}
+
+do {
     check(AXSlashWatcher.suggestCandidates(for: "/format").contains { $0.name == "格式检查" }, "/format 命中格式检查")
     check(AXSlashWatcher.suggestCandidates(for: "/格式检查").contains { $0.name == "格式检查" }, "中文命令名命中")
     check(AXSlashWatcher.matchSlashToken("/format")?.name == "格式检查", "matchSlashToken 命中格式检查")

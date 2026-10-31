@@ -6,13 +6,18 @@ private final class UpdateProtocol: URLProtocol {
     nonisolated(unsafe) private static var responseStatus = 200
     nonisolated(unsafe) private static var requests: [URLRequest] = []
     nonisolated(unsafe) private static var offline = false
+    nonisolated(unsafe) private static var responseGate: DispatchSemaphore?
+    nonisolated(unsafe) private static var responseGateTimedOut = false
 
-    static func fixture(_ body: String, status: Int = 200, offline: Bool = false) {
+    static func fixture(_ body: String, status: Int = 200, offline: Bool = false,
+                        responseGate: DispatchSemaphore? = nil) {
         lock.lock()
         defer { lock.unlock() }
         responseBody = body
         responseStatus = status
         self.offline = offline
+        self.responseGate = responseGate
+        responseGateTimedOut = false
         requests = []
     }
 
@@ -20,6 +25,12 @@ private final class UpdateProtocol: URLProtocol {
         lock.lock()
         defer { lock.unlock() }
         return requests
+    }
+
+    static var didResponseGateTimeOut: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return responseGateTimedOut
     }
 
     override class func canInit(with request: URLRequest) -> Bool { true }
@@ -31,7 +42,13 @@ private final class UpdateProtocol: URLProtocol {
         let body = Self.responseBody
         let status = Self.responseStatus
         let offline = Self.offline
+        let responseGate = Self.responseGate
         Self.lock.unlock()
+        if responseGate?.wait(timeout: .now() + 5) == .timedOut {
+            Self.lock.lock()
+            Self.responseGateTimedOut = true
+            Self.lock.unlock()
+        }
         if offline {
             client?.urlProtocol(self, didFailWithError: URLError(.notConnectedToInternet))
             return
@@ -154,16 +171,22 @@ private func runTests() async {
     check(updater.statusMessage.contains("网络") && !updater.shouldRemind(), "离线给出可重试提示，自动检查静默失败")
 
     reset()
-    UpdateProtocol.fixture(release())
+    let responseGate = DispatchSemaphore(value: 0)
+    UpdateProtocol.fixture(release(), responseGate: responseGate)
     let background = make()
     var mergedResult: Bool?
     background.onCheckCompleted = { mergedResult = $0 }
     let automaticTask = Task { await background.check(userInitiated: false) }
-    // Both calls enter the actor before URLSession can resume the first request.
-    await Task.yield()
-    await background.check()
+    // Hold the response until the manual call actually overlaps the automatic
+    // request. Task.yield alone guarantees neither task order nor overlap.
+    let overlapDeadline = Date().addingTimeInterval(2)
+    while !background.isChecking && Date() < overlapDeadline { await Task.yield() }
+    let overlapped = background.isChecking
+    if overlapped { await background.check() }
+    responseGate.signal()
     await automaticTask.value
-    check(UpdateProtocol.captured.count == 1 && mergedResult == true, "手动检查合并启动中的请求并获得结果")
+    check(overlapped && !UpdateProtocol.didResponseGateTimeOut
+          && UpdateProtocol.captured.count == 1 && mergedResult == true, "手动检查合并启动中的请求并获得结果")
     reset()
     UpdateProtocol.fixture(release())
     let unknownVersion = make("")

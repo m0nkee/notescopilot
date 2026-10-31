@@ -22,6 +22,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private(set) var notesStore: NotesStore?
     private(set) var notesStoreError: String?
     private(set) var notesStoreLoading = false
+    private(set) var notesTemplatesLoading = false
+    private var templateRefreshID = UUID()
     /// FSEvents 监听：NoteStore.sqlite 变更后自动重索引（对应 ProNotes 的 fsEventStream）
     private var storeWatcher: StoreWatcher?
     private var hotkeyRef: EventHotKeyRef?
@@ -66,6 +68,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
 
         // Full-text indexing runs off the main thread; errors remain visible and retryable.
+        NotificationCenter.default.addObserver(
+            forName: .init("nc.storeDidReindex"), object: nil, queue: .main
+        ) { [weak self] _ in MainActor.assumeIsolated { self?.refreshNotesTemplates() } }
         if startBackgroundServices { retryNotesStore() }
 
         // accessory（LSUIElement）应用没有主菜单，⌘V/⌘C 的快捷键等价物会失效，
@@ -435,10 +440,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     self.notesStoreError = nil
                     self.storeWatcher = StoreWatcher(store: store)
                     self.storeWatcher?.start()
+                    self.refreshNotesTemplates()
                 case .failure(let error):
                     self.notesStoreError = error.localizedDescription
                 }
                 NotificationCenter.default.post(name: .init("nc.storeAvailable"), object: nil)
+            }
+        }
+    }
+
+    /// Keep Notes templates separate from local edits; stale scans cannot replace a newer result.
+    @objc func refreshNotesTemplates() {
+        guard let store = notesStore else { retryNotesStore(); return }
+        let requestID = UUID()
+        templateRefreshID = requestID
+        notesTemplatesLoading = true
+        NotificationCenter.default.post(name: TemplateStore.notesChangedNotification, object: nil)
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            let templates = NotesTemplateImporter.readTemplates(from: store)
+            DispatchQueue.main.async {
+                guard let self, self.templateRefreshID == requestID, self.notesStore === store else { return }
+                self.notesTemplatesLoading = false
+                TemplateStore.updateNotesTemplates(templates)
+                NCLog.log("Notes 模板已更新：\(templates.count) 个")
             }
         }
     }
