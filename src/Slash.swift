@@ -319,6 +319,7 @@ final class KeywordListener {
     /// 斜杠命令缓冲（如英文别名 "/polish"）：
     /// 只在监听启动后重新开始记录，避免旧缓冲误触发
     private var slashBuf = ""
+    private var consumedLauncherKey = false
     /// 授权重试定时器：用户在系统设置里授完权后自动拉起监听，无需重启应用
     private var retryTimer: Timer?
     /// 上次记录的辅助功能授权结果（日志去重）
@@ -346,9 +347,9 @@ final class KeywordListener {
 
     func startIfNeeded() {
         guard tap == nil else { return }
-        guard enabled || slashGlobal else {
+        guard enabled || slashGlobal || SelectionScope.isEnabled() else {
             cancelPermissionRetry()
-            NCLog.log("startIfNeeded 跳过：关键词与全局斜杠均关闭")
+            NCLog.log("startIfNeeded 跳过：选区快捷键、关键词与斜杠均关闭")
             NotificationCenter.default.post(
                 name: .init("nc.kwStatus"),
                 object: "菜单键盘导航与关键词扩展已关闭。")
@@ -465,12 +466,15 @@ final class KeywordListener {
         }
         buffer = ""
         slashBuf = ""
+        consumedLauncherKey = false
         cancelPermissionRetry()
     }
 
     /// keyDown 仅路由菜单导航与显式启用的关键词；正文命令统一交给 AX。
     fileprivate func handle(_ event: CGEvent) -> Unmanaged<CGEvent>? {
         let flags = event.flags
+        let repeating = event.getIntegerValueField(.keyboardEventAutorepeat) != 0
+        if !repeating { consumedLauncherKey = false }
         if !flags.intersection([.maskCommand, .maskAlternate, .maskControl]).isEmpty {
             buffer = ""
             slashBuf = ""
@@ -483,6 +487,7 @@ final class KeywordListener {
         if kc == 125 || kc == 126 || kc == 36 || kc == 53,
            MainActor.assumeIsolated({
                SlashSuggestPanel.shared.routeKeyIfVisible(kc)
+                   || (kc == 53 && SelectionAIPanel.shared.dismissFromHost())
            }) {
             buffer = ""
             slashBuf = ""
@@ -492,6 +497,18 @@ final class KeywordListener {
         var chars = [UniChar](repeating: 0, count: 4)
         var actual = 0
         event.keyboardGetUnicodeString(maxStringLength: 4, actualStringLength: &actual, unicodeString: &chars)
+        #if NC_APP
+        let isM = actual == 1 ? (chars[0] == 109 || chars[0] == 77) : (actual == 0 && kc == 46)
+        if isM && flags.intersection([.maskShift, .maskSecondaryFn]).isEmpty {
+            if repeating && consumedLauncherKey { return nil }
+            if !repeating && MainActor.assumeIsolated({ SelectionAIPanel.shared.openFromHostShortcut() }) {
+                consumedLauncherKey = true
+                buffer = ""
+                slashBuf = ""
+                return nil
+            }
+        }
+        #endif
         guard actual > 0 else {
             buffer = ""
             slashBuf = ""

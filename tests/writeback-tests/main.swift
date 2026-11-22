@@ -477,12 +477,12 @@ Task { @MainActor in
 
     let selectionGate = CompletionGate()
     let request = SelectionAIRequest(complete: { _, _ in await selectionGate.wait() })
-    request.select(original)
+    request.select(.notes(original))
     request.run(instruction: "rewrite")
     let oldTask = request.task
     await selectionGate.waitUntilStarted()
     let nextSelection = snapshot(noteID: "note-b", text: "different")
-    request.select(nextSelection)
+    request.select(.notes(nextSelection))
     selectionGate.finish("old selection result")
     await oldTask?.value
     check(request.snapshot?.noteID == "note-b" && request.resultText.isEmpty && !request.busy,
@@ -490,7 +490,7 @@ Task { @MainActor in
 
     let hiddenGate = CompletionGate()
     let hiddenRequest = SelectionAIRequest(complete: { _, _ in await hiddenGate.wait() })
-    hiddenRequest.select(original)
+    hiddenRequest.select(.notes(original))
     hiddenRequest.run(instruction: "rewrite")
     let hiddenTask = hiddenRequest.task
     await hiddenGate.waitUntilStarted()
@@ -501,11 +501,38 @@ Task { @MainActor in
           "hiding a selection cancels its request and ignores late completion")
 
     let validRequest = SelectionAIRequest(complete: { _, context in "edited \(context)" })
-    validRequest.select(original)
+    validRequest.select(.notes(original))
     validRequest.run(instruction: "rewrite")
     await validRequest.task?.value
     check(validRequest.resultText == "edited original" && !validRequest.busy,
           "a current selection receives its own completion")
+
+    let serviceText = "  仅本段 👩🏽‍💻\n第二行  "
+    var serviceInputs: [String] = []
+    let serviceRequest = SelectionAIRequest(complete: { _, context in
+        serviceInputs.append(context)
+        return serviceInputs.count == 1 ? "选区结果" : " \n "
+    })
+    serviceRequest.select(.service(serviceText))
+    check(serviceInputs.isEmpty && serviceRequest.snapshot == nil, "服务选区打开时不调用模型，也没有 Notes 写回目标")
+    serviceRequest.run(instruction: "总结")
+    await serviceRequest.task?.value
+    check(serviceInputs == [serviceText] && serviceRequest.resultText == "选区结果", "模型只收到服务交来的选区")
+    serviceRequest.writeResult(using: { _, _, _, _ in check(false, "服务选区意外进入 Notes 写回") }) { _ in }
+    serviceRequest.run(instruction: "总结")
+    await serviceRequest.task?.value
+    check(serviceRequest.lastError != nil && serviceRequest.resultText == "选区结果", "重新生成返回空白时保留上一份可复制结果")
+
+    let repeatGate = CompletionGate()
+    let repeatService = SelectionAIRequest(complete: { _, _ in await repeatGate.wait() })
+    repeatService.select(.service(serviceText))
+    repeatService.run(instruction: "润色")
+    let priorServiceTask = repeatService.task
+    await repeatGate.waitUntilStarted()
+    repeatService.select(.service(serviceText))
+    repeatGate.finish("来自上次服务")
+    await priorServiceTask?.value
+    check(repeatService.resultText.isEmpty && !repeatService.busy, "两次服务即使内容相同也不接收彼此的迟到结果")
 
     check(NotesBridge.context(in: snapshot(text: "first paragraph", location: 0, length: 0))?.text == "first paragraph",
           "cursor at zero uses its current paragraph")
@@ -758,7 +785,7 @@ Task { @MainActor in
     validRequest.writeResult(using: { _, _, valid, _ in firstValidity = valid }) { _ in }
     check(firstValidity?() == true, "pending selection write receives a live operation token")
     validRequest.cancel()
-    validRequest.select(original)
+    validRequest.select(.notes(original))
     validRequest.run(instruction: "rewrite")
     await validRequest.task?.value
     check(firstValidity?() == false && validRequest.resultText == "edited original",

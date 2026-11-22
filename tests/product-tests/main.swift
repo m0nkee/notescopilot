@@ -421,10 +421,11 @@ private func keyboardListenerTests() async {
     let defaults = UserDefaults.standard
     let previous = defaults.volatileDomain(forName: UserDefaults.argumentDomain)
     defer { defaults.setVolatileDomain(previous, forName: UserDefaults.argumentDomain) }
-    func features(keywords: Bool, slash: Bool) {
+    func features(keywords: Bool, slash: Bool, selection: Bool = false) {
         var fixture = previous
         fixture["nc.kw.enabled"] = keywords
         fixture["nc.slash.global"] = slash
+        fixture[SelectionScope.enabledKey] = selection
         defaults.setVolatileDomain(fixture, forName: UserDefaults.argumentDomain)
     }
     var messages: [String] = []
@@ -486,12 +487,15 @@ private func keyboardListenerTests() async {
     })
     defer { disabled.stop() }
     disabled.startIfNeeded()
-    check(disabledAttempts == 0 && !disabled.isRunning, "关键词与斜杠菜单均关闭时不启动键盘tap")
+    check(disabledAttempts == 0 && !disabled.isRunning, "全部键盘入口关闭时不启动键盘tap")
     messages.append("菜单键盘导航与关键词监听已启动。")
     let messageCountBeforeRestart = messages.count
     disabled.restart()
     check(messages.count == messageCountBeforeRestart + 1 && messages.last == "菜单键盘导航与关键词扩展已关闭。",
           "关闭全部键盘功能后restart会发布关闭状态以替换界面缓存的已启动消息")
+    features(keywords: false, slash: false, selection: true)
+    disabled.startIfNeeded()
+    check(disabledAttempts == 1, "只启用选区写作工具也会启动快捷键监听")
 }
 
 renderingTests()

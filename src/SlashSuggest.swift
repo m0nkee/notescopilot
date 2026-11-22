@@ -402,16 +402,7 @@ extension SlashSuggestPanel {
             $0.bundleIdentifier == "com.apple.Notes"
         }) else { return false }
         let axApp = AXUIElementCreateApplication(notes.processIdentifier)
-        var fRef: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(axApp, kAXFocusedUIElementAttribute as CFString, &fRef) == .success,
-              let f = fRef else { return false }
-        let el = unsafeBitCast(f, to: AXUIElement.self)
-        var rRef: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(el, "AXMarkedTextRange" as CFString, &rRef) == .success,
-              let rv = rRef else { return false }
-        var range = CFRange()
-        AXValueGetValue(unsafeBitCast(rv, to: AXValue.self), .cfRange, &range)
-        return range.length > 0
+        return AXText.element(axApp, kAXFocusedUIElementAttribute).map(AXText.isComposing) == true
     }
 }
 

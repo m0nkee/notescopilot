@@ -342,9 +342,9 @@ enum ProfileStore {
 enum Config {
     static var defaults = UserDefaults.standard
     static let defaultSystem = """
-    你是 NotesCopilot，一个嵌入 Apple Notes 工作流的 AI 写作助手。
+    你是 NotesCopilot，帮助用户处理 Apple Notes 笔记和在 Mac 上选中的文字。
     直接给出结果内容本身，不要寒暄与多余解释；默认输出 Markdown。
-    用户给出的「笔记上下文」来自 Apple Notes 中选中的文字；改写时不要改变其原意。
+    改写用户提供的文字时保留原意。
     """
 
     /// 全部已保存配置（多份），编辑后由设置页写回
@@ -449,16 +449,19 @@ enum AIService {
         return arr.compactMap { $0["id"] as? String }.sorted()
     }
 
-    /// 非流式单轮补全（模板 {{ai:指令}} 片段用）：走当前生效配置，
-    /// 笔记上下文非空时自动拼入。与面板流式通道互不干扰。
+    enum ContextKind: String { case note = "笔记上下文", selection = "选中文本" }
+
+    /// 模板片段与选区工具独立发起单轮补全。选区中的缩进和首尾换行也属于用户的输入。
     static func complete(instruction: String, context: String,
+                         contextKind: ContextKind = .note,
                          configuration: AIRequestConfiguration? = nil) async throws -> String {
         let configuration = try configuration ?? AIRequestConfiguration.current()
         try Task.checkCancellation()
         var user = instruction
-        let ctx = context.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !ctx.isEmpty {
-            user = "【笔记上下文】\n\(ctx)\n\n【任务】\n\(instruction)"
+        let trimmed = context.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmed.isEmpty {
+            let content = contextKind == .selection ? context : trimmed
+            user = "【\(contextKind.rawValue)】\n\(content)\n\n【任务】\n\(instruction)"
         }
         guard let url = URL(string: configuration.baseURL + "/chat/completions") else {
             throw APIError(status: -1, message: "Base URL 无效")

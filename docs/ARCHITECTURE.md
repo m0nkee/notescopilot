@@ -10,7 +10,8 @@ NotesCopilot 为 Swift 单进程应用（`swiftc` 直编，零第三方依赖）
 | `Chat.swift` | `ChatEngine` + `AIService`：OpenAI 兼容端点 SSE 流式请求、多模型配置、上下文注入 |
 | `Slash.swift` | 斜杠命令引擎：`/` 触发、命令注册表（AI/Markdown/模板/工具分组）、`NCLog` 诊断日志、KeywordListener（辅助功能授权的 active event tap） |
 | `SlashSuggest.swift` | 斜杠命令候选面板 UI（分组列表、键盘导航） |
-| `SelectionAI.swift` | **选中加工条**：`SelectionWatcher`（0.2s AX 轮询）、`SelectionAIPanel`（AI/自定义/格式三段分组）、`SelectionKeyPanel`/`ActivatingTextField`（面板键盘焦点）、`NotesFormatButton`（格式按钮纯逻辑，可单测） |
+| `SelectionAI.swift`、`SelectionToolsView.swift` | Notes 选区去抖与入口定位、macOS 服务提供方、单轮生成与取消、原文和结果审阅、按来源控制写回 |
+| `InputFieldSelection.swift` | 自动浮钮的范围偏好、前台输入框 AX 选区、窗口与原文校验、跨应用替换和结果核验 |
 | `NotesBridge.swift` | **Notes 桥接核心**：选区/光标读写、`formatMenuItems`（13 项格式菜单）、AX 菜单枚举与 AXPress、快捷键兜底（AXMenuItemCmdChar/Modifiers → CGEvent）、`selectionSignature` |
 | `UrlTitle.swift` | URL → 标题超链：三级抓取（HTTP 直抓 → 共享 Cookie → 浏览器标签页 AppleScript） |
 | `FormatBridge.swift` | 格式菜单缓存层：菜单元素查找与快捷键解析 |
@@ -33,9 +34,10 @@ NotesCopilot 为 Swift 单进程应用（`swiftc` 直编，零第三方依赖）
 - `KeywordListener` 使用 `.defaultTap` 拦截菜单导航键，由辅助功能授权和实际 tap 创建/启用结果决定是否启动；不以 listen-only 的输入监控预检提前阻止启动。撤权时停止旧 tap；创建或重新启用失败后限速重试，超时且授权仍有效时可直接恢复现有 tap。
 - 命令删除绑定原 Notes 快照，通过 AX 区间替换并等待删除确认，不向其他应用投递全局退格
 - 主面板、选中加工和模板写回均再次校验笔记、正文、选区与操作有效期；取消期间不执行迟到写入
-- `SelectionWatcher`（0.2s）轮询选区，出现稳定选区后弹出加工条
-- 选区签名（`selectionSignature`）仅取选区起止位置，避免每次全量读文本
-- `SelectionPollingState` 仅在完整快照准备成功后提交已展示状态；失败时同一选区限速重试，换选区或取消选区立即清除失败等待。
+- `SelectionWatcher` 每 0.2 秒检查前台选区。默认只检查 Notes，选择「全局」后才检查其他应用的焦点控件。连续两次选区稳定才显示浮钮。全局浮钮在内存中暂存选中文字，宿主短暂撤回选区时仍可展开。再次点击宿主、键入或切换应用会结束待展开的选区。只读选区使用宿主提供的字符范围、文本标记或所选文本。仅在展开时读取可编辑字段全文并绑定写回位置。追加时先将选区折叠至末尾，确认光标位置后再插入。安全输入和浮钮本身跳过。
+- 外部输入框快照持有原进程、窗口、焦点控件、UTF-16 选区、选中文字及本地字段值。写回前核对目标和当前范围偏好。原生控件优先直接写选区，网页输入框调用原应用「编辑」菜单中的粘贴命令，随后核对字段内容。临时剪贴板按 changeCount 恢复。模型只接收选区和指令。
+- 外部只读摘录展开后，轮询会忽略同一宿主窗口自行公布的新范围。用户回到宿主点击或键入后，新的稳定选区才可取代当前工具。选区浮钮的 `M` 键由现有辅助功能键盘通道处理，检查前台来源、权限范围和输入法组合状态后，调用与鼠标相同的打开动作。
+- `Info.plist` 声明纯文本服务。通过 `NSApp.servicesProvider` 进入的会话只持有选中文字，可预览和复制。三个入口共享生成、取消和审阅流程。Notes 原生格式使用笔记快照，替换和追加分别通过对应宿主的写回路径执行。
 - `NotesBridge.accessIssue` 区分缺少辅助功能、Notes 自动化拒绝及笔记身份不可用；通过去重通知更新面板和诊断页，不把访问问题混入手动 AI 请求错误。
 
 ### 2. Notes 菜单 AX 结构（重要取证结论）
@@ -49,7 +51,7 @@ NotesCopilot 为 Swift 单进程应用（`swiftc` 直编，零第三方依赖）
 
 - 全局快捷键用 Carbon `RegisterEventHotKey`（⇧⌘Space）
 - 普通文本优先 AX 选区写入；富文本在主线程由安全 HTML 一次生成带样式内容，同时发布 RTFD、RTF、UTF-8 HTML 和纯文本，并调用 Notes 的“粘贴并保留样式”菜单。在准备剪贴板后及菜单执行前再次校验目标与操作有效期，按 changeCount 恢复完整剪贴板；菜单不可用时明确报错，不静默改为丢失样式的普通粘贴。
-- **borderless NSPanel 键盘焦点三要素**：`canBecomeKey=true` 的 NSPanel 子类 + 应用内激活（`NSApp.activate(ignoringOtherApps:)`，外部 activate 对 UIElement 应用无效）+ `makeFirstResponder`；面板持 key 期间需挂起选区轮询，防止面板被误收起
+- 选区入口使用非激活 NSPanel。全局浮钮展开后保持原应用处于前台，便于确认写回。通过系统服务打开的面板独立于自动浮钮范围。
 
 ### 4. URL 三级抓取
 
@@ -75,7 +77,7 @@ Notes 模板以 `TopotextDoc` 第一行作为模板名，去掉该行和紧随�
 
 | 套件 | 覆盖 |
 |---|---|
-| `selai-tests` | 选中加工条：格式按钮全集/拆行/标签映射、面板逻辑（33 项） |
+| `selai-tests` | 选区去抖、失败恢复、动作分组、Notes 格式映射 |
 | `slashgroup-tests` | 斜杠命令分组与匹配（26 项） |
 | `template-tests` | 模板引擎解析与编解码（41 项） |
 | `urltitle-tests` | URL 抓取解析与误判防护 |

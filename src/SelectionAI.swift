@@ -1,37 +1,46 @@
 import AppKit
 import Accessibility
-import ObjectiveC
-
-// MARK: - 选中即 AI：悬浮快捷加工（hover 风格）
-//
-// 复刻 ProNotes Inline Toolbar 的「贴在 Notes 编辑区上的悬浮条」思路，但触发条件改为
-// 「文本选中且稳定」：AX 轮询读 kAXSelectedTextRange，选区稳定 2 拍（≈0.4s）即视为
-// 用户完成选择，在选区矩形下方弹出非激活面板（不抢 Notes 焦点，选区不丢）：
-//
-//   [润色] [总结] [翻译] [解释] [精简]  [自定义指令…]
-//     → AIService.complete 非流式加工 → 结果卡展示：
-//   [替换选区] [追加到后] [复制] [×]
-//
-// 写入通道（替换/追加）：优先 AXSetSelectedText（零剪贴板污染），
-// 不支持时退回「AXSetSelectedTextRange 恢复选区 + ⌘V 粘贴」。
+import SwiftUI
 
 // MARK: 快捷动作定义
 
 struct SelectionQuickAction: Equatable {
+    enum Group: String, CaseIterable { case edit = "编辑", read = "阅读" }
     let name: String
+    let group: Group
     let instruction: String
 }
 
 /// 快捷加工清单：指令要求「只输出加工后的文本」，保证替换动作可直接落笔
 let selectionQuickActions: [SelectionQuickAction] = [
-    .init(name: "润色", instruction: "请润色以下文字，使其更通顺、专业，保持原意与格式。只输出润色后的文本，不要解释。"),
-    .init(name: "总结", instruction: "请用简洁的要点总结以下内容的核心信息。只输出总结内容。"),
-    .init(name: "翻译", instruction: "请将以下内容翻译成英文，保持原意与语气。只输出译文。"),
-    .init(name: "解释", instruction: "请简要解释以下内容的关键概念与逻辑。"),
-    .init(name: "精简", instruction: "请把以下内容压缩得更简洁，保留核心信息。只输出精简后的文本。"),
+    .init(name: "校对", group: .edit, instruction: "请只修正错别字、语法和标点，保留原意、段落与语气。输出完整校对稿，无需改动时返回原文。"),
+    .init(name: "润色", group: .edit, instruction: "请润色以下文字，使其更通顺、专业，保持原意与格式。只输出润色后的文本，不要解释。"),
+    .init(name: "精简", group: .edit, instruction: "请把以下内容压缩得更简洁，保留核心信息。只输出精简后的文本。"),
+    .init(name: "总结", group: .read, instruction: "请用简洁的要点总结以下内容的核心信息。只输出总结内容。"),
+    .init(name: "翻译", group: .read, instruction: "请将以下内容翻译成英文，保持原意与语气。只输出译文。"),
+    .init(name: "解释", group: .read, instruction: "请简要解释以下内容的关键概念与逻辑。"),
 ]
 
-// MARK: Notes 原生格式按钮（选中面板第二排，纯逻辑可单测）
+enum WritingSelection {
+    case notes(NotesBridge.SelectionSnapshot)
+    case input(InputFieldSelection)
+    case service(String)
+
+    var text: String {
+        switch self {
+        case .notes(let snapshot): return snapshot.text
+        case .input(let snapshot): return snapshot.text
+        case .service(let text): return text
+        }
+    }
+
+    var notesSnapshot: NotesBridge.SelectionSnapshot? {
+        if case .notes(let snapshot) = self { return snapshot }
+        return nil
+    }
+}
+
+// MARK: Notes 原生格式菜单
 
 struct NotesFormatItem: Equatable {
     let menuTitle: String   // Notes「格式」菜单的准确标题（AXPress 用）
@@ -45,13 +54,6 @@ enum NotesFormatButton {
         return NotesBridge.formatMenuItems
             .filter { NotesBridge.formatMenuTitles(for: $0.menu).contains { set.contains($0) } }
             .map { NotesFormatItem(menuTitle: $0.menu, label: $0.label) }
-    }
-
-    /// 拆行（面板宽度有限，每行最多 5 个）
-    nonisolated static func splitRows(_ items: [NotesFormatItem], maxPerRow: Int = 5) -> [[NotesFormatItem]] {
-        guard maxPerRow > 0, !items.isEmpty else { return items.isEmpty ? [] : [items] }
-        return stride(from: 0, to: items.count, by: maxPerRow)
-            .map { Array(items[$0..<min($0 + maxPerRow, items.count)]) }
     }
 }
 
@@ -90,12 +92,15 @@ enum SelAIState: Equatable {
     }
 }
 
-/// Coordinates the real poll's cheap selection signature and fallible full
-/// snapshot preparation. A show is observable only after preparation succeeds.
+/// A stable signature still needs a matching control and range to place a launcher.
 struct SelectionPollingState {
     private(set) var state: SelAIState = .idle
     private var failedSignature: String?
     private var nextSnapshotAttempt: Date?
+
+    init(shownSignature: String? = nil) {
+        if let shownSignature { state = .shown(sig: shownSignature) }
+    }
 
     mutating func poll(currentSig: String?, now: Date, prepareShow: () -> Bool) -> SelAIState.StepAction {
         if currentSig != failedSignature {
@@ -108,8 +113,7 @@ struct SelectionPollingState {
             if let currentSig {
                 state = .watching(sig: currentSig, stable: 1)
                 failedSignature = currentSig
-                // Permission failures must stay recoverable without retrying
-                // an Apple Event on every 0.2-second selection poll.
+                // Back off on transient AX failures while tracking the same range.
                 nextSnapshotAttempt = now.addingTimeInterval(1)
             }
             return .none
@@ -130,52 +134,108 @@ final class SelectionWatcher {
     static let shared = SelectionWatcher()
     private var timer: Timer?
     private var polling = SelectionPollingState()
+    private let panel: SelectionAIPanel
+    private let defaults: UserDefaults
+    private let frontmost: () -> NSRunningApplication?
+    private let browserAccess = BrowserSelectionAccess()
 
-    private var enabled: Bool {
-        UserDefaults.standard.object(forKey: "nc.selai.enabled") == nil
-            ? true : UserDefaults.standard.bool(forKey: "nc.selai.enabled")
+    init(panel: SelectionAIPanel? = nil, defaults: UserDefaults = .standard,
+         frontmost: @escaping () -> NSRunningApplication? = { NSWorkspace.shared.frontmostApplication }) {
+        self.panel = panel ?? .shared
+        self.defaults = defaults
+        self.frontmost = frontmost
     }
 
     var isRunning: Bool { timer != nil }
 
     func startIfNeeded() {
-        guard timer == nil else { return }
+        guard timer == nil, SelectionScope.isEnabled(in: defaults) else { return }
         timer = Timer.scheduledTimer(withTimeInterval: 0.2, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated { self?.poll() }
         }
-        NCLog.log("选中加工通道已启动（AX 轮询 0.2s，开关 = \(enabled)）")
+        NCLog.log("选区写作工具已启动")
     }
 
     func stop() {
         timer?.invalidate(); timer = nil
+        browserAccess.update(for: nil)
         polling = SelectionPollingState()
-        SelectionAIPanel.shared.hide()
+        if !panel.isServiceSession { panel.hide() }
+    }
+
+    func scopeDidChange() {
+        polling = SelectionPollingState()
+        if !SelectionScope.allowsGlobalSelection(in: defaults) { browserAccess.update(for: nil) }
+        if panel.isInputSession && !SelectionScope.allowsGlobalSelection(in: defaults) { panel.hide() }
     }
 
     private func poll() {
-        guard enabled else { return }
-        // 用户正在面板输入框里打字（面板持 key、Notes 不在前台）：挂起轮询，避免面板被误收起
-        if SelectionAIPanel.shared.panelIsKey { return }
-        if SelectionAIPanel.shared.isRetainingResult { return }
-        if SelectionAIPanel.shared.cancelIfTargetChanged() { polling = SelectionPollingState() }
-        // 上下文里的选中区间签名：仅选区起止，不读全文（省一次 AX 取值）
-        let sig: String? = NotesBridge.shared.selectionSignature()
-        var preparedSnapshot: NotesBridge.SelectionSnapshot?
+        guard SelectionScope.isEnabled(in: defaults) else { return }
+        if panel.isInputSession && !SelectionScope.allowsGlobalSelection(in: defaults) { scopeDidChange() }
+        if panel.writing { return }
+        if panel.isServiceSession || (panel.hasOpenedSelection && !panel.isInputSession && panel.panelIsKey) {
+            polling = SelectionPollingState()
+            return
+        }
+        let front = frontmost()
+        if front?.processIdentifier == ProcessInfo.processInfo.processIdentifier && panel.hasOpenedSelection { return }
+        let inNotes = front?.bundleIdentifier == NotesBridge.notesBundleID
+        var anchor: TextSelectionAnchor?
+        if front?.processIdentifier != ProcessInfo.processInfo.processIdentifier {
+            browserAccess.update(for: SelectionScope.allowsGlobalSelection(in: defaults) && !inNotes && AXIsProcessTrusted() ? front : nil)
+        }
+        if let front, !inNotes, SelectionScope.current(in: defaults) == .global {
+            // A pause halfway through a drag is not a finished selection.
+            if NSEvent.pressedMouseButtons & 1 != 0 { return }
+            // Hit-testing an app directly looks through other windows. Once the
+            // tool has keyboard focus, Chromium can expose the same document
+            // selection on a different AX node behind our menu.
+            anchor = InputFieldBridge.anchor(in: front, allowPointerLookup: !panel.containsPointer)
+        }
+        let sig = inNotes ? NotesBridge.shared.selectionSignature() : anchor?.signature
+        if panel.isWaitingAfterDismissal(in: front, candidate: anchor) {
+            polling = SelectionPollingState()
+            return
+        }
+        if let excerpt = panel.launcherExcerpt {
+            if sig == excerpt.anchor.signature {
+                polling = SelectionPollingState(shownSignature: excerpt.anchor.signature)
+                return
+            }
+            if InputFieldBridge.isInSourceContext(excerpt, front: front) {
+                if sig == nil || panel.containsPointer {
+                    // Ignore an empty AX sample and discard any half-observed replacement.
+                    polling = SelectionPollingState(shownSignature: excerpt.anchor.signature)
+                    return
+                }
+            } else {
+                panel.hide()
+                polling = SelectionPollingState()
+            }
+        }
+        // A renderer may lose focus as the tool opens. Keep its captured excerpt until
+        // the user closes it or another nonempty selection survives the debounce.
+        if panel.hasOpenedSelection && !panel.isObservingNewSelection(sig, candidate: anchor) {
+            polling = SelectionPollingState()
+            return
+        }
         let action = polling.poll(currentSig: sig, now: Date()) {
-            guard NotesBridge.isFrontmostNotes(),
-                  let snapshot = NotesBridge.shared.readSelectionSnapshot(),
-                  sig == "\(snapshot.range.location):\(snapshot.range.length)" else { return false }
-            preparedSnapshot = snapshot
+            if inNotes {
+                anchor = NotesBridge.shared.selectionAnchor()
+            } else if var input = anchor {
+                input.bounds = input.extent.bounds(in: input.element)
+                anchor = input
+            }
+            guard let anchor, sig == anchor.signature else { return false }
             return true
         }
         switch action {
         case .show:
-            // 弹出时才做完整快照（文本 + 边界矩形 + 元素引用）
-            guard let snap = preparedSnapshot else { break }
-            SelectionAIPanel.shared.showMenu(for: snap)
-            NCLog.log("选中加工面板弹出：选中 \(snap.text.count) 字 @\(snap.range.location)")
+            if let anchor {
+                panel.showLauncher(at: anchor) { [weak self] in self?.polling = SelectionPollingState() }
+            }
         case .hide:
-            SelectionAIPanel.shared.hide()
+            if !panel.hasOpenedSelection && panel.launcherExcerpt == nil { panel.hide() }
         case .none:
             break
         }
@@ -191,18 +251,20 @@ final class SelectionAIRequest {
     private let complete: Completion?
     private var requestID: UUID?
     private var writeOperationID: UUID?
-    private(set) var snapshot: NotesBridge.SelectionSnapshot?
+    private(set) var selection: WritingSelection?
+    var snapshot: NotesBridge.SelectionSnapshot? { selection?.notesSnapshot }
     private(set) var resultText = ""
     private(set) var busy = false
     private(set) var lastError: String?
+    private(set) var needsConfiguration = false
     private(set) var task: Task<Void, Never>?
     var onChange: (() -> Void)?
 
     init(complete: Completion? = nil) { self.complete = complete }
 
-    func select(_ snapshot: NotesBridge.SelectionSnapshot) {
+    func select(_ selection: WritingSelection) {
         cancel()
-        self.snapshot = snapshot
+        self.selection = selection
     }
 
     func cancel() {
@@ -210,20 +272,21 @@ final class SelectionAIRequest {
         requestID = nil
         task?.cancel()
         task = nil
-        snapshot = nil
+        selection = nil
         resultText = ""
         lastError = nil
+        needsConfiguration = false
         busy = false
     }
 
     func run(instruction: String) {
-        guard let snapshot else { return }
+        guard let selection else { return }
         writeOperationID = nil
         requestID = nil
         task?.cancel()
         task = nil
-        resultText = ""
         lastError = nil
+        needsConfiguration = false
         let operation: Completion
         do {
             if let complete {
@@ -231,12 +294,14 @@ final class SelectionAIRequest {
             } else {
                 let configuration = try AIRequestConfiguration.current()
                 operation = { instruction, context in
-                    try await AIService.complete(instruction: instruction, context: context, configuration: configuration)
+                    try await AIService.complete(instruction: instruction, context: context,
+                                                 contextKind: .selection, configuration: configuration)
                 }
             }
         } catch {
             busy = false
             lastError = error.localizedDescription
+            needsConfiguration = true
             onChange?()
             return
         }
@@ -246,9 +311,11 @@ final class SelectionAIRequest {
         onChange?()
         task = Task { @MainActor [weak self] in
             do {
-                let text = try await operation(instruction, snapshot.text)
-                guard let self, !Task.isCancelled, self.requestID == id,
-                      self.snapshot?.matches(snapshot) == true else { return }
+                let text = try await operation(instruction, selection.text)
+                guard let self, !Task.isCancelled, self.requestID == id else { return }
+                guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                    throw APIError(status: -2, message: "模型返回了空文本，请重试。")
+                }
                 self.resultText = text
                 self.busy = false
                 self.task = nil
@@ -266,7 +333,7 @@ final class SelectionAIRequest {
     /// 写入失败不消费结果；关闭面板或切换请求后，迟到的写入回调不影响新结果。
     func writeResult(using writer: (NotesBridge.SelectionSnapshot, String, @escaping () -> Bool, @escaping (String?) -> Void) -> Void,
                      completion: @escaping (String?) -> Void) {
-        guard let snapshot, !resultText.isEmpty else { return }
+        guard let snapshot, !busy, !resultText.isEmpty else { return }
         let result = resultText
         let id = UUID()
         writeOperationID = id
@@ -284,476 +351,440 @@ final class SelectionAIRequest {
     }
 }
 
-/// 可成为 key window 的 borderless 面板：否则自定义指令输入框拿不到键盘焦点（默认 borderless canBecomeKey=false）
-/// .nonactivatingPanel 保证弹出时不抢 Notes 焦点；但要输入时需应用内激活（见 ActivatingTextField）
-final class SelectionKeyPanel: NSPanel {
-    override var canBecomeKey: Bool { true }
-}
-
-/// 自定义指令输入框：非激活应用的 borderless 面板点击无法成为 key window，
-/// 点击时应用内激活本应用 + makeKey + firstResponder 才能接收键盘输入
-final class ActivatingTextField: NSTextField {
-    override func mouseDown(with event: NSEvent) {
-        NSApp.activate(ignoringOtherApps: true)
-        window?.makeKey()
-        window?.makeFirstResponder(self)
-        super.mouseDown(with: event)
-    }
+/// 自动出现的入口不取焦点，用户展开后才能用键盘操作面板。
+private final class SelectionKeyPanel: NSPanel {
+    var acceptsKeyboard = false
+    override var canBecomeKey: Bool { acceptsKeyboard }
+    var dismiss: (() -> Void)?
+    override func cancelOperation(_ sender: Any?) { dismiss?() }
 }
 
 @MainActor
-final class SelectionAIPanel: NSObject {
+final class SelectionAIPanel: NSObject, ObservableObject {
+    enum Phase { case launcher, menu, working, review, unavailable }
+
     static let shared = SelectionAIPanel()
+    private let notes: NotesBridge
+    private let request: SelectionAIRequest
+    private let formatTitles: () -> [String]
+    private let defaults: UserDefaults
+    private var panel: SelectionKeyPanel?
+    private var anchor: TextSelectionAnchor?
+    private(set) var launcherExcerpt: InputFieldSelection?
+    private var hostInputMonitor: Any?
+    private var waitingForSourceGesture = false
+    private var dismissedSource: (pid: pid_t, window: AXUIElement?, inputCount: UInt64)?
+    private var placement = NSRect.zero
+    private var returnApplication: NSRunningApplication?
+    private var sessionID = UUID()
+    private(set) var action: SelectionQuickAction?
+    private(set) var formats: [NotesFormatItem] = []
+    @Published private(set) var phase: Phase = .launcher
+    @Published private(set) var status = ""
+    @Published private(set) var writing = false
+    @Published private(set) var staleSelection = false
+    @Published var showingOriginal = false
+    @Published var customInstruction = ""
 
-    private enum Mode { case hidden, menu, working, result }
-
-    private var panel: NSPanel?
-    private var mode: Mode = .hidden
-    private let request = SelectionAIRequest()
-    private var snapshot: NotesBridge.SelectionSnapshot? { request.snapshot }
-    private var resultText: String { request.resultText }
-
-    override init() {
+    init(request: SelectionAIRequest? = nil, notes: NotesBridge = .shared, defaults: UserDefaults = .standard,
+         formatTitles: (() -> [String])? = nil) {
+        self.request = request ?? SelectionAIRequest()
+        self.notes = notes
+        self.defaults = defaults
+        self.formatTitles = formatTitles ?? notes.supportedFormatTitles
         super.init()
-        request.onChange = { [weak self] in self?.requestDidChange() }
+        self.request.onChange = { [weak self] in self?.requestDidChange() }
     }
 
-    // 菜单态控件
-    private var actionsRow: NSStackView?
-    private var customRow: NSStackView?
-    private var formatRows: [NSStackView] = []
-    private var customField: NSTextField?
+    var panelIsKey: Bool { panel?.isKeyWindow == true }
+    var isServiceSession: Bool {
+        if case .service = request.selection { return true }
+        return false
+    }
+    var isInputSession: Bool {
+        if case .input = anchor?.source { return true }
+        return false
+    }
+    var sourceName: String? {
+        switch request.selection {
+        case .notes: return "Notes"
+        case .input(let field): return field.host.application.localizedName ?? "输入框"
+        case .service: return "服务选区"
+        case nil: return nil
+        }
+    }
+    var hasOpenedSelection: Bool { anchor != nil && phase != .launcher }
+    var containsPointer: Bool { panel?.isVisible == true && panel?.frame.contains(NSEvent.mouseLocation) == true }
+    func isObservingNewSelection(_ signature: String?, candidate: TextSelectionAnchor?) -> Bool {
+        guard let signature, signature != anchor?.signature else { return false }
+        // Chromium can republish a selection on a read-only ancestor when
+        // the menu takes focus, including selections made in a chat composer.
+        if waitingForSourceGesture, case .input(let original) = request.selection,
+           case .input(let next) = candidate?.source,
+           next.application.processIdentifier == original.host.application.processIdentifier,
+           CFEqual(next.window, original.host.window),
+           original.fieldValue == nil || !next.editable { return false }
+        return true
+    }
+    var original: String { request.selection?.text ?? "" }
+    var result: String { request.resultText }
+    var needsConfiguration: Bool { request.needsConfiguration }
+    var hasNotesTarget: Bool { request.snapshot != nil }
+    var hasReplacementTarget: Bool {
+        if case .input(let selection) = request.selection { return selection.fieldValue != nil && SelectionScope.allowsGlobalSelection(in: defaults) }
+        return hasNotesTarget
+    }
+    var canWrite: Bool {
+        phase == .review && hasReplacementTarget && !staleSelection && !showingOriginal && !writing && !result.isEmpty
+    }
 
-    // 结果态控件
-    private var resultView: NSTextView?
-    private var resultButtons: NSStackView?
-    private var statusLabel: NSTextField?
-    private var spinner: NSProgressIndicator?
-    private var replaceButton: NSButton?
-    private var appendButton: NSButton?
-    private var copyButton: NSButton?
-    private var retryButton: NSButton?
-    private var closeButton: NSButton?
-    private var lastInstruction: (text: String, name: String)?
-    private(set) var isRetainingResult = false
-    private var writing = false
-    private var expandedFormats = false
-    private var moreFormatsButton: NSButton?
+    func showLauncher(at anchor: TextSelectionAnchor, onNewDrag: @escaping () -> Void = {}) {
+        if case .input = anchor.source, !SelectionScope.allowsGlobalSelection(in: defaults) { return }
+        resetSession()
+        self.anchor = anchor
+        placement = Self.screenRect(for: anchor.bounds)
+        if case .input = anchor.source {
+            launcherExcerpt = InputFieldBridge.launcherExcerpt(anchor)
+            // AppKit delivers the panel's own click locally. Only a new host
+            // interaction ends the pending excerpt; pointer travel and mouse-up do not.
+            hostInputMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown, .otherMouseDown, .keyDown, .scrollWheel]) { [weak self] event in
+                guard let self else { return }
+                if event.type == .leftMouseDown && self.containsPointer { return }
+                if self.phase != .launcher {
+                    if self.waitingForSourceGesture,
+                       event.type == .leftMouseDown || event.type == .keyDown,
+                       case .input(let original) = self.request.selection,
+                       NSWorkspace.shared.frontmostApplication?.processIdentifier == original.host.application.processIdentifier {
+                        self.waitingForSourceGesture = false
+                    }
+                    return
+                }
+                if event.type == .scrollWheel && !event.momentumPhase.isEmpty { return }
+                self.hide()
+                if event.type == .leftMouseDown { onNewDrag() }
+            }
+        }
+        present(.launcher)
+    }
 
-    var isVisible: Bool { panel?.isVisible ?? false }
+    @objc func openTools() {
+        guard let anchor else { return }
+        let selection: WritingSelection
+        switch anchor.source {
+        case .notes:
+            guard let snapshot = notes.readSelectionSnapshot(allowInactiveNotes: true),
+                  anchor.matches(snapshot.element, snapshot.range) else {
+                status = notes.accessIssue?.message ?? "无法确认这处选区，请回到 Notes 正文重新选择。"
+                present(.unavailable, focus: true)
+                return
+            }
+            selection = .notes(snapshot)
+        case .input:
+            guard SelectionScope.allowsGlobalSelection(in: defaults) else { hide(); return }
+            guard let field = InputFieldBridge.openSelection(anchor, excerpt: launcherExcerpt) else {
+                status = "无法读取原选区，请回到原应用重新选择文字。"
+                present(.unavailable, focus: true)
+                return
+            }
+            selection = .input(field)
+        }
+        guard !selection.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            status = "选区中只有空白，请选择要处理的文字。"
+            present(.unavailable, focus: true)
+            return
+        }
+        request.select(selection)
+        if case .input = selection { waitingForSourceGesture = true }
+        if case .notes = selection { formats = NotesFormatButton.items(presenting: formatTitles()) }
+        status = ""
+        present(.menu, focus: true)
+    }
 
-    /// 面板持有键盘焦点（用户正在输入指令）：轮询暂时挂起，避免因 Notes 不在前台而收起面板
-    var panelIsKey: Bool { panel?.isKeyWindow ?? false }
+    /// A Services pasteboard carries the input text, without a durable document or range identity.
+    @objc(openSelectionWritingTools:userData:error:)
+    func openSelectionWritingTools(_ pasteboard: NSPasteboard, userData: String?,
+                                   error: AutoreleasingUnsafeMutablePointer<NSString?>?) {
+        guard let text = pasteboard.string(forType: .string),
+              !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            error?.pointee = "请先选择要处理的文字。"
+            return
+        }
+        error?.pointee = nil
+        resetSession()
+        request.select(.service(text))
+        placement = Self.screenRect(for: nil)
+        present(.menu, focus: true)
+    }
 
-    func hide() {
-        let heldFocus = panelIsKey
+    private func resetSession() {
+        if let hostInputMonitor { NSEvent.removeMonitor(hostInputMonitor) }
+        hostInputMonitor = nil
+        launcherExcerpt = nil
+        waitingForSourceGesture = false
+        sessionID = UUID()
         request.cancel()
-        spinner?.stopAnimation(nil)
-        panel?.orderOut(nil)
-        mode = .hidden
-        isRetainingResult = false
+        anchor = nil
+        returnApplication = nil
+        formats = []
+        action = nil
+        status = ""
         writing = false
-        if heldFocus { yieldToNotes {} }
+        staleSelection = false
+        showingOriginal = false
+        customInstruction = ""
     }
 
-    @discardableResult
-    func cancelIfTargetChanged() -> Bool {
-        if isRetainingResult { return false }
-        guard let snapshot, !panelIsKey else { return false }
-        guard !NotesBridge.shared.isCurrent(snapshot) else { return false }
-        hide()
+    func openFromHostShortcut() -> Bool {
+        guard phase == .launcher, panel?.isVisible == true, SelectionScope.isEnabled(in: defaults),
+              let anchor, let front = NSWorkspace.shared.frontmostApplication else { return false }
+        let app = AXUIElementCreateApplication(front.processIdentifier)
+        AXUIElementSetMessagingTimeout(app, 0.08)
+        switch anchor.source {
+        case .notes:
+            guard front.bundleIdentifier == NotesBridge.notesBundleID else { return false }
+        case .input(let host):
+            guard SelectionScope.allowsGlobalSelection(in: defaults), front.processIdentifier == host.application.processIdentifier,
+                  let window = AXText.element(app, kAXFocusedWindowAttribute), CFEqual(window, host.window) else { return false }
+        }
+        if let field = AXText.element(app, kAXFocusedUIElementAttribute),
+           AXText.isProtected(field) || AXText.isComposing(field) { return false }
+        let session = sessionID
+        // Build and focus the same menu as a click, outside the system event tap.
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.sessionID == session, self.phase == .launcher,
+                  NSWorkspace.shared.frontmostApplication?.processIdentifier == front.processIdentifier else { return }
+            self.openTools()
+        }
         return true
     }
 
-    /// 面板输入期间本应用是前台；交给 Notes 的动作前先把前台还给 Notes
-    private func yieldToNotes(then action: @escaping @MainActor () -> Void = {}) {
-        if NSWorkspace.shared.frontmostApplication?.bundleIdentifier == NotesBridge.notesBundleID {
-            action()
-            return
+    private static var hostInputCount: UInt64 {
+        [.leftMouseDown, .rightMouseDown, .keyDown].reduce(UInt64(0)) {
+            $0 + UInt64(CGEventSource.counterForEventType(.combinedSessionState, eventType: $1))
         }
-        guard NSWorkspace.shared.frontmostApplication?.processIdentifier == ProcessInfo.processInfo.processIdentifier else {
-            return
+    }
+
+    // Closing a tool leaves the source selection intact. Wait for the next
+    // gesture before offering it again; retain no excerpt while dismissed.
+    func dismiss() {
+        var source: (pid_t, AXUIElement?, UInt64)?
+        if let anchor {
+            switch anchor.source {
+            case .input(let host): source = (host.application.processIdentifier, host.window, Self.hostInputCount)
+            case .notes:
+                var pid: pid_t = 0
+                if AXUIElementGetPid(anchor.element, &pid) == .success { source = (pid, nil, Self.hostInputCount) }
+            }
         }
-        NSWorkspace.shared.runningApplications.first(where: { $0.bundleIdentifier == NotesBridge.notesBundleID })?.activate()
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { action() }
+        hide()
+        dismissedSource = source
     }
 
-    // MARK: 弹出菜单
-
-    func showMenu(for snap: NotesBridge.SelectionSnapshot) {
-        isRetainingResult = false
-        writing = false
-        request.select(snap)
-        let p = ensurePanel()
-        switchTo(.menu)
-        let h = menuHeight()
-        layout(size: NSSize(width: 380, height: h))
-        place(below: snap.bounds, size: NSSize(width: 380, height: h))
-        p.orderFront(nil)
+    func isWaitingAfterDismissal(in front: NSRunningApplication?, candidate: TextSelectionAnchor?) -> Bool {
+        guard let dismissed = dismissedSource else { return false }
+        if front?.processIdentifier == ProcessInfo.processInfo.processIdentifier { return true }
+        let sameWindow: Bool
+        if case .input(let host) = candidate?.source, let window = dismissed.window {
+            sameWindow = CFEqual(host.window, window)
+        } else { sameWindow = true }
+        if sameWindow && front?.processIdentifier == dismissed.pid && Self.hostInputCount == dismissed.inputCount { return true }
+        dismissedSource = nil
+        return false
     }
 
-    /// 分组小标签（左列，与「格式」标签同款式）
-    private static func sectionTag(_ text: String) -> NSTextField {
-        let tag = NSTextField(labelWithString: text)
-        tag.font = .systemFont(ofSize: 10, weight: .semibold)
-        tag.textColor = .tertiaryLabelColor
-        tag.widthAnchor.constraint(equalToConstant: 38).isActive = true
-        return tag
+    func hide() {
+        dismissedSource = nil
+        let restore = panelIsKey ? returnApplication : nil
+        resetSession()
+        panel?.orderOut(nil)
+        panel?.contentView = nil
+        if let restore, !restore.isTerminated,
+           NSWorkspace.shared.frontmostApplication?.processIdentifier == ProcessInfo.processInfo.processIdentifier {
+            restore.activate()
+        }
     }
 
-    /// 菜单态面板高度：AI 行 + 自定义行 + 格式行数 × 27 + 底部余量
-    private func menuHeight() -> CGFloat {
-        122 + CGFloat(expandedFormats ? formatRows.count : min(1, formatRows.count)) * 27
+    private func markStale() {
+        staleSelection = true
+        status = "原选区已变化，仍可复制结果。"
     }
 
-    // MARK: 加工执行
+    func run(_ action: SelectionQuickAction) {
+        guard !writing, request.selection != nil else { return }
+        if isInputSession && !SelectionScope.allowsGlobalSelection(in: defaults) { hide(); return }
+        self.action = action
+        status = ""
+        showingOriginal = false
+        present(.working)
+        request.run(instruction: action.instruction)
+    }
 
-    private func run(instruction: String, actionName: String) {
-        guard let snap = snapshot else { return }
-        lastInstruction = (instruction, actionName)
-        isRetainingResult = false
-        switchTo(.working)
-        statusLabel?.stringValue = "「\(actionName)」加工中…（选中 \(snap.text.count) 字）"
-        spinner?.startAnimation(nil)
-        request.run(instruction: instruction)
+    func runCustom() {
+        let instruction = customInstruction.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !instruction.isEmpty else { return }
+        run(.init(name: "自定义", group: .edit, instruction: instruction))
+    }
+
+    func chooseAnotherTool() {
+        guard !writing, let selection = request.selection else { return }
+        request.select(selection)
+        action = nil
+        status = ""
+        showingOriginal = false
+        present(.menu)
     }
 
     private func requestDidChange() {
-        guard !request.busy, let snapshot else { return }
-        guard panelIsKey || NotesBridge.shared.isCurrent(snapshot) else { hide(); return }
-        spinner?.stopAnimation(nil)
-        switchTo(.result)
-        layout(size: NSSize(width: 440, height: 236))
-        place(below: snapshot.bounds, size: NSSize(width: 440, height: 236))
-        if let error = request.lastError { statusLabel?.stringValue = "❌ \(error)" }
+        guard !request.busy, request.selection != nil else { return }
+        if isInputSession && !SelectionScope.allowsGlobalSelection(in: defaults) { hide(); return }
+        status = request.lastError.map { result.isEmpty ? $0 : "已保留上次结果。 " + $0 } ?? ""
+        if hasReplacementTarget && !result.isEmpty && request.lastError == nil {
+            switch request.selection {
+            case .notes(let target): staleSelection = notes.readNotesSnapshot().map(target.matches) != true
+            case .input(let target): staleSelection = !InputFieldBridge.isCurrent(target)
+            default: break
+            }
+            if staleSelection { markStale() }
+        }
+        present(.review)
     }
 
-    // MARK: 结果动作
-
-    private func replaceSelection() {
-        writeResult(append: false)
+    func copyPreview(to pb: NSPasteboard = .general) {
+        let text = showingOriginal ? original : result
+        guard phase == .review, !writing, !text.isEmpty else { return }
+        pb.clearContents()
+        status = pb.setString(text, forType: .string) ? (showingOriginal ? "已复制原文" : "已复制结果") : "复制失败，请重试。"
+        present(.review)
     }
 
-    private func appendAfter() {
-        writeResult(append: true)
-    }
-
-    private func writeResult(append: Bool) {
-        guard let snap = snapshot, !resultText.isEmpty, !writing else { return }
+    func writeResult(append: Bool) {
+        guard canWrite else { return }
         writing = true
-        isRetainingResult = true
-        updateResultButtons()
-        let range = append ? CFRange(location: snap.range.location + snap.range.length, length: 0) : snap.range
+        status = ""
+        if case .input(let target) = request.selection {
+            let session = sessionID
+            let text = result
+            panel?.orderOut(nil)
+            Task { @MainActor in
+                let error = await InputFieldBridge.write(target, text: text, append: append) {
+                    self.sessionID == session && self.writing && SelectionScope.allowsGlobalSelection(in: self.defaults)
+                }
+                guard self.sessionID == session else { return }
+                self.writing = false
+                guard let error else { self.hide(); return }
+                self.staleSelection = true
+                self.status = error + " 仍可复制结果。"
+                self.present(.review)
+            }
+            return
+        }
         request.writeResult(using: { target, text, valid, completed in
-            NotesBridge.shared.writeWhenNotesActive(in: target, text: text, range: range,
-                                                    html: MarkdownDocument.html(text),
-                                                    isOperationValid: valid, completion: completed)
+            let end = target.range.location + target.range.length
+            let range = append ? CFRange(location: end, length: 0) : target.range
+            self.notes.writeWhenNotesActive(in: target, text: text, range: range, html: MarkdownDocument.html(text),
+                                            isOperationValid: valid, completion: completed)
         }) { [weak self] error in
             guard let self else { return }
             self.writing = false
-            if let error {
-                self.statusLabel?.stringValue = "❌ \(error) 结果已保留，可重试或复制。"
-                self.updateResultButtons()
-                self.panel?.orderFront(nil)
+            guard let error else { self.hide(); return }
+            if let snapshot = self.request.snapshot, self.notes.readNotesSnapshot().map(snapshot.matches) != true {
+                self.markStale()
             } else {
-                self.hide()
+                self.status = error + " 可重试写入或复制结果。"
             }
+            self.present(.review)
         }
     }
 
-    private func copyResult() {
-        let pb = NSPasteboard.general
-        pb.clearContents()
-        pb.setString(resultText, forType: .string)
-        statusLabel?.stringValue = "✅ 已复制到剪贴板"
+    func applyFormat(_ item: NotesFormatItem) {
+        guard let target = request.snapshot, phase == .menu else { return }
+        let session = sessionID
+        notes.withNotesTargetActive(in: target, isOperationValid: {
+            self.sessionID == session && self.phase == .menu && self.request.snapshot?.matches(target) == true
+        }) { error in
+            guard self.sessionID == session, self.phase == .menu, self.request.snapshot?.matches(target) == true else { return }
+            self.status = error ?? self.notes.applyFormat(item.menuTitle) ?? ""
+            self.present(.menu)
+        }
     }
 
-    // MARK: 面板构建
+    // A key panel can receive Escape directly. For the passive chip in Notes the
+    // existing Notes keyboard listener can dismiss it without activating the app.
+    func dismissFromHost() -> Bool {
+        guard panel?.isVisible == true, let anchor, !SlashSuggestPanel.isIMEComposing else { return false }
+        switch anchor.source {
+        case .notes: guard NotesBridge.isFrontmostNotes() else { return false }
+        case .input(let host):
+            guard NSWorkspace.shared.frontmostApplication?.processIdentifier == host.application.processIdentifier else { return false }
+        }
+        dismiss()
+        return true
+    }
 
-    private func ensurePanel() -> NSPanel {
-        if let p = panel { return p }
-        let p = SelectionKeyPanel(contentRect: NSRect(x: 0, y: 0, width: 380, height: 92),
-                        styleMask: [.borderless, .nonactivatingPanel],
-                        backing: .buffered, defer: false)
-        p.isOpaque = false
-        p.backgroundColor = .clear
-        p.hasShadow = true
-        p.level = .floating
-        p.isReleasedWhenClosed = false
-        p.hidesOnDeactivate = false
-        p.canHide = false
-        p.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+    private func present(_ phase: Phase, focus: Bool = false) {
+        let pendingSize = phase == .working && panel?.isVisible == true ? panel?.frame.size : nil
+        if phase != .launcher { launcherExcerpt = nil }
+        self.phase = phase
+        let window: SelectionKeyPanel
+        if let panel {
+            window = panel
+        } else {
+            window = SelectionKeyPanel(contentRect: .zero, styleMask: [.borderless, .nonactivatingPanel],
+                                       backing: .buffered, defer: false)
+            window.title = "NotesCopilot 写作工具"
+            window.backgroundColor = .clear
+            window.isOpaque = false
+            window.hasShadow = true
+            window.level = .floating
+            window.hidesOnDeactivate = false
+            window.isReleasedWhenClosed = false
+            window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+            window.dismiss = { [weak self] in self?.dismiss() }
+            panel = window
+        }
 
-        let effect = NSVisualEffectView()
-        effect.material = .popover
-        effect.blendingMode = .behindWindow
-        effect.state = .active
-        effect.wantsLayer = true
-        effect.layer?.cornerRadius = 10
-        p.contentView = effect
-
-        let container = NSStackView()
-        container.orientation = .vertical
-        container.alignment = .leading
-        container.spacing = 6
-        container.edgeInsets = NSEdgeInsets(top: 8, left: 10, bottom: 8, right: 10)
-        container.translatesAutoresizingMaskIntoConstraints = false
-        effect.addSubview(container)
-        NSLayoutConstraint.activate([
-            container.leadingAnchor.constraint(equalTo: effect.leadingAnchor, constant: 4),
-            container.trailingAnchor.constraint(equalTo: effect.trailingAnchor, constant: -4),
-            container.topAnchor.constraint(equalTo: effect.topAnchor, constant: 4),
-            container.bottomAnchor.constraint(equalTo: effect.bottomAnchor, constant: -4),
-        ])
-
-        // 菜单态：分组行（Magpie 风格，左侧分类小标签 + 内容）
-        // 行 1「AI」：快捷加工动作
-        let row = NSStackView()
-        row.orientation = .horizontal
-        row.spacing = 6
-        row.addArrangedSubview(Self.sectionTag("AI"))
-        for a in selectionQuickActions {
-            let b = NSButton(title: a.name, target: nil, action: nil)
-            b.bezelStyle = .rounded
-            b.controlSize = .small
-            b.font = .systemFont(ofSize: 12, weight: .medium)
-            b.onAction = { [weak self] _ in
-                self?.run(instruction: a.instruction, actionName: a.name)
+        window.acceptsKeyboard = phase != .launcher
+        let content: NSView
+        let size: NSSize
+        if phase == .launcher {
+            content = SelectionLauncherButton(target: self, action: #selector(openTools))
+            size = SelectionLauncherButton.size
+        } else {
+            let host = NSHostingView(rootView: SelectionToolsView(model: self, pendingSize: pendingSize))
+            content = host
+            size = host.fittingSize
+        }
+        window.setContentSize(size)
+        window.contentView = content
+        if let screen = NSScreen.screens.first(where: { $0.frame.contains(NSPoint(x: placement.midX, y: placement.midY)) })
+            ?? NSScreen.main {
+            window.setFrameOrigin(Self.origin(for: size, near: placement, within: screen.visibleFrame))
+        }
+        if focus {
+            if let front = NSWorkspace.shared.frontmostApplication,
+               front.processIdentifier != ProcessInfo.processInfo.processIdentifier {
+                returnApplication = front
             }
-            row.addArrangedSubview(b)
-        }
-        row.addArrangedSubview(NSView()) // 弹性占位
-        container.addArrangedSubview(row)
-        actionsRow = row
-
-        // 行 2「自定义」：输入任意指令，⏎ 用 AI 处理选中文本
-        let crow = NSStackView()
-        crow.orientation = .horizontal
-        crow.spacing = 6
-        crow.addArrangedSubview(Self.sectionTag("自定义"))
-        let field = ActivatingTextField()
-        field.placeholderString = "输入指令，⏎ 执行（如：改写成邮件语气）"
-        field.bezelStyle = .roundedBezel
-        field.controlSize = .small
-        field.font = .systemFont(ofSize: 12)
-        field.target = self
-        field.action = #selector(customFieldEnter)
-        field.widthAnchor.constraint(equalToConstant: 286).isActive = true
-        crow.addArrangedSubview(field)
-        container.addArrangedSubview(crow)
-        customRow = crow
-        customField = field
-
-        // 菜单态：Notes 原生格式按钮（标题/列表/块引用…，动态枚举「格式」菜单，仅显示当前已支持的项）
-        let fmtItems = NotesFormatButton.items(presenting: NotesBridge.shared.supportedFormatTitles())
-        for (i, rowItems) in NotesFormatButton.splitRows(fmtItems, maxPerRow: 4).enumerated() {
-            let frow = NSStackView()
-            frow.orientation = .horizontal
-            frow.spacing = 5
-            if i == 0 {
-                let tag = NSTextField(labelWithString: "格式")
-                tag.font = .systemFont(ofSize: 10, weight: .semibold)
-                tag.textColor = .tertiaryLabelColor
-                frow.addArrangedSubview(tag)
-            }
-            for it in rowItems {
-                let b = NSButton(title: it.label, target: nil, action: nil)
-                b.bezelStyle = .rounded
-                b.controlSize = .small
-                b.font = .systemFont(ofSize: 11, weight: .regular)
-                b.onAction = { [weak self] _ in self?.applyFormat(it.menuTitle) }
-                frow.addArrangedSubview(b)
-            }
-            container.addArrangedSubview(frow)
-            formatRows.append(frow)
-        }
-        if formatRows.count > 1, let firstRow = formatRows.first {
-            let more = NSButton(title: "更多格式 ▾", target: nil, action: nil)
-            more.controlSize = .small
-            more.onAction = { [weak self] _ in
-                guard let self else { return }
-                self.expandedFormats.toggle()
-                self.moreFormatsButton?.title = self.expandedFormats ? "收起 ▴" : "更多格式 ▾"
-                self.switchTo(.menu)
-                self.layout(size: NSSize(width: 380, height: self.menuHeight()))
-            }
-            firstRow.addArrangedSubview(more)
-            moreFormatsButton = more
-        }
-
-        // 结果/加载态：状态行 + 结果文本 + 按钮行
-        let status = NSTextField(labelWithString: "")
-        status.font = .systemFont(ofSize: 11)
-        status.textColor = .secondaryLabelColor
-        container.addArrangedSubview(status)
-        statusLabel = status
-
-        let spin = NSProgressIndicator()
-        spin.controlSize = .small
-        spin.style = .spinning
-        spin.isDisplayedWhenStopped = false
-        container.addArrangedSubview(spin)
-        spinner = spin
-
-        let scroll = NSScrollView()
-        scroll.hasVerticalScroller = true
-        scroll.drawsBackground = false
-        let tv = NSTextView()
-        tv.isEditable = false
-        tv.isSelectable = true
-        tv.font = .systemFont(ofSize: 12)
-        tv.isRichText = false
-        tv.autoresizingMask = [.width]
-        tv.textContainerInset = NSSize(width: 4, height: 4)
-        scroll.documentView = tv
-        scroll.translatesAutoresizingMaskIntoConstraints = false
-        container.addArrangedSubview(scroll)
-        resultView = tv
-
-        let btns = NSStackView()
-        btns.orientation = .horizontal
-        btns.spacing = 8
-        let replace = NSButton(title: "替换选区", target: nil, action: nil)
-        replace.keyEquivalent = "\r"
-        replace.onAction = { [weak self] _ in self?.replaceSelection() }
-        replaceButton = replace
-        let append = NSButton(title: "追加到后", target: nil, action: nil)
-        append.onAction = { [weak self] _ in self?.appendAfter() }
-        appendButton = append
-        let copy = NSButton(title: "复制", target: nil, action: nil)
-        copy.onAction = { [weak self] _ in self?.copyResult() }
-        copyButton = copy
-        let retry = NSButton(title: "重试", target: nil, action: nil)
-        retry.controlSize = .small
-        retry.onAction = { [weak self] _ in
-            guard let self, let instruction = self.lastInstruction else { return }
-            self.run(instruction: instruction.text, actionName: instruction.name)
-        }
-        retryButton = retry
-        let close = NSButton(title: "✕", target: nil, action: nil)
-        close.bezelStyle = .texturedRounded
-        close.controlSize = .small
-        close.onAction = { [weak self] _ in self?.hide() }
-        close.keyEquivalent = "\u{1b}"
-        close.toolTip = "关闭并取消当前加工"
-        closeButton = close
-        [replace, append, copy, retry, NSView()].forEach { btns.addArrangedSubview($0) }
-        btns.addArrangedSubview(close)
-        container.addArrangedSubview(btns)
-        resultButtons = btns
-
-        panel = p
-        switchTo(.menu)
-        return p
-    }
-
-    @objc private func customFieldEnter() {
-        let text = (customField?.stringValue ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !text.isEmpty else { return }
-        customField?.stringValue = ""
-        run(instruction: text, actionName: "自定义")
-    }
-
-    /// 应用 Notes 原生段落格式到当前选区：面板保持展开，方便连续叠加格式
-    private func applyFormat(_ menuTitle: String) {
-        guard let snapshot else { return }
-        yieldToNotes {
-            guard NotesBridge.shared.isCurrent(snapshot) else { self.hide(); return }
-            if let err = NotesBridge.shared.applyFormat(menuTitle) {
-                NCLog.log("格式「\(menuTitle)」失败：\(err)")
-                self.statusLabel?.stringValue = "❌ 格式「\(menuTitle)」：\(err)"
-                self.statusLabel?.isHidden = false
-            } else {
-                NCLog.log("格式「\(menuTitle)」已应用到选区")
-            }
+            // Keep the host's field editor and selection active while reviewing external text.
+            if !isInputSession { NSApp.activate(ignoringOtherApps: true) }
+            window.makeKeyAndOrderFront(nil)
+        } else {
+            window.orderFront(nil)
         }
     }
 
-    /// 状态切换：显示/隐藏对应控件组
-    private func switchTo(_ m: Mode) {
-        mode = m
-        let menuMode = m == .menu
-        actionsRow?.isHidden = !menuMode
-        customRow?.isHidden = !menuMode
-        for (i, frow) in formatRows.enumerated() { frow.isHidden = !menuMode || (!expandedFormats && i > 0) }
-        statusLabel?.isHidden = (m == .menu)
-        spinner?.isHidden = (m != .working)
-        resultView?.enclosingScrollView?.isHidden = (m != .result)
-        resultButtons?.isHidden = (m != .result && m != .working)
-        closeButton?.title = m == .working ? "取消" : "✕"
-        updateResultButtons()
-        if m == .menu {
-            statusLabel?.stringValue = ""
+    private static func screenRect(for quartz: CGRect?) -> NSRect {
+        if let quartz, !quartz.isEmpty, let primary = NSScreen.screens.first {
+            return CGRect(x: quartz.minX, y: primary.frame.maxY - quartz.maxY, width: quartz.width, height: quartz.height)
         }
-        if m == .result {
-            resultView?.string = resultText
-            statusLabel?.stringValue = "AI 已加工 \(resultText.count) 字，可替换原选区、追加到选区后，或复制："
-        }
+        return CGRect(origin: NSEvent.mouseLocation, size: .zero)
     }
 
-    private func updateResultButtons() {
-        let available = mode == .result && !resultText.isEmpty && !writing
-        replaceButton?.isEnabled = available
-        appendButton?.isEnabled = available
-        copyButton?.isEnabled = available
-        retryButton?.isHidden = mode != .result
-        retryButton?.isEnabled = !writing && lastInstruction != nil
+    static func origin(for size: CGSize, near anchor: CGRect, within visible: CGRect) -> CGPoint {
+        let bounds = visible.insetBy(dx: 4, dy: 4)
+        let below = anchor.minY - size.height - 4
+        let y = below >= bounds.minY ? below : anchor.maxY + 4
+        return CGPoint(x: max(bounds.minX, min(anchor.minX, bounds.maxX - size.width)),
+                       y: max(bounds.minY, min(y, bounds.maxY - size.height)))
     }
-
-    private func layout(size: NSSize) {
-        panel?.setContentSize(size)
-        // 让 stack 自适应新尺寸
-        if let effect = panel?.contentView,
-           let container = effect.subviews.first as? NSStackView {
-            container.setFrameSize(size)
-        }
-    }
-
-    /// 选区矩形（Quartz 坐标）下方放置；参考 SlashSuggestPanel.place 的换算与夹取
-    private func place(below qRect: CGRect, size: CGSize) {
-        guard let panel else { return }
-        var targetScreen = NSScreen.main ?? NSScreen.screens[0]
-        if let matched = NSScreen.screens.first(where: { quartzFrame(of: $0).contains(CGPoint(x: qRect.midX, y: qRect.minY)) }) {
-            targetScreen = matched
-        }
-        let screenQ = quartzFrame(of: targetScreen)
-        let screenA = targetScreen.frame
-        let localX = qRect.minX - screenQ.minX
-        let localYTop = qRect.maxY - screenQ.minY
-        var x = screenA.minX + localX
-        var y = screenA.minY + (screenA.height - localYTop) - size.height
-        // 屏幕内夹取
-        if x < screenA.minX + 4 { x = screenA.minX + 4 }
-        if x + size.width > screenA.maxX - 4 { x = screenA.maxX - size.width - 4 }
-        if y < screenA.minY + 4 {
-            // 下方放不下：选区上方
-            y = screenA.minY + (screenA.height - localYTop) + qRect.height
-        }
-        if y + size.height > screenA.maxY - 4 { y = screenA.maxY - size.height - 4 }
-        panel.setFrameOrigin(CGPoint(x: x, y: y))
-    }
-
-    /// NSScreen Quartz 全局 frame（左上原点），同 SlashSuggestPanel.quartzFrame
-    private func quartzFrame(of s: NSScreen) -> CGRect {
-        let f = s.frame
-        let mainH = NSScreen.screens.first { $0.frame.minX == 0 && $0.frame.minY == 0 }?.frame.height
-            ?? NSScreen.screens.map { $0.frame.height }.max() ?? f.height
-        let qy = -(f.minY + f.height - mainH)
-        return CGRect(x: f.minX, y: qy, width: f.width, height: f.height)
-    }
-}
-
-// MARK: - NSButton 闭包 action（AppKit 无 onAction 原生支持，做一个小扩展）
-
-private var onActionKey: UInt8 = 0
-extension NSButton {
-    var onAction: ((NSButton) -> Void)? {
-        get { objc_getAssociatedObject(self, &onActionKey) as? (NSButton) -> Void }
-        set {
-            objc_setAssociatedObject(self, &onActionKey, newValue, .OBJC_ASSOCIATION_RETAIN_NONATOMIC)
-            target = self
-            action = newValue == nil ? nil : #selector(handleOnAction)
-        }
-    }
-    @objc private func handleOnAction() { onAction?(self) }
 }

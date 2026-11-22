@@ -871,7 +871,7 @@ enum SettingsPage: String, CaseIterable, Identifiable {
         case .prompt: return "AI 的角色设定，随每次请求发送"
         case .markdown: return "在 Notes 里键入 # / ## / [] / > / ``` / - / * / 1. + 空格 自动套格式"
         case .templates: return "在提示词输入框键入 / 即可通过斜杠命令插入"
-        case .expansion: return "Notes AI 交互需辅助功能与 Notes 自动化；键盘导航与关键词扩展使用辅助功能授权"
+        case .expansion: return "选择写作工具出现的位置，管理 Notes 斜杠命令与关键词扩展"
         case .general: return "版本更新、登录启动、权限检查与连接诊断"
         }
     }
@@ -930,8 +930,8 @@ struct SettingsView: View {
     @State private var kwEnabled = UserDefaults.standard.bool(forKey: "nc.kw.enabled")
     @State private var slashGlobal = UserDefaults.standard.object(forKey: "nc.slash.global") == nil
         ? true : UserDefaults.standard.bool(forKey: "nc.slash.global")
-    @State private var selAIEnabled = UserDefaults.standard.object(forKey: "nc.selai.enabled") == nil
-        ? true : UserDefaults.standard.bool(forKey: "nc.selai.enabled")
+    @State private var selAIEnabled = SelectionScope.isEnabled()
+    @AppStorage(SelectionScope.defaultsKey) private var selectionScope = SelectionScope.notes
     @State private var newTplName = ""
     @State private var newTplContent = ""
     @State private var newTrigger = ""
@@ -1015,13 +1015,15 @@ struct SettingsView: View {
             KeywordListener.shared.restart()
         }
         .onChange(of: selAIEnabled) { on in
-            UserDefaults.standard.set(on, forKey: "nc.selai.enabled")
+            UserDefaults.standard.set(on, forKey: SelectionScope.enabledKey)
+            KeywordListener.shared.restart()
             if on {
                 SelectionWatcher.shared.startIfNeeded()
             } else {
                 SelectionWatcher.shared.stop()
             }
         }
+        .onChange(of: selectionScope) { _ in SelectionWatcher.shared.scopeDidChange() }
     }
 
     /// ── 左侧导航（Magpie NavigationView 自绘：选中项 accent 胶囊高亮）──
@@ -1796,15 +1798,22 @@ struct SettingsView: View {
 
     private var expansionPage: some View {
         VStack(alignment: .leading, spacing: 12) {
-            card("textformat.abc", "选中即 AI（悬浮快捷加工）") {
-                Toggle("在 Notes 选中文字后自动弹出快捷加工条", isOn: $selAIEnabled)
+            card("textformat.abc", "选区写作工具") {
+                Toggle("选中文字时显示写作工具", isOn: $selAIEnabled)
                     .toggleStyle(.switch)
                 if selAIEnabled {
-                    Text("选中文字并保持约 0.4 秒，选区下方弹出悬浮条：〔润色 · 总结 · 翻译 · 解释 · 精简〕或输入自定义指令回车。AI 完成后弹出结果卡，可「替换选区」（直接覆盖原文字）、「追加到后」（插到选区末尾之后）、「复制」或关闭。需要辅助功能与 Notes 自动化权限（用于确认笔记身份），无需输入监控；优先 AX 直写。")
+                    Picker("应用范围", selection: $selectionScope) {
+                        Text("仅 Notes").tag(SelectionScope.notes)
+                        Text("全局").tag(SelectionScope.global)
+                    }
+                    .pickerStyle(.segmented)
+                    Text(selectionScope == .global
+                         ? "在其他应用中选中文字即可显示工具。可以复制处理结果，在可编辑的输入框中还可替换或追加到选区末尾。"
+                         : "在 Notes 正文中选中文字后，可校对、润色或输入指令，审阅后可替换或追加。")
                         .font(.caption).foregroundColor(.secondary)
-                    Text("切换选区会自动重新弹出；取消选区面板自动消失。")
-                        .font(.caption2).foregroundColor(.secondary)
                 }
+                Text("自动显示需要辅助功能权限，Notes 写回还需 Notes 自动化权限。也可通过「服务 → 用 NotesCopilot 处理选中文本」手动打开工具。")
+                    .font(.caption).foregroundColor(.secondary)
             }
             card("slash.circle", "Notes 斜杠命令") {
                 Toggle("在 Notes 正文键入 / 显示命令菜单", isOn: $slashGlobal)

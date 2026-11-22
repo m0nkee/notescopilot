@@ -32,17 +32,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var hotkeyStatus: OSStatus?
     private var updateTimer: Timer?
     private var updateMenuItem: NSMenuItem?
+    private var regularFeaturesStarted = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         if startBackgroundServices { FrontmostTracker.shared.start() }
         buildStatusItem()
         buildPanel()
-        if startBackgroundServices {
-            registerHotkey()
-            KeywordListener.shared.startIfNeeded()
-            AXSlashWatcher.shared.startIfNeeded()
-            SelectionWatcher.shared.startIfNeeded()
-        }
+        if startBackgroundServices { registerHotkey() }
 
         NotificationCenter.default.addObserver(
             forName: .init("nc.openSettings"), object: nil, queue: .main
@@ -71,7 +67,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         NotificationCenter.default.addObserver(
             forName: .init("nc.storeDidReindex"), object: nil, queue: .main
         ) { [weak self] _ in MainActor.assumeIsolated { self?.refreshNotesTemplates() } }
-        if startBackgroundServices { retryNotesStore() }
 
         // accessory（LSUIElement）应用没有主菜单，⌘V/⌘C 的快捷键等价物会失效，
         // 导致设置窗口的 SecureField 无法粘贴——构建标准 mainMenu 修复
@@ -79,17 +74,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         AppUpdater.shared.onCheckCompleted = { [weak self] userInitiated in
             self?.presentUpdateResult(userInitiated: userInitiated)
         }
-        if startBackgroundServices {
-            Task { await AppUpdater.shared.checkIfNeeded() }
-            updateTimer = Timer.scheduledTimer(withTimeInterval: 60 * 60, repeats: true) { _ in
-                Task { @MainActor in await AppUpdater.shared.checkIfNeeded() }
+        NSApp.servicesProvider = SelectionAIPanel.shared
+        if notification.userInfo?[NSApplication.launchIsDefaultUserInfoKey] as? Bool ?? true {
+            if startBackgroundServices { NSUpdateDynamicServices() }
+            showPrimaryWindow()
+        } else if startBackgroundServices {
+            if SelectionScope.allowsGlobalSelection() {
+                KeywordListener.shared.startIfNeeded()
+                SelectionWatcher.shared.startIfNeeded()
+            }
+            // A Service can cold-launch the app with just a string. Start Notes integration
+            // when the user next enters Notes or opens a regular NotesCopilot window.
+            NSWorkspace.shared.notificationCenter.addObserver(
+                forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main
+            ) { [weak self] note in
+                let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication
+                if app?.bundleIdentifier == NotesBridge.notesBundleID {
+                    MainActor.assumeIsolated { self?.startRegularFeaturesIfNeeded() }
+                }
             }
         }
-
-        // 内置模板 seed（对齐 ProNotes _defaultTemplates；幂等，仅首次）
-        if startBackgroundServices { TemplateSeeder.ensureSeeded() }
-
-        showPrimaryWindow()
         recordStartupState("启动完成")
         // Status-bar window geometry settles after the launch callback returns.
         DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in
@@ -106,9 +110,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return false
     }
 
+    func applicationWillTerminate(_ notification: Notification) {
+        if startBackgroundServices { SelectionWatcher.shared.stop() }
+    }
+
     private func showPrimaryWindow() {
         if Config.baseURL.isEmpty { showSettings() }
         else { revealPanel(captureContext: false) }
+    }
+
+    private func startRegularFeaturesIfNeeded() {
+        guard startBackgroundServices, !regularFeaturesStarted else { return }
+        regularFeaturesStarted = true
+        KeywordListener.shared.startIfNeeded()
+        AXSlashWatcher.shared.startIfNeeded()
+        SelectionWatcher.shared.startIfNeeded()
+        TemplateSeeder.ensureSeeded()
+        retryNotesStore()
+        Task { await AppUpdater.shared.checkIfNeeded() }
+        updateTimer = Timer.scheduledTimer(withTimeInterval: 60 * 60, repeats: true) { _ in
+            Task { @MainActor in await AppUpdater.shared.checkIfNeeded() }
+        }
     }
 
     private func present(_ window: NSWindow) {
@@ -365,6 +387,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     /// 呼出面板（不隐藏）并抓取选中：全局斜杠命令与热键共用
     func revealPanel(captureContext: Bool = true) {
+        startRegularFeaturesIfNeeded()
         if captureContext && startBackgroundServices {
             let target = NotesBridge.shared.readNotesSnapshot()
             let context = target.flatMap { NotesBridge.context(in: $0) }
@@ -380,6 +403,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // MARK: 设置窗口
 
     @objc func showSettings() {
+        startRegularFeaturesIfNeeded()
         // The floating AI panel would otherwise cover the normal settings window.
         panel?.orderOut(nil)
         if settingsWindow == nil {
@@ -409,6 +433,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // MARK: 笔记库窗口（LiberatorLite）
 
     @objc func showLibrary() {
+        startRegularFeaturesIfNeeded()
         panel?.orderOut(nil)
         if notesStore == nil { retryNotesStore() }
         if libraryWindow == nil {

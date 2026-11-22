@@ -270,16 +270,26 @@ final class NotesBridge {
         }
     }
 
-    /// 选区签名（仅位置+长度，轮询去抖用）：Notes 前台且有非空选区时返回，否则 nil
+    private func selectedNotesRange() -> (AXUIElement, CFRange)? {
+        guard let focused = focusedNotesTextElement(),
+              AXText.attribute(focused, kAXRoleAttribute) as? String == kAXTextAreaRole,
+              let range = AXText.range(of: focused), range.location >= 0, range.length > 0 else { return nil }
+        return (focused, range)
+    }
+
     func selectionSignature() -> String? {
-        guard let focused = focusedNotesTextElement() else { return nil }
-        guard let r = selectedRange(of: focused), r.length > 0 else { return nil }
-        return "\(r.location):\(r.length)"
+        guard let (element, range) = selectedNotesRange() else { return nil }
+        return TextSelectionAnchor(element: element, range: range, bounds: nil).signature
+    }
+
+    func selectionAnchor() -> TextSelectionAnchor? {
+        guard let (element, range) = selectedNotesRange() else { return nil }
+        return TextSelectionAnchor(element: element, range: range, bounds: AXText.bounds(element, range))
     }
 
     /// 完整选区快照；也保存笔记身份与正文，写回时拒绝失效的目标。
-    func readSelectionSnapshot() -> SelectionSnapshot? {
-        guard let snap = readTextSnapshot(), snap.range.length > 0 else { return nil }
+    func readSelectionSnapshot(allowInactiveNotes: Bool = false) -> SelectionSnapshot? {
+        guard let snap = readTextSnapshot(allowInactiveNotes: allowInactiveNotes), snap.range.length > 0 else { return nil }
         return snap
     }
 
@@ -287,20 +297,20 @@ final class NotesBridge {
     func readTextSnapshot(allowInactiveNotes: Bool = false) -> SelectionSnapshot? {
         if let snapshotReader { return snapshotReader() }
         guard let focused = focusedNotesTextElement(allowInactiveNotes: allowInactiveNotes),
-              let role = Self.axAttr(focused, kAXRoleAttribute) as? String,
+              let role = AXText.attribute(focused, kAXRoleAttribute) as? String,
               role == kAXTextAreaRole,
-              let r = selectedRange(of: focused), r.location >= 0, r.length >= 0,
-              let documentText = Self.axAttr(focused, kAXValueAttribute) as? String,
+              let r = AXText.range(of: focused), r.location >= 0, r.length >= 0,
+              let documentText = AXText.attribute(focused, kAXValueAttribute) as? String,
               r.location <= (documentText as NSString).length,
               r.length <= (documentText as NSString).length - r.location,
               let noteID = selectedNoteID() else { return nil }
         let text = (documentText as NSString).substring(with: NSRange(location: r.location, length: r.length))
-        let bounds = boundsForRange(focused, r)
+        let bounds = AXText.bounds(focused, r)
             ?? (cursorScreenRect() ?? CGRect(x: 0, y: 0, width: 200, height: 24))
         guard let current = focusedNotesTextElement(allowInactiveNotes: allowInactiveNotes), CFEqual(current, focused),
-              let currentRange = selectedRange(of: current),
+              let currentRange = AXText.range(of: current),
               currentRange.location == r.location, currentRange.length == r.length,
-              Self.axAttr(current, kAXValueAttribute) as? String == documentText else { return nil }
+              AXText.attribute(current, kAXValueAttribute) as? String == documentText else { return nil }
         return SelectionSnapshot(element: focused, range: r, text: text, bounds: bounds,
                                  noteID: noteID, documentText: documentText)
     }
@@ -334,15 +344,6 @@ final class NotesBridge {
         return unsafeBitCast(f, to: AXUIElement.self)
     }
 
-    private func selectedRange(of el: AXUIElement) -> CFRange? {
-        var rRef: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(el, kAXSelectedTextRangeAttribute as CFString, &rRef) == .success,
-              let rv = rRef, AXValueGetType(unsafeBitCast(rv, to: AXValue.self)) == .cfRange else { return nil }
-        var range = CFRange()
-        guard AXValueGetValue(unsafeBitCast(rv, to: AXValue.self), .cfRange, &range) else { return nil }
-        return range
-    }
-
     private func selectedText(of el: AXUIElement) -> String? {
         var tRef: CFTypeRef?
         guard AXUIElementCopyAttributeValue(el, kAXSelectedTextAttribute as CFString, &tRef) == .success,
@@ -358,21 +359,6 @@ final class NotesBridge {
             el, kAXStringForRangeParameterizedAttribute as CFString, param, &outRef
         ) == .success, let s = outRef else { return nil }
         return unsafeBitCast(s, to: CFString.self) as String
-    }
-
-    /// 区间的屏幕矩形（Quartz 左上原点）
-    private func boundsForRange(_ el: AXUIElement, _ r: CFRange) -> CGRect? {
-        var cfRange = r
-        guard let param = AXValueCreate(.cfRange, &cfRange) else { return nil }
-        var rectRef: CFTypeRef?
-        guard AXUIElementCopyParameterizedAttributeValue(
-            el, kAXBoundsForRangeParameterizedAttribute as CFString, param, &rectRef
-        ) == .success, let rv = rectRef,
-            AXValueGetType(unsafeBitCast(rv, to: AXValue.self)) == .cgRect else { return nil }
-        var rect = CGRect.zero
-        guard AXValueGetValue(unsafeBitCast(rv, to: AXValue.self), .cgRect, &rect),
-              rect.width > 0, rect.height > 0 else { return nil }
-        return rect
     }
 
     /// AX 恢复选区（替换/追加前的关键一步：面板操作后选区可能丢失）
@@ -650,10 +636,10 @@ final class NotesBridge {
     func typeExpansion(deleteCount: Int, insert text: String, expectedTrigger: String? = nil) {
         guard let app = NSWorkspace.shared.frontmostApplication else { return }
         let axApp = AXUIElementCreateApplication(app.processIdentifier)
-        guard let focused = Self.axAttr(axApp, kAXFocusedUIElementAttribute) else { return }
+        guard let focused = AXText.attribute(axApp, kAXFocusedUIElementAttribute) else { return }
         let element = unsafeBitCast(focused, to: AXUIElement.self)
-        guard let cursor = selectedRange(of: element), cursor.length == 0,
-              let document = Self.axAttr(element, kAXValueAttribute) as? String,
+        guard let cursor = AXText.range(of: element), cursor.length == 0,
+              let document = AXText.attribute(element, kAXValueAttribute) as? String,
               cursor.location >= 0, cursor.location <= document.utf16.count else { return }
         let before = (document as NSString).substring(to: cursor.location)
         guard deleteCount > 0, before.count >= deleteCount else { return }
@@ -664,10 +650,10 @@ final class NotesBridge {
         guard setSelectionRange(element, replacementRange) else { return }
         func stillCurrent() -> Bool {
             guard NSWorkspace.shared.frontmostApplication?.processIdentifier == app.processIdentifier,
-                  let currentFocused = Self.axAttr(axApp, kAXFocusedUIElementAttribute),
+                  let currentFocused = AXText.attribute(axApp, kAXFocusedUIElementAttribute),
                   CFEqual(currentFocused, element),
-                  Self.axAttr(element, kAXValueAttribute) as? String == document,
-                  let currentRange = self.selectedRange(of: element) else { return false }
+                  AXText.attribute(element, kAXValueAttribute) as? String == document,
+                  let currentRange = AXText.range(of: element) else { return false }
             return currentRange.location == replacementRange.location && currentRange.length == replacementRange.length
         }
         guard stillCurrent() else { return }
@@ -729,15 +715,9 @@ final class NotesBridge {
         return FormatStyle.allCases.first(where: { $0.menuTitles.contains(title) })?.menuTitles ?? [title]
     }
 
-    private static func axAttr(_ el: AXUIElement, _ name: String) -> CFTypeRef? {
-        var ref: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(el, name as CFString, &ref) == .success else { return nil }
-        return ref
-    }
-
     /// 取菜单栏项的菜单元素：Notes 不支持 AXMenu 属性(-25212)，但菜单是菜单栏项的首个子元素
     private static func menuOfMenuBarItem(_ mbItem: AXUIElement) -> AXUIElement? {
-        guard let kidsRef = axAttr(mbItem, kAXChildrenAttribute as String),
+        guard let kidsRef = AXText.attribute(mbItem, kAXChildrenAttribute as String),
               let kids = kidsRef as? [AXUIElement] else { return nil }
         return kids.first
     }
@@ -749,12 +729,12 @@ final class NotesBridge {
         guard let notes = NSWorkspace.shared.runningApplications.first(where: { $0.bundleIdentifier == Self.notesBundleID }),
               notes.isFinishedLaunching else { return fallback }
         let axApp = AXUIElementCreateApplication(notes.processIdentifier)
-        guard let menuBar = Self.axAttr(axApp, kAXMenuBarAttribute) else { return fallback }
+        guard let menuBar = AXText.attribute(axApp, kAXMenuBarAttribute) else { return fallback }
         var found: Set<String> = []
         let wanted = Set(fallback.flatMap { Self.formatMenuTitles(for: $0) })
         // AXMenuBar 返回的是单个菜单栏元素，子元素才是菜单栏项
         let bar = unsafeBitCast(menuBar, to: AXUIElement.self)
-        if let itemsRef = Self.axAttr(bar, kAXChildrenAttribute as String),
+        if let itemsRef = AXText.attribute(bar, kAXChildrenAttribute as String),
            let items = itemsRef as? [AXUIElement] {
             for mbItem in items {
                 guard let menu = Self.menuOfMenuBarItem(mbItem) else { continue }
@@ -767,12 +747,12 @@ final class NotesBridge {
 
     private static func collectFormatTitles(_ el: AXUIElement, depth: Int, wanted: Set<String>, into out: inout Set<String>) {
         guard depth < 4 else { return }
-        guard let roleRef = axAttr(el, kAXRoleAttribute), let role = roleRef as? String else { return }
-        if role == "AXMenuItem", let tRef = axAttr(el, kAXTitleAttribute),
+        guard let roleRef = AXText.attribute(el, kAXRoleAttribute), let role = roleRef as? String else { return }
+        if role == "AXMenuItem", let tRef = AXText.attribute(el, kAXTitleAttribute),
            let t = tRef as? String, wanted.contains(t) {
             out.insert(t)
         }
-        if let kidsRef = axAttr(el, kAXChildrenAttribute),
+        if let kidsRef = AXText.attribute(el, kAXChildrenAttribute),
            let kids = kidsRef as? [AXUIElement] {
             for k in kids { collectFormatTitles(k, depth: depth + 1, wanted: wanted, into: &out) }
         }
@@ -800,9 +780,9 @@ final class NotesBridge {
 
     /// 在应用菜单栏的所有菜单里递归找标题匹配的 AXMenuItem
     private static func findMenuItem(_ axApp: AXUIElement, titled title: String) -> AXUIElement? {
-        guard let barEl = axAttr(axApp, kAXMenuBarAttribute) else { return nil }
+        guard let barEl = AXText.attribute(axApp, kAXMenuBarAttribute) else { return nil }
         let bar = unsafeBitCast(barEl, to: AXUIElement.self)
-        guard let itemsRef = axAttr(bar, kAXChildrenAttribute as String),
+        guard let itemsRef = AXText.attribute(bar, kAXChildrenAttribute as String),
               let items = itemsRef as? [AXUIElement] else { return nil }
         for mbItem in items {
             guard let menu = Self.menuOfMenuBarItem(mbItem) else { continue }
@@ -813,11 +793,11 @@ final class NotesBridge {
 
     private static func findMenuItemRecurse(_ el: AXUIElement, titled title: String, depth: Int) -> AXUIElement? {
         guard depth < 5 else { return nil }
-        if let roleRef = axAttr(el, kAXRoleAttribute), (roleRef as? String) == "AXMenuItem",
-           let tRef = axAttr(el, kAXTitleAttribute), (tRef as? String) == title {
+        if let roleRef = AXText.attribute(el, kAXRoleAttribute), (roleRef as? String) == "AXMenuItem",
+           let tRef = AXText.attribute(el, kAXTitleAttribute), (tRef as? String) == title {
             return el
         }
-        if let kidsRef = axAttr(el, kAXChildrenAttribute),
+        if let kidsRef = AXText.attribute(el, kAXChildrenAttribute),
            let kids = kidsRef as? [AXUIElement] {
             for k in kids {
                 if let hit = findMenuItemRecurse(k, titled: title, depth: depth + 1) { return hit }
@@ -828,11 +808,11 @@ final class NotesBridge {
 
     /// 快捷键兜底：AXMenuItemCmdChar + AXMenuItemCmdModifiers（bit0=Shift bit1=Option bit2=Control，Command 恒定）
     private static func pressViaShortcut(_ item: AXUIElement, title: String) -> String? {
-        guard let chRef = axAttr(item, "AXMenuItemCmdChar"), let ch = chRef as? String, !ch.isEmpty else {
+        guard let chRef = AXText.attribute(item, "AXMenuItemCmdChar"), let ch = chRef as? String, !ch.isEmpty else {
             return "「\(title)」无可用快捷键"
         }
         var mods = 0
-        if let modRef = axAttr(item, "AXMenuItemCmdModifiers") {
+        if let modRef = AXText.attribute(item, "AXMenuItemCmdModifiers") {
             mods = (modRef as? NSNumber)?.intValue ?? 0
         }
         var flags: CGEventFlags = [.maskCommand]

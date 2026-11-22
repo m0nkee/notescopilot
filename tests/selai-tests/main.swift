@@ -1,6 +1,5 @@
 // 选中即 AI 状态机单元测试（SelAIState reducer 纯逻辑）
-// 编译：swiftc -o selai-tests main.swift ../../src/Chat.swift ../../src/Slash.swift ../../src/SlashSuggest.swift ../../src/NotesBridge.swift ../../src/FrontmostTracker.swift ../../src/FormatBridge.swift ../../src/TemplateEngine.swift ../../src/SelectionAI.swift
-// 运行：./selai-tests
+// scripts/run-tests.sh selai-tests
 import Foundation
 import AppKit
 
@@ -12,6 +11,21 @@ func check(_ cond: Bool, _ name: String) {
 
 typealias S = SelAIState
 let show = S.StepAction.show, hide = S.StepAction.hide, none = S.StepAction.none
+
+do {
+    let suite = "nc.selection-scope.\(UUID())"
+    let prefs = UserDefaults(suiteName: suite)!
+    defer { prefs.removePersistentDomain(forName: suite) }
+    check(SelectionScope.current(in: prefs) == .notes && SelectionScope.isEnabled(in: prefs)
+          && !SelectionScope.allowsGlobalSelection(in: prefs), "新用户默认只在 Notes 出现浮钮")
+    prefs.set(false, forKey: SelectionScope.enabledKey)
+    prefs.set("global", forKey: SelectionScope.defaultsKey)
+    check(!SelectionScope.allowsGlobalSelection(in: prefs), "已有的关闭设置优先于全局范围")
+    prefs.set(true, forKey: SelectionScope.enabledKey)
+    check(SelectionScope.allowsGlobalSelection(in: prefs), "显式启用全局后允许其他输入框")
+    prefs.set("unknown", forKey: SelectionScope.defaultsKey)
+    check(SelectionScope.current(in: prefs) == .notes, "无法识别的范围回到仅 Notes")
+}
 
 // ---- 1. 无选中：任何状态回 idle 并隐藏 ----
 do {
@@ -66,12 +80,13 @@ do {
 
 // ---- 7. 快捷动作清单完整性 ----
 do {
-    check(selectionQuickActions.count == 5, "5 个快捷动作")
+    check(selectionQuickActions.count == 6, "6 个快捷动作")
     check(selectionQuickActions.allSatisfy { !$0.instruction.isEmpty }, "全部动作有指令")
-    check(selectionQuickActions.map(\.name) == ["润色", "总结", "翻译", "解释", "精简"], "动作名与顺序稳定")
+    check(selectionQuickActions.filter { $0.group == .edit }.map(\.name) == ["校对", "润色", "精简"], "编辑组选区改写")
+    check(selectionQuickActions.filter { $0.group == .read }.map(\.name) == ["总结", "翻译", "解释"], "阅读组选区加工")
 }
 
-// ---- 8. Notes 原生格式按钮（动态枚举 → 按钮清单 → 拆行） ----
+// ---- 8. Notes 原生格式菜单（动态枚举 → 本地化标签） ----
 do {
     let all = NotesBridge.formatMenuItems.map(\.menu)
     check(all.count == 13, "格式全集 13 项")
@@ -93,13 +108,6 @@ do {
     check(byMenu["斜体"] == "斜体" && byMenu["下划线"] == "下划线" && byMenu["删除线"] == "删除线", "字体样式标签直出")
     check(byMenu["显示颜色"] == "颜色", "显示颜色 → 颜色")
 
-    // 拆行：13 个 → 5 + 5 + 3
-    let rows = NotesFormatButton.splitRows(NotesFormatButton.items(presenting: all))
-    check(rows.count == 3, "13 个按钮拆 3 行")
-    check(rows[0].count == 5 && rows[1].count == 5 && rows[2].count == 3, "行大小 5 + 5 + 3")
-    check(NotesFormatButton.splitRows([]).isEmpty, "空清单 → 无行")
-    check(NotesFormatButton.splitRows(NotesFormatButton.items(presenting: ["标题"])).count == 1, "单按钮单行")
-    check(NotesFormatButton.splitRows(NotesFormatButton.items(presenting: all), maxPerRow: 3).count == 5, "自定义每行数（13 项 / 3 = 5 行）")
 }
 
 // 总开关对键盘与 AX 通道一致生效；格式菜单标题统一中英文别名。

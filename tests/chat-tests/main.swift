@@ -450,11 +450,16 @@ private final class ChatTests {
         configure()
         ChatTestProtocol.reset()
         var error: String?
+        let selection = "    第一行\n第二行\n"
         let task = Task {
-            do { _ = try await AIService.complete(instruction: "complete", context: "") }
+            do { _ = try await AIService.complete(instruction: "complete", context: selection, contextKind: .selection) }
             catch let failure { error = failure.localizedDescription }
         }
         await wait("nonstreaming starts") { ChatTestProtocol.count == 1 }
+        let payload = ChatTestProtocol.capturedRequest(0)?.httpBody.flatMap { try? JSONSerialization.jsonObject(with: $0) } as? [String: Any]
+        let messages = payload?["messages"] as? [[String: String]]
+        check(messages?.last?["content"] == "【选中文本】\n\(selection)\n\n【任务】\ncomplete",
+              "selection requests identify the excerpt and preserve its indentation and trailing newline")
         ChatTestProtocol.respond(0, body: "{\"choices\":[{\"message\":{\"content\":\"partial\"},\"finish_reason\":\"length\"}]}", includeDone: false)
         await task.value
         check(error?.contains("长度限制") == true, "nonstreaming selection/template calls reject truncated responses")

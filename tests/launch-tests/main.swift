@@ -1,8 +1,7 @@
 import AppKit
 import Foundation
 
-/// Runs the real delegate and AppKit windows with all external services disabled.
-/// Window visibility under a locked session does not establish visual focus or screen placement.
+/// Exercises the real delegate with isolated settings. Optional host processes provide synthetic selections.
 @main
 @MainActor
 struct LaunchTests {
@@ -11,7 +10,7 @@ struct LaunchTests {
     private static var delegates: [AppDelegate] = []
     private static let ownedTitles: Set<String> = ["NotesCopilot", "NotesCopilot 设置", "笔记库 · NotesCopilot"]
 
-    private static func check(_ value: Bool, _ name: String) {
+    static func check(_ value: Bool, _ name: String) {
         if value { passed += 1; print("PASS  \(name)") }
         else { failed += 1; print("FAIL  \(name)") }
     }
@@ -69,13 +68,14 @@ struct LaunchTests {
         ProfileStore.secretStore = MemoryProfileSecretStore()
     }
 
-    private static func launch(configured: Bool) throws -> AppDelegate {
+    private static func launch(configured: Bool, defaultLaunch: Bool = true) throws -> AppDelegate {
         closeWindows()
         try configure(configured)
         let delegate = AppDelegate(startBackgroundServices: false)
         delegates.append(delegate)
         NSApp.delegate = delegate
-        delegate.applicationDidFinishLaunching(Notification(name: NSApplication.didFinishLaunchingNotification))
+        delegate.applicationDidFinishLaunching(Notification(name: NSApplication.didFinishLaunchingNotification,
+            userInfo: [NSApplication.launchIsDefaultUserInfoKey: defaultLaunch]))
         settle()
         let state = delegate.startupState()
         if JSONSerialization.isValidJSONObject(state),
@@ -89,11 +89,219 @@ struct LaunchTests {
     static func main() {
         let app = NSApplication.shared
         app.setActivationPolicy(.accessory)
-        DispatchQueue.main.async { runTests(app) }
+        if CommandLine.arguments.contains("--send-service-fixture") {
+            Task { @MainActor in await sendServiceFixture() }
+            app.run()
+            return
+        }
+        guard CommandLine.arguments.contains("--run-tests") else { exit(1) }
+        Task { @MainActor in await runTests(app) }
         app.run()
     }
 
-    private static func runTests(_ app: NSApplication) {
+    private static let serviceFixture = "跨进程选区 📝"
+
+    private static func sendServiceFixture() async -> Never {
+        let fixture = Bundle(path: CommandLine.arguments[2])!
+        let spec = (fixture.object(forInfoDictionaryKey: "NSServices") as! [[String: Any]])[0]
+        let name = (spec["NSMenuItem"] as! [String: String])["default"]!
+        let board = NSPasteboard(name: .init(CommandLine.arguments.last!))
+        let view = NSTextView(frame: NSRect(x: 0, y: 0, width: 240, height: 80))
+        let window = NSWindow(contentRect: view.frame, styleMask: [.titled], backing: .buffered, defer: false)
+        window.contentView = view
+        window.makeFirstResponder(view)
+        NSApp.activate(ignoringOtherApps: true)
+        window.makeKeyAndOrderFront(nil)
+        view.string = "prefix " + serviceFixture + " suffix"
+        view.setSelectedRange((view.string as NSString).range(of: serviceFixture))
+        let advertised = (spec["NSSendTypes"] as! [String]).map { NSPasteboard.PasteboardType($0) }
+        let supported = advertised.filter { view.validRequestor(forSendType: $0, returnType: nil) != nil }
+        let menu = NSMenu()
+        let appMenu = NSMenu()
+        let servicesMenu = NSMenu(title: "Services")
+        menu.addItem(withTitle: "Application", action: nil, keyEquivalent: "").submenu = appMenu
+        appMenu.addItem(withTitle: "Services", action: nil, keyEquivalent: "").submenu = servicesMenu
+        NSApp.mainMenu = menu
+        NSApp.servicesMenu = servicesMenu
+        NSApp.registerServicesMenuSendTypes(advertised, returnTypes: [])
+        NSUpdateDynamicServices()
+        let exported = view.writeSelection(to: board, types: supported)
+        let deadline = Date().addingTimeInterval(10)
+        var sent = false
+        while exported && !sent && Date() < deadline {
+            servicesMenu.update()
+            sent = NSPerformService(name, board)
+            if !sent { try? await Task.sleep(nanoseconds: 500_000_000) }
+        }
+        print("SERVICE CLIENT  exported=\(exported) dispatched=\(sent)")
+        exit(sent ? 0 : 1)
+    }
+
+    private static func checkServiceDispatch(_ service: SelectionAIPanel) async throws {
+        let board = NSPasteboard.withUniqueName()
+        defer { board.releaseGlobally() }
+        let peer = Process()
+        peer.executableURL = URL(fileURLWithPath: ProcessInfo.processInfo.environment["NC_SERVICE_TEST_CLIENT"]!)
+        peer.arguments = ["--send-service-fixture", Bundle.main.bundlePath, board.name.rawValue]
+        try peer.run()
+        let deadline = Date().addingTimeInterval(15)
+        while (peer.isRunning || service.original != serviceFixture) && Date() < deadline {
+            try await Task.sleep(nanoseconds: 50_000_000)
+        }
+        if peer.isRunning { peer.terminate(); check(false, "system service dispatch timed out"); return }
+        check(peer.terminationStatus == 0 && service.isServiceSession && service.original == serviceFixture,
+              "NSPerformService delivers just the selected text from a separate AppKit process")
+        service.hide()
+    }
+
+    private static func checkWritingTools() async throws {
+        _ = try launch(configured: true, defaultLaunch: false)
+        guard let spec = (Bundle.main.object(forInfoDictionaryKey: "NSServices") as? [[String: Any]])?.first,
+              let message = spec["NSMessage"] as? String,
+              let service = NSApp.servicesProvider as? SelectionAIPanel else {
+            check(false, "the application registers its declared writing service")
+            return
+        }
+        let sendTypes = (spec["NSSendTypes"] as? [String] ?? []).map { NSPasteboard.PasteboardType($0) }
+        check(service === SelectionAIPanel.shared && service.responds(to: NSSelectorFromString(message + ":userData:error:"))
+              && sendTypes.contains(.string) && sendTypes.contains(.init("NSStringPboardType"))
+              && spec["NSReturnTypes"] == nil, "the provider implements the declared send-only text selector")
+        check(!hasWindow("NotesCopilot") && !hasWindow("NotesCopilot 设置"), "a service launch leaves the ordinary windows closed")
+        if ProcessInfo.processInfo.environment["NC_TEST_SYSTEM_SERVICE"] == "1" {
+            try await checkServiceDispatch(service)
+        }
+
+        let board = NSPasteboard.withUniqueName()
+        defer { board.releaseGlobally() }
+        let source = NSTextView(frame: NSRect(x: 0, y: 0, width: 400, height: 120))
+        let selected = "下周三，我们会就测试反馈进行一次讨论。"
+        source.string = "资料草稿\n" + selected + "\n待补充"
+        let range = (source.string as NSString).range(of: selected)
+        var error: NSString?
+        for editable in [true, false] {
+            source.isEditable = editable
+            source.isSelectable = true
+            source.setSelectedRange(range)
+            board.clearContents()
+            let supported = sendTypes.filter { source.validRequestor(forSendType: $0, returnType: nil) != nil }
+            check(!supported.isEmpty && source.writeSelection(to: board, types: supported),
+                  "native text view negotiates and exports its selection, editable=\(editable)")
+            service.openSelectionWritingTools(board, userData: nil, error: &error)
+            check(error == nil && service.isServiceSession && service.original == selected && service.phase == .menu
+                  && !service.hasNotesTarget && service.formats.isEmpty && !service.canWrite,
+                  "service opens the selected excerpt with copy-only capabilities, editable=\(editable)")
+        }
+        SelectionWatcher.shared.stop()
+        check(service.isServiceSession, "disabling Notes automatic selection leaves the explicit service available")
+        board.clearContents()
+        board.setString(" \n ", forType: .string)
+        service.openSelectionWritingTools(board, userData: nil, error: &error)
+        check(error != nil && service.original == selected, "whitespace is rejected without replacing an open review")
+        service.hide()
+
+        let element = AXUIElementCreateApplication(12345)
+        let snapshot = NotesBridge.SelectionSnapshot(element: element, range: CFRange(location: range.location, length: range.length),
+            text: selected, bounds: .zero, noteID: "writing-fixture", documentText: source.string)
+        var current: NotesBridge.SelectionSnapshot? = snapshot
+        var reads = 0, writes = 0
+        var writtenRange: NSRange?
+        var writtenText = ""
+        let bridge = NotesBridge(snapshotReader: { reads += 1; return current }, replacementWriter: { _, range, text, _ in
+            writes += 1
+            writtenRange = NSRange(location: range.location, length: range.length)
+            writtenText = text
+            return nil
+        })
+        var inputs: [String] = []
+        let candidate = "下周三讨论测试反馈。"
+        let request = SelectionAIRequest(complete: { _, text in inputs.append(text); return candidate })
+        let tools = SelectionAIPanel(request: request, notes: bridge, formatTitles: { ["Title", "Body"] })
+        defer { tools.hide() }
+        tools.showLauncher(at: .init(element: element, range: snapshot.range, bounds: nil))
+        check(reads == 0 && inputs.isEmpty && tools.phase == .launcher && !tools.panelIsKey,
+              "a passive Notes button takes no focus, reads no document and sends no request")
+        if let launcher = NSApp.windows.compactMap({ $0.isVisible ? $0.contentView as? SelectionLauncherButton : nil }).first {
+            check(launcher.attributedTitle.string.hasSuffix("M") && launcher.accessibilityLabel() == "Copilot 写作工具",
+                  "the launcher labels its shortcut visually and exposes its action to Accessibility")
+            try captureSelectionPreview("selection-launcher", view: launcher)
+        }
+        tools.openTools()
+        check(tools.formats.map(\.menuTitle) == ["标题", "正文"] && inputs.isEmpty,
+              "opening Notes tools binds the selection and exposes only the host's formats")
+        try checkToolWindow("selection-menu", width: 340)
+        let edit = selectionQuickActions.first { $0.name == "精简" }!
+        tools.run(edit)
+        await request.task?.value
+        check(inputs == [selected] && tools.result == candidate && tools.canWrite && writes == 0, "generation previews a result without writing")
+        try checkToolWindow("selection-review", width: 420)
+        tools.showingOriginal = true
+        tools.writeResult(append: false)
+        tools.copyPreview(to: board)
+        check(!tools.canWrite && writes == 0 && board.string(forType: .string) == selected,
+              "original preview copies the source and cannot commit the candidate")
+        tools.showingOriginal = false
+        tools.copyPreview(to: board)
+        check(board.string(forType: .string) == candidate, "result preview copies the displayed candidate")
+        current = nil
+        tools.writeResult(append: false)
+        check(writes == 0 && tools.staleSelection && !tools.canWrite && tools.result == candidate,
+              "a switched Notes target leaves the draft available only for copying")
+
+        board.clearContents()
+        board.setString(selected, forType: .string)
+        tools.openSelectionWritingTools(board, userData: nil, error: &error)
+        let readsBeforeService = reads
+        tools.run(edit)
+        await request.task?.value
+        tools.writeResult(append: true)
+        check(tools.phase == .review && tools.result == candidate && !tools.canWrite && writes == 0
+              && reads == readsBeforeService, "global review neither reads Notes nor reaches the Notes writer")
+        tools.chooseAnotherTool()
+        check(tools.phase == .menu && tools.original == selected && tools.result.isEmpty,
+              "choosing another action reuses the original service selection")
+
+        current = snapshot
+        for append in [false, true] {
+            tools.showLauncher(at: .init(element: element, range: snapshot.range, bounds: nil))
+            tools.openTools()
+            tools.run(edit)
+            await request.task?.value
+            let before = writes
+            tools.writeResult(append: append)
+            let expectedRange = append ? NSRange(location: NSMaxRange(range), length: 0) : range
+            check(writes == before + 1 && writtenRange == expectedRange && writtenText == candidate,
+                  "explicit Notes confirmation writes the reviewed draft once to its bound range, append=\(append)")
+        }
+    }
+
+    private static func checkToolWindow(_ name: String, width: CGFloat) throws {
+        settle()
+        guard let view = NSApp.windows.first(where: { $0.title == "NotesCopilot 写作工具" && $0.isVisible })?.contentView else {
+            check(false, "missing native panel for \(name)")
+            return
+        }
+        check(view.bounds.width == width && view.bounds.height > 100 && view.bounds.size == view.fittingSize,
+              "\(name) fits its real native panel at \(Int(view.bounds.width)) × \(Int(view.bounds.height))")
+        try captureSelectionPreview(name, view: view)
+    }
+
+    private static func captureSelectionPreview(_ name: String, view: NSView) throws {
+        guard let path = ProcessInfo.processInfo.environment["NC_SELECTION_PREVIEWS"], let window = view.window else { return }
+        let originalAppearance = window.appearance
+        defer { window.appearance = originalAppearance }
+        let directory = URL(fileURLWithPath: path, isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        for (appearance, suffix) in [(originalAppearance, ""), (NSAppearance(named: .aqua), "-light"), (NSAppearance(named: .darkAqua), "-dark")] {
+            window.appearance = appearance
+            settle()
+            view.displayIfNeeded()
+            guard let bitmap = view.bitmapImageRepForCachingDisplay(in: view.bounds) else { continue }
+            view.cacheDisplay(in: view.bounds, to: bitmap)
+            try bitmap.representation(using: .png, properties: [:])?.write(to: directory.appendingPathComponent(name + suffix + ".png"))
+        }
+    }
+
+    private static func runTests(_ app: NSApplication) async {
         guard !NSScreen.screens.isEmpty else {
             print("UNAVAILABLE  No WindowServer screen connection; lifecycle assertions were not run.")
             exit(77)
@@ -199,11 +407,13 @@ struct LaunchTests {
             _ = (unconfigured as NSApplicationDelegate).applicationShouldHandleReopen?(app, hasVisibleWindows: true)
             settle()
             check(settingsOffscreen && reachable(settings), "unconfigured reopen restores offscreen settings")
+            try await checkWritingTools()
+            try await checkGlobalInputFields()
         } catch {
             check(false, "launch harness error: \(error.localizedDescription)")
         }
         closeWindows()
-        print("NOTE  Window state only; no visual focus or unlocked-screen validation.")
+        print("NOTE  选区检查使用合成文稿与确定性的模型响应。")
         print(failed == 0 ? "全部通过：\(passed) 项" : "失败 \(failed) 项 / 共 \(passed + failed) 项")
         exit(failed == 0 ? 0 : 1)
     }

@@ -49,6 +49,18 @@ struct RenderUI {
         engine.lastError = "响应尚未完成，已保留当前结果。可以继续生成、重新生成，或复制已有内容。写回前请确认目标笔记。"
         try render(PanelView(engine: engine, notesAccessIssueProvider: { nil }), size: NSSize(width: 520, height: 640), name: "panel-error-small", directory: output)
         try render(SettingsView(discoverLocalModels: false, notesAccessIssueProvider: { nil }, updater: updater), size: NSSize(width: 940, height: 640), name: "settings-light", directory: output)
+        for scope in [SelectionScope.notes, .global] {
+            var selectionValues = values
+            selectionValues[SelectionScope.enabledKey] = true
+            selectionValues[SelectionScope.defaultsKey] = scope.rawValue
+            defaults.setVolatileDomain(selectionValues, forName: UserDefaults.argumentDomain)
+            UserDefaults.standard.setVolatileDomain(selectionValues, forName: UserDefaults.argumentDomain)
+            try render(SettingsView(discoverLocalModels: false, notesAccessIssueProvider: { nil },
+                                    initialPage: .expansion, updater: updater).defaultAppStorage(defaults),
+                       size: NSSize(width: 940, height: 640), name: "settings-selection-" + scope.rawValue, directory: output)
+        }
+        defaults.setVolatileDomain(values, forName: UserDefaults.argumentDomain)
+        UserDefaults.standard.setVolatileDomain(values, forName: UserDefaults.argumentDomain)
         try render(SettingsView(discoverLocalModels: false, notesAccessIssueProvider: { nil }, updater: updater), size: NSSize(width: 940, height: 640), name: "settings-dark", directory: output, dark: true)
 
         try checkTemplates(output: output, defaults: defaults, values: values, delegate: delegate, updater: updater)
@@ -90,7 +102,7 @@ struct RenderUI {
                      "Recovery fixture must use only the isolated store and preserve standard synthetic defaults")
         try render(SettingsView(discoverLocalModels: false, notesAccessIssueProvider: { nil }, updater: updater), size: NSSize(width: 940, height: 640), name: "settings-keychain-recovery-light", directory: output)
         try render(SettingsView(discoverLocalModels: false, notesAccessIssueProvider: { nil }, updater: updater), size: NSSize(width: 940, height: 640), name: "settings-keychain-recovery-dark", directory: output, dark: true)
-        print("UI smoke: 23 native layouts rendered with isolated data")
+        print("UI smoke: 25 native layouts rendered with isolated data")
     }
 
     @MainActor private static func checkPromptCategories(output: URL) throws {
