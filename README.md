@@ -6,7 +6,7 @@
 
 在 Apple Notes 里写作，也能在 Mac 上直接处理选中的文字。
 
-[下载 v2.8.0 · Apple Silicon](https://github.com/m0nkee/notescopilot/releases/download/v2.8.0/NotesCopilot-2.8.0-arm64.dmg) · [发布说明与校验文件](https://github.com/m0nkee/notescopilot/releases/tag/v2.8.0) · [使用手册](docs/USAGE.md)
+[下载 v2.8.1 · Apple Silicon](https://github.com/m0nkee/notescopilot/releases/download/v2.8.1/NotesCopilot-2.8.1-arm64.dmg) · [发布说明与校验文件](https://github.com/m0nkee/notescopilot/releases/tag/v2.8.1) · [使用手册](docs/USAGE.md)
 
 </div>
 
@@ -20,7 +20,7 @@ NotesCopilot 是一个原生 macOS 菜单栏应用。默认在 **Notes 正文**�
 </picture>
 
 1. 选中要处理的文字。浮钮出现后，**单击浮钮或按一次 `M`** 打开同一个菜单。
-2. 核对菜单里的原文摘录，选择校对、润色、精简、总结、翻译、解释，或输入自己的指令。翻译默认输出英文。
+2. 核对原文摘录，点击动作或按按钮旁的字母。例如，按 `T` 直接翻译为英文，按 `I` 输入自己的指令，再按回车执行。
 3. 在结果面板对照原文，复制需要的版本。打开工具和选择动作是两个独立步骤，点动作或提交指令时才会向配置的模型发送所选文字。
 
 | 划选位置 | 可用操作 |
@@ -30,7 +30,9 @@ NotesCopilot 是一个原生 macOS 菜单栏应用。默认在 **Notes 正文**�
 | 支持的可编辑输入框 | 复制结果。能核对原窗口、输入框内容和选区时，还可替换或追加 |
 | 提供文本服务的应用 | 从系统「服务 → 用 NotesCopilot 处理选中文本」手动打开，审阅并复制 |
 
-`M` 只在浮钮可见、来源应用位于前台时用来打开工具。菜单展开后可以正常输入自定义指令，按 `Esc` 可关闭。跨应用支持取决于宿主是否通过 macOS 辅助功能公开文字选区。安全输入框会跳过。
+例如，依次按 `M`、`T`、`C` 即可打开工具、翻译，并在译文出现后复制。结果页可用 `O` 对照原文，有可写选区时还可用 `A` 追加或 `R` 替换。输入指令期间字母正常输入，按 `Esc` 返回工具，再按一次关闭。
+
+`M` 在浮钮可见且来源应用位于前台时生效。跨应用支持取决于宿主是否通过 macOS 辅助功能公开文字选区，安全输入框会跳过。
 
 ![选区写作工具菜单](docs/images/panel-format.png)
 

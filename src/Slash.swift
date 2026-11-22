@@ -484,6 +484,14 @@ final class KeywordListener {
         // tap 挂在主 runloop = 主线程，可安全进入 MainActor；测试构建（无 NC_APP）跳过
         #if NC_APP
         let kc = CGKeyCode(event.getIntegerValueField(.keyboardEventKeycode))
+        if MainActor.assumeIsolated({ SelectionAIPanel.shared.panelIsKey }) {
+            // The nonactivating tools panel can own the keyboard while the
+            // source app remains frontmost. Let its window and its IME route input.
+            buffer = ""
+            slashBuf = ""
+            if repeating && consumedLauncherKey { return nil }
+            return Unmanaged.passUnretained(event)
+        }
         if kc == 125 || kc == 126 || kc == 36 || kc == 53,
            MainActor.assumeIsolated({
                SlashSuggestPanel.shared.routeKeyIfVisible(kc)

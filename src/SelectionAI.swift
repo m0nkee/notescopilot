@@ -8,18 +8,23 @@ struct SelectionQuickAction: Equatable {
     enum Group: String, CaseIterable { case edit = "编辑", read = "阅读" }
     let name: String
     let group: Group
+    let shortcut: String?
     let instruction: String
 }
 
 /// 快捷加工清单：指令要求「只输出加工后的文本」，保证替换动作可直接落笔
 let selectionQuickActions: [SelectionQuickAction] = [
-    .init(name: "校对", group: .edit, instruction: "请只修正错别字、语法和标点，保留原意、段落与语气。输出完整校对稿，无需改动时返回原文。"),
-    .init(name: "润色", group: .edit, instruction: "请润色以下文字，使其更通顺、专业，保持原意与格式。只输出润色后的文本，不要解释。"),
-    .init(name: "精简", group: .edit, instruction: "请把以下内容压缩得更简洁，保留核心信息。只输出精简后的文本。"),
-    .init(name: "总结", group: .read, instruction: "请用简洁的要点总结以下内容的核心信息。只输出总结内容。"),
-    .init(name: "翻译", group: .read, instruction: "请将以下内容翻译成英文，保持原意与语气。只输出译文。"),
-    .init(name: "解释", group: .read, instruction: "请简要解释以下内容的关键概念与逻辑。"),
+    .init(name: "校对", group: .edit, shortcut: "p", instruction: "请只修正错别字、语法和标点，保留原意、段落与语气。输出完整校对稿，无需改动时返回原文。"),
+    .init(name: "润色", group: .edit, shortcut: "r", instruction: "请润色以下文字，使其更通顺、专业，保持原意与格式。只输出润色后的文本，不要解释。"),
+    .init(name: "精简", group: .edit, shortcut: "c", instruction: "请把以下内容压缩得更简洁，保留核心信息。只输出精简后的文本。"),
+    .init(name: "总结", group: .read, shortcut: "s", instruction: "请用简洁的要点总结以下内容的核心信息。只输出总结内容。"),
+    .init(name: "翻译", group: .read, shortcut: "t", instruction: "请将以下内容翻译成英文，保持原意与语气。只输出译文。"),
+    .init(name: "解释", group: .read, shortcut: "e", instruction: "请简要解释以下内容的关键概念与逻辑。"),
 ]
+
+enum SelectionReviewKey: String {
+    case original = "o", copy = "c", back = "b", generate = "g", append = "a", replace = "r"
+}
 
 enum WritingSelection {
     case notes(NotesBridge.SelectionSnapshot)
@@ -351,14 +356,6 @@ final class SelectionAIRequest {
     }
 }
 
-/// 自动出现的入口不取焦点，用户展开后才能用键盘操作面板。
-private final class SelectionKeyPanel: NSPanel {
-    var acceptsKeyboard = false
-    override var canBecomeKey: Bool { acceptsKeyboard }
-    var dismiss: (() -> Void)?
-    override func cancelOperation(_ sender: Any?) { dismiss?() }
-}
-
 @MainActor
 final class SelectionAIPanel: NSObject, ObservableObject {
     enum Phase { case launcher, menu, working, review, unavailable }
@@ -622,7 +619,32 @@ final class SelectionAIPanel: NSObject, ObservableObject {
     func runCustom() {
         let instruction = customInstruction.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !instruction.isEmpty else { return }
-        run(.init(name: "自定义", group: .edit, instruction: instruction))
+        run(.init(name: "自定义", group: .edit, shortcut: nil, instruction: instruction))
+    }
+
+    private func performToolKey(_ key: String) -> Bool {
+        switch phase {
+        case .menu:
+            if key == SelectionKeyPanel.instructionKey { return panel?.focusInstruction() == true }
+            guard let action = selectionQuickActions.first(where: { $0.shortcut == key }) else { return false }
+            run(action)
+        case .review:
+            guard !writing, let key = SelectionReviewKey(rawValue: key) else { return false }
+            switch key {
+            case .back: chooseAnotherTool()
+            case .generate:
+                guard let action else { return false }
+                run(action)
+            case .original, .copy:
+                guard !result.isEmpty else { return false }
+                if key == .original { showingOriginal.toggle() } else { copyPreview() }
+            case .append, .replace:
+                guard canWrite else { return false }
+                writeResult(append: key == .append)
+            }
+        default: return false
+        }
+        return true
     }
 
     func chooseAnotherTool() {
@@ -740,6 +762,7 @@ final class SelectionAIPanel: NSObject, ObservableObject {
             window.isReleasedWhenClosed = false
             window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
             window.dismiss = { [weak self] in self?.dismiss() }
+            window.performToolKey = { [weak self] key in self?.performToolKey(key) == true }
             panel = window
         }
 
@@ -770,6 +793,10 @@ final class SelectionAIPanel: NSObject, ObservableObject {
             window.makeKeyAndOrderFront(nil)
         } else {
             window.orderFront(nil)
+        }
+        if phase == .menu {
+            // Start in command mode even if AppKit initially chose the text field.
+            window.makeFirstResponder(nil)
         }
     }
 

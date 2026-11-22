@@ -1,5 +1,109 @@
 import SwiftUI
 
+/// The launcher stays passive. Once opened, the panel owns its command keys
+/// through the normal window responder chain, including for macOS Services.
+final class SelectionKeyPanel: NSPanel {
+    static let instructionKey = "i"
+    var acceptsKeyboard = false
+    override var canBecomeKey: Bool { acceptsKeyboard }
+    weak var instructionField: NSTextField?
+    var performToolKey: ((String) -> Bool)?
+    var dismiss: (() -> Void)?
+    private var consumedKey: UInt16?
+
+    func focusInstruction() -> Bool {
+        // Returning from review creates a fresh hosting view. Attach its
+        // native field before routing a rapidly following I keystroke.
+        contentView?.layoutSubtreeIfNeeded()
+        guard let field = instructionField, field.window === self,
+              makeFirstResponder(field), let editor = field.currentEditor() else { return false }
+        editor.selectedRange = NSRange(location: (editor.string as NSString).length, length: 0)
+        return true
+    }
+
+    override func sendEvent(_ event: NSEvent) {
+        if event.type == .keyUp, consumedKey == event.keyCode {
+            consumedKey = nil
+            return
+        }
+        guard event.type == .keyDown, isKeyWindow, acceptsKeyboard else { super.sendEvent(event); return }
+        if event.isARepeat, consumedKey == event.keyCode { return }
+        if !event.isARepeat { consumedKey = nil }
+        let modifiers: NSEvent.ModifierFlags = [.command, .control, .option, .shift, .function]
+        guard !event.isARepeat, event.modifierFlags.intersection(modifiers).isEmpty else { super.sendEvent(event); return }
+        let editor = firstResponder as? NSTextView
+        if editor?.hasMarkedText() == true { super.sendEvent(event); return }
+        if event.keyCode == 53 {
+            cancelOperation(nil)
+        } else {
+            guard editor?.isEditable != true, let key = event.charactersIgnoringModifiers?.lowercased(),
+                  performToolKey?(key) == true else { super.sendEvent(event); return }
+        }
+        consumedKey = event.keyCode
+    }
+
+    override func cancelOperation(_ sender: Any?) {
+        if let editor = firstResponder as? NSTextView, editor.isEditable {
+            if !editor.hasMarkedText() { makeFirstResponder(nil) }
+        } else {
+            dismiss?()
+        }
+    }
+}
+
+private final class InstructionField: NSTextField {
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        (window as? SelectionKeyPanel)?.instructionField = self
+    }
+}
+
+private struct SelectionInstructionField: NSViewRepresentable {
+    @Binding var text: String
+    let submit: () -> Void
+
+    func makeCoordinator() -> Coordinator { Coordinator(self) }
+
+    func makeNSView(context: Context) -> NSTextField {
+        let field = InstructionField()
+        field.placeholderString = "描述想做的修改…"
+        field.setAccessibilityLabel("自定义指令")
+        field.setAccessibilityHelp("按 I 输入指令，按回车执行")
+        field.bezelStyle = .roundedBezel
+        field.controlSize = .small
+        field.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
+        field.lineBreakMode = .byTruncatingTail
+        (field.cell as? NSTextFieldCell)?.usesSingleLineMode = true
+        (field.cell as? NSTextFieldCell)?.sendsActionOnEndEditing = false
+        field.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        field.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        field.delegate = context.coordinator
+        field.target = context.coordinator
+        field.action = #selector(Coordinator.submit(_:))
+        return field
+    }
+
+    func updateNSView(_ field: NSTextField, context: Context) {
+        context.coordinator.parent = self
+        if field.currentEditor() == nil, field.stringValue != text { field.stringValue = text }
+    }
+
+    final class Coordinator: NSObject, NSTextFieldDelegate {
+        var parent: SelectionInstructionField
+        init(_ parent: SelectionInstructionField) { self.parent = parent }
+
+        func controlTextDidChange(_ notification: Notification) {
+            if let field = notification.object as? NSTextField { parent.text = field.stringValue }
+        }
+        @objc func submit(_ sender: NSTextField) {
+            guard (sender.currentEditor() as? NSTextView)?.hasMarkedText() != true else { return }
+            parent.text = sender.stringValue
+            parent.submit()
+        }
+    }
+}
+
 /// A nonactivating panel receives its first click directly in this AppKit button.
 final class SelectionLauncherButton: NSButton {
     static let size = NSSize(width: 154, height: 30)
@@ -79,7 +183,7 @@ struct SelectionToolsView: View {
             }
             .buttonStyle(.plain)
             .accessibilityLabel("关闭写作工具")
-            .keyboardShortcut(.cancelAction)
+            .help("关闭写作工具（Esc）")
         }
     }
 
@@ -87,9 +191,9 @@ struct SelectionToolsView: View {
         Group {
             excerpt
             HStack(spacing: 6) {
-                TextField("描述想做的修改…", text: $model.customInstruction)
-                    .textFieldStyle(.roundedBorder)
-                    .onSubmit(model.runCustom)
+                keyHint(SelectionKeyPanel.instructionKey)
+                SelectionInstructionField(text: $model.customInstruction, submit: model.runCustom)
+                    .frame(maxWidth: .infinity)
                 Button(action: model.runCustom) { Image(systemName: "arrow.right") }
                     .accessibilityLabel("执行自定义指令")
                     .disabled(model.customInstruction.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
@@ -100,8 +204,10 @@ struct SelectionToolsView: View {
                     Text(group.rawValue).font(.caption).foregroundStyle(.secondary)
                         .frame(width: 32, alignment: .leading)
                     ForEach(selectionQuickActions.filter { $0.group == group }, id: \.name) { action in
-                        Button(action.name) { model.run(action) }
-                            .help(action.name == "翻译" ? "翻译成英文" : action.name)
+                        if let key = action.shortcut {
+                            shortcutButton(action.name, key: key) { model.run(action) }
+                                .help(action.name == "翻译" ? "翻译成英文（T）" : "\(action.name)（\(key.uppercased())）")
+                        }
                     }
                 }
             }
@@ -115,6 +221,8 @@ struct SelectionToolsView: View {
                 .fixedSize()
             }
             feedback
+            Text("按字母选工具 · 输入时 ↩ 执行，Esc 返回")
+                .font(.caption).foregroundStyle(.secondary)
         }
     }
 
@@ -126,12 +234,17 @@ struct SelectionToolsView: View {
     private var review: some View {
         Group {
             if !model.result.isEmpty {
-                Picker("查看文本", selection: $model.showingOriginal) {
-                    Text("结果").tag(false)
-                    Text("原文").tag(true)
+                HStack(spacing: 6) {
+                    Picker("查看文本", selection: $model.showingOriginal) {
+                        Text("结果").tag(false)
+                        Text("原文").tag(true)
+                    }
+                    .labelsHidden().pickerStyle(.segmented)
+                    .accessibilityLabel("查看文本")
+                    .accessibilityHint("按 O 切换原文与结果")
+                    keyHint(SelectionReviewKey.original.rawValue)
                 }
-                .labelsHidden().pickerStyle(.segmented)
-                .accessibilityLabel("查看文本")
+                .help("切换原文与结果（O）")
                 .disabled(model.writing)
                 ScrollView {
                     Text(verbatim: model.showingOriginal ? model.original : model.result)
@@ -150,18 +263,18 @@ struct SelectionToolsView: View {
                         NotificationCenter.default.post(name: .init("nc.openSettings"), object: nil)
                     }
                 }
-                Button("换个工具", action: model.chooseAnotherTool)
+                shortcutButton("换个工具", key: SelectionReviewKey.back.rawValue, action: model.chooseAnotherTool)
                 if let action = model.action {
-                    Button(model.result.isEmpty ? "重试" : "重新生成") { model.run(action) }
+                    shortcutButton(model.result.isEmpty ? "重试" : "重新生成", key: SelectionReviewKey.generate.rawValue) { model.run(action) }
                 }
                 Spacer()
                 if !model.result.isEmpty {
                     let preferReplace = model.canWrite && model.action?.group == .edit
-                    resultButton(model.showingOriginal ? "复制原文" : "复制结果", primary: !preferReplace) { model.copyPreview() }
+                    shortcutButton(model.showingOriginal ? "复制原文" : "复制结果", key: SelectionReviewKey.copy.rawValue, primary: !preferReplace) { model.copyPreview() }
                     if model.hasReplacementTarget && !model.staleSelection {
-                        Button("追加") { model.writeResult(append: true) }
-                            .help("追加到原选区末尾").disabled(!model.canWrite)
-                        resultButton("替换选区", primary: preferReplace) { model.writeResult(append: false) }
+                        shortcutButton("追加", key: SelectionReviewKey.append.rawValue) { model.writeResult(append: true) }
+                            .help("追加到原选区末尾（A）").disabled(!model.canWrite)
+                        shortcutButton("替换选区", key: SelectionReviewKey.replace.rawValue, primary: preferReplace) { model.writeResult(append: false) }
                             .disabled(!model.canWrite)
                     }
                 }
@@ -170,8 +283,19 @@ struct SelectionToolsView: View {
         }
     }
 
-    @ViewBuilder private func resultButton(_ title: String, primary: Bool, action: @escaping () -> Void) -> some View {
-        let button = Button(title, action: action)
+    private func keyHint(_ key: String) -> some View {
+        Text(verbatim: key.uppercased()).font(.system(.caption, design: .monospaced))
+            .foregroundStyle(.secondary).accessibilityHidden(true)
+    }
+
+    @ViewBuilder private func shortcutButton(_ title: String, key: String, primary: Bool = false,
+                                            action: @escaping () -> Void) -> some View {
+        let button = Button(action: action) {
+            HStack(spacing: 4) { Text(verbatim: title); keyHint(key) }
+        }
+        .accessibilityLabel(Text(verbatim: title))
+        .accessibilityHint(Text("快捷键 \(key.uppercased())"))
+        .help("\(title)（\(key.uppercased())）")
         if primary { button.buttonStyle(.borderedProminent) } else { button }
     }
 

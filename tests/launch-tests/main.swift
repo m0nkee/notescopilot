@@ -198,6 +198,7 @@ struct LaunchTests {
         service.openSelectionWritingTools(board, userData: nil, error: &error)
         check(error != nil && service.original == selected, "whitespace is rejected without replacing an open review")
         service.hide()
+        await checkToolShortcuts(excerpt: selected)
 
         let element = AXUIElementCreateApplication(12345)
         let snapshot = NotesBridge.SelectionSnapshot(element: element, range: CFRange(location: range.location, length: range.length),
@@ -267,11 +268,92 @@ struct LaunchTests {
             tools.run(edit)
             await request.task?.value
             let before = writes
-            tools.writeResult(append: append)
+            sendToolKey(append ? "a" : "r", code: append ? 0 : 15)
             let expectedRange = append ? NSRange(location: NSMaxRange(range), length: 0) : range
             check(writes == before + 1 && writtenRange == expectedRange && writtenText == candidate,
                   "explicit Notes confirmation writes the reviewed draft once to its bound range, append=\(append)")
         }
+    }
+
+    /// Deliver through the app so AppKit dispatches to the real key window and its field editor.
+    static func sendToolKey(_ text: String, code: UInt16, modifiers: NSEvent.ModifierFlags = [], repeating: Bool = false) {
+        guard let window = NSApp.windows.first(where: { $0.isVisible && $0.title == "NotesCopilot 写作工具" }),
+              let event = NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: modifiers,
+                                           timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber,
+                                           context: nil, characters: text, charactersIgnoringModifiers: text,
+                                           isARepeat: repeating, keyCode: code) else { return }
+        NSApp.sendEvent(event)
+    }
+
+    private static func checkToolShortcuts(excerpt: String) async {
+        let board = NSPasteboard.withUniqueName()
+        defer { board.releaseGlobally() }
+        board.setString(excerpt, forType: .string)
+        var instructions: [String] = []
+        let request = SelectionAIRequest { instruction, _ in
+            instructions.append(instruction)
+            return "工具结果"
+        }
+        let panel = SelectionAIPanel(request: request)
+        defer { panel.hide() }
+        panel.openSelectionWritingTools(board, userData: nil, error: nil)
+        settle()
+        guard let window = NSApp.windows.first(where: { $0.isKeyWindow && $0.title == "NotesCopilot 写作工具" }) else {
+            check(false, "the tool menu takes keyboard focus")
+            return
+        }
+        check(window.firstResponder as? NSTextView == nil, "the menu opens ready for command letters")
+        let shortcuts: [(String, UInt16, String)] = [
+            ("t", 17, "翻译"), ("p", 35, "校对"), ("r", 15, "润色"), ("c", 8, "精简"), ("s", 1, "总结"), ("e", 14, "解释")
+        ]
+        for (letter, code, title) in shortcuts {
+            let previous = instructions.count
+            sendToolKey(letter, code: code)
+            sendToolKey(letter, code: code, repeating: true)
+            await request.task?.value
+            check(panel.phase == .review && instructions.count == previous + 1 &&
+                  instructions.last == selectionQuickActions.first(where: { $0.name == title })?.instruction,
+                  "the displayed \(letter.uppercased()) key runs \(title) once")
+            sendToolKey("b", code: 11)
+            check(panel.phase == .menu && panel.original == excerpt, "B returns to the same excerpt after \(title)")
+        }
+        sendToolKey("T", code: 17, modifiers: .shift)
+        check(panel.phase == .menu, "modified letters do not dispatch a bare command")
+        sendToolKey("i", code: 34)
+        guard let editor = window.firstResponder as? NSTextView, editor.isEditable else {
+            check(false, "I assigns the keyboard to the instruction field")
+            return
+        }
+        sendToolKey("i", code: 34, repeating: true)
+        sendToolKey("t", code: 17)
+        sendToolKey("i", code: 34)
+        check(panel.phase == .menu && panel.customInstruction == "ti", "the editor receives shortcut letters and ignores repeat from the opening I")
+        editor.setMarkedText("拼", selectedRange: NSRange(location: 1, length: 0), replacementRange: editor.selectedRange())
+        sendToolKey("\u{1b}", code: 53)
+        check(window.isVisible && window.firstResponder === editor && panel.phase == .menu,
+              "Escape during marked input leaves editing with the input method")
+        if editor.hasMarkedText() { editor.unmarkText() }
+        sendToolKey("\u{1b}", code: 53)
+        check(window.firstResponder !== editor && panel.phase == .menu, "Escape leaves editing and keeps the tools open")
+        sendToolKey("i", code: 34)
+        if let input = window.firstResponder as? NSTextView {
+            input.insertText("请保留原意 ti", replacementRange: NSRange(location: 0, length: (input.string as NSString).length))
+        }
+        let draft = panel.customInstruction
+        sendToolKey("\r", code: 36)
+        await request.task?.value
+        check(!draft.isEmpty && panel.phase == .review && instructions.last == draft, "Return submits the typed custom instruction")
+        sendToolKey("o", code: 31)
+        check(panel.showingOriginal, "O switches the review to the source text")
+        sendToolKey("r", code: 15)
+        sendToolKey("a", code: 0)
+        check(!panel.canWrite && panel.phase == .review && !panel.writing, "A and R respect a read-only review")
+        let count = instructions.count
+        sendToolKey("g", code: 5)
+        await request.task?.value
+        check(instructions.count == count + 1 && instructions.last == draft && !panel.showingOriginal, "G regenerates the same instruction")
+        sendToolKey("\u{1b}", code: 53)
+        check(!window.isVisible, "Escape outside the editor closes the review")
     }
 
     private static func checkToolWindow(_ name: String, width: CGFloat) throws {

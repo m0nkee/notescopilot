@@ -151,7 +151,10 @@ extension LaunchTests {
         check(panel.phase == .menu && panel.original == "这是什么？", "translation menu captured the five-character excerpt")
         try await send("collapse")
         try await Task.sleep(nanoseconds: 480_000_000)
-        panel.run(translate)
+        // The fixture deliberately reactivates the source to collapse its range.
+        // Re-enter the tool window before sending a panel-local shortcut.
+        NSApp.windows.first { $0.isVisible && $0.title == "NotesCopilot 写作工具" }?.makeKeyAndOrderFront(nil)
+        sendToolKey("t", code: 17)
         await request.task?.value
         let copy = NSPasteboard.withUniqueName()
         panel.copyPreview(to: copy)
