@@ -37,4 +37,11 @@ ln -s /Applications "$STAGE/Applications"
 hdiutil create -volname "NotesCopilot $VERSION" -srcfolder "$STAGE" \
   -fs HFS+ -format UDZO "$OUTPUT"
 hdiutil verify "$OUTPUT"
+CHECKSUM="$OUTPUT.sha256"
+(
+  cd "$(dirname "$OUTPUT")"
+  shasum -a 256 "$(basename "$OUTPUT")"
+) > "$CHECKSUM"
+(cd "$(dirname "$OUTPUT")" && shasum -a 256 -c "$(basename "$CHECKSUM")")
 echo "DMG OK: $OUTPUT"
+echo "SHA-256 OK: $CHECKSUM"

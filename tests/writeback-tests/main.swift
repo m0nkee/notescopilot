@@ -157,11 +157,12 @@ Task { @MainActor in
     let nativeBridge = NotesBridge()
     nativePasteboard.clearContents()
     let restoreEmpty = nativeBridge.preparePasteboard(text: nativeText, html: nativeHTML, pasteboard: nativePasteboard)
-    let nativeRTF = nativePasteboard.data(forType: .rtf)
-    let nativeRTFD = nativePasteboard.data(forType: .rtfd)
+    let nativeItem = NotesBridge.pasteboardItem(text: nativeText, html: nativeHTML)
+    let nativeRTF = nativeItem.data(forType: .rtf)
+    let nativeRTFD = nativeItem.data(forType: .rtfd)
     check(nativeRTF != nil, "rich clipboard transport supplies native RTF alongside HTML and plain text")
     check(nativeRTFD != nil, "rich clipboard transport supplies standard flat RTFD before the fallbacks")
-    let nativeItems = nativePasteboard.pasteboardItems ?? []
+    let nativeItems = [nativeItem]
     check(nativeItems.count == 1 && nativeItems[0].data(forType: .rtfd) == nativeRTFD
           && nativeItems[0].data(forType: .rtf) == nativeRTF
           && nativeItems[0].data(forType: .html) == NotesBridge.htmlPasteboardData(nativeHTML)

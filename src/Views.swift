@@ -310,7 +310,7 @@ struct PanelView: View {
                     promptSection
                     if suggestions.isEmpty { quickActionsRow }
                 }
-            }.frame(maxHeight: showHistory || notesAccessIssue != nil ? 340 : engine.images.isEmpty ? 215 : 265)
+            }.frame(maxHeight: .infinity)
             if !suggestions.isEmpty { suggestionsMenu }
             outputSection
             if !engine.pendingResult.isEmpty { reviewBanner }
@@ -922,6 +922,8 @@ struct SettingsView: View {
     @State private var statusText = ""
     @State private var recoveringCredentials = false
     @State private var lastSavedProfiles: [ModelProfile]?
+    @State private var profileSaveTask: Task<Void, Never>?
+    @State private var pendingDeleteID: UUID?
 
     // 模板与文本扩展
     @State private var templates: [TemplateNote] = TemplateStore.templates
@@ -935,8 +937,18 @@ struct SettingsView: View {
         ? true : UserDefaults.standard.bool(forKey: "nc.slash.global")
     @State private var selAIEnabled = SelectionScope.isEnabled()
     @AppStorage(SelectionScope.defaultsKey) private var selectionScope = SelectionScope.notes
+    @AppStorage(SelectionScope.pausedKey) private var selectionPaused = false
+    @AppStorage(SelectionScope.PrivacyMode.defaultsKey) private var selectionPrivacyMode = SelectionScope.PrivacyMode.blocklist
+    @State private var selectionPrivacyApps: [String] = SelectionScope.privacyApps()
+    @State private var privacyAppChoices: [String] = []
+    @State private var selectedPrivacyApp = ""
+    @State private var manualPrivacyApp = ""
     @State private var newTplName = ""
     @State private var newTplContent = ""
+    @State private var customAICommands: [CustomAICommand] = CustomAICommandStore.commands
+    @State private var newAICommandName = ""
+    @State private var newAICommandPrompt = ""
+    @State private var newAICommandError: String?
     @State private var newTrigger = ""
     @State private var newExpansion = ""
     @State private var kwStatus: String?
@@ -984,30 +996,29 @@ struct SettingsView: View {
             refreshPermissionStatus()
         }
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification).receive(on: DispatchQueue.main)) { _ in
+            refreshPrivacyAppChoices()
             refreshPermissionStatus()
+        }
+        .onDisappear {
+            profileSaveTask?.cancel()
+            saveProfilesNow()
         }
         .onAppear {
             lastSavedProfiles = profiles
+            refreshPrivacyAppChoices()
             refreshPermissionStatus()
             refreshNotesTemplatesStatus()
             if let error = ProfileStore.lastError { statusText = error }
         }
-        .onChange(of: profiles) { list in
-            guard !recoveringCredentials, list != lastSavedProfiles else { return }
-            if ProfileStore.save(list) {
-                lastSavedProfiles = list
-                if let error = ProfileStore.lastError { statusText = error }
-                else if statusText.contains("钥匙串") || statusText.hasPrefix("配置未保存") {
-                    statusText = "配置已保存。"
-                }
-            }
-            else { statusText = ProfileStore.lastError ?? "配置保存失败" }
+        .onChange(of: profiles) { _ in
+            scheduleProfileSave()
         }
         .onChange(of: activeID) { id in
             ProfileStore.activeID = id
             updateActiveStatus()
         }
         .onChange(of: templates) { TemplateStore.templates = $0 }
+        .onChange(of: customAICommands) { CustomAICommandStore.commands = $0 }
         .onChange(of: rules) { KeywordStore.rules = $0 }
         .onChange(of: kwEnabled) { on in
             UserDefaults.standard.set(on, forKey: "nc.kw.enabled")
@@ -1027,6 +1038,18 @@ struct SettingsView: View {
             }
         }
         .onChange(of: selectionScope) { _ in SelectionWatcher.shared.scopeDidChange() }
+        .onChange(of: selectionPaused) { _ in
+            UserDefaults.standard.set(selectionPaused, forKey: SelectionScope.pausedKey)
+            SelectionWatcher.shared.scopeDidChange()
+        }
+        .onChange(of: selectionPrivacyMode) { mode in
+            UserDefaults.standard.set(mode.rawValue, forKey: SelectionScope.PrivacyMode.defaultsKey)
+            SelectionWatcher.shared.scopeDidChange()
+        }
+        .onChange(of: selectionPrivacyApps) { apps in
+            UserDefaults.standard.set(apps, forKey: SelectionScope.privacyAppsKey)
+            SelectionWatcher.shared.scopeDidChange()
+        }
     }
 
     /// ── 左侧导航（Magpie NavigationView 自绘：选中项 accent 胶囊高亮）──
@@ -1107,17 +1130,42 @@ struct SettingsView: View {
             .padding(.horizontal, 14)
             .padding(.bottom, 8)
             if let release = updater.availableRelease {
-                Button(updater.isDownloading ? "正在下载 v\(release.version)…" : "直接下载 v\(release.version)") {
-                    Task { @MainActor in
-                        guard let fileURL = await updater.download() else { return }
-                        NSWorkspace.shared.activateFileViewerSelecting([fileURL])
+                if updater.isDownloading {
+                    Button("取消下载") { updater.cancelDownload() }
+                        .buttonStyle(.borderless)
+                        .font(.caption2)
+                        .padding(.horizontal, 14)
+                        .padding(.bottom, 4)
+                    if let progress = updater.downloadProgress {
+                        ProgressView(value: progress)
+                            .padding(.horizontal, 14)
+                            .padding(.bottom, 4)
+                    } else {
+                        ProgressView()
+                            .controlSize(.small)
+                            .padding(.horizontal, 14)
+                            .padding(.bottom, 4)
                     }
+                } else {
+                    Button("直接下载 v\(release.version)") {
+                        Task { @MainActor in
+                            guard let fileURL = await updater.download() else { return }
+                            NSWorkspace.shared.activateFileViewerSelecting([fileURL])
+                        }
+                    }
+                    .buttonStyle(.borderless)
+                    .font(.caption2)
+                    .padding(.horizontal, 14)
+                    .padding(.bottom, 8)
                 }
-                .buttonStyle(.borderless)
-                .font(.caption2)
-                .disabled(updater.isDownloading)
-                .padding(.horizontal, 14)
-                .padding(.bottom, 8)
+                if let notes = release.alertNotes {
+                    Text(notes)
+                        .font(.caption2)
+                        .foregroundColor(.secondary)
+                        .lineLimit(3)
+                        .padding(.horizontal, 14)
+                        .padding(.bottom, 4)
+                }
                 if !updater.downloadStatusMessage.isEmpty {
                     Text(updater.downloadStatusMessage)
                         .font(.caption2)
@@ -1264,6 +1312,9 @@ struct SettingsView: View {
 
     private var modelPage: some View {
         VStack(alignment: .leading, spacing: 12) {
+            if profiles.isEmpty {
+                onboardingCard
+            }
             card("checkmark.seal", "生效状态") {
                 activeStatusRow
             }
@@ -1296,12 +1347,44 @@ struct SettingsView: View {
                 quickAddRow
             }
         }
+        .confirmationDialog("删除这份模型配置？", isPresented: pendingDeleteBinding, titleVisibility: .visible) {
+            Button("删除配置和钥匙串中的 API Key", role: .destructive) {
+                if let id = pendingDeleteID { performDelete(id) }
+            }
+            Button("取消", role: .cancel) { pendingDeleteID = nil }
+        } message: {
+            Text("删除后不可恢复；正在编辑的 Base URL、模型与参数也会一并移除。")
+        }
         .onAppear {
             guard discoverLocalModels, localServices.isEmpty else { return }
             LocalAIProbe.discover { name, port, ids in
                 if !localServices.contains(where: { $0.port == port }) {
                     localServices.append((name, port, ids))
                 }
+            }
+        }
+    }
+
+    private var onboardingCard: some View {
+        card("sparkles", "快速上手（4 步）", note: "可随时跳过；只授予当前功能需要的权限") {
+            VStack(alignment: .leading, spacing: 8) {
+                Label("1. 添加模型：选云端预设、本地服务，或手动填写 Base URL 与模型名。", systemImage: "1.circle")
+                Label("2. 填入 API Key（云端）或确认本地服务地址；密钥只存系统钥匙串。", systemImage: "2.circle")
+                HStack {
+                    Label("3. 测试生成：发送「请只回复 OK」验证端点、凭据和参数。", systemImage: "3.circle")
+                    Spacer()
+                    Button(testingModel ? "测试中…" : "立即测试") { testActiveModel() }
+                        .controlSize(.small)
+                        .disabled(testingModel)
+                }
+                HStack {
+                    Label("4. 按需授权：只用 Notes 时先给辅助功能/自动化；需要其他应用选区时再开启全局。", systemImage: "4.circle")
+                    Spacer()
+                    Button("查看权限") { page = .general }
+                        .controlSize(.small)
+                }
+                Text("未授权时的降级：无辅助功能则斜杠命令和选区浮钮不触发；无 Notes 自动化则不能写回，只能复制结果；无完全磁盘访问则笔记库和模板不可读。")
+                    .font(.caption).foregroundColor(.secondary)
             }
         }
     }
@@ -1319,6 +1402,7 @@ struct SettingsView: View {
         modelFetchGeneration = UUID()
         fetchingID = nil
         let drafts = profiles
+        profileSaveTask?.cancel()
         recoveringCredentials = true
         DispatchQueue.global(qos: .userInitiated).async {
             let saved = ProfileStore.authorizeAndSave(drafts)
@@ -1554,10 +1638,46 @@ struct SettingsView: View {
     }
 
     private func deleteProfile(_ id: UUID) {
+        pendingDeleteID = id
+    }
+
+    private func performDelete(_ id: UUID) {
+        pendingDeleteID = nil
         expandedIDs.remove(id)
         profiles.removeAll { $0.id == id }
         if activeID == id { activeID = profiles.first?.id }
+        profileSaveTask?.cancel()
+        saveProfilesNow()
         statusText = "已删除该配置。"
+    }
+
+    private var pendingDeleteBinding: Binding<Bool> {
+        Binding(
+            get: { pendingDeleteID != nil },
+            set: { if !$0 { pendingDeleteID = nil } }
+        )
+    }
+
+    private func scheduleProfileSave() {
+        profileSaveTask?.cancel()
+        profileSaveTask = Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 500_000_000)
+            guard !Task.isCancelled else { return }
+            saveProfilesNow()
+        }
+    }
+
+    private func saveProfilesNow() {
+        guard !recoveringCredentials, profiles != lastSavedProfiles else { return }
+        if ProfileStore.save(profiles) {
+            lastSavedProfiles = profiles
+            if let error = ProfileStore.lastError { statusText = error }
+            else if statusText.contains("钥匙串") || statusText.hasPrefix("配置未保存") {
+                statusText = "配置已保存。"
+            }
+        } else {
+            statusText = ProfileStore.lastError ?? "配置保存失败"
+        }
     }
 
     private func appendProfile(_ prof: ModelProfile, active: Bool) {
@@ -1571,6 +1691,32 @@ struct SettingsView: View {
         }
     }
 
+    private var activeProfileIndex: Int? {
+        profiles.firstIndex { $0.id == (activeID ?? profiles.first?.id) }
+    }
+
+    private var activeTemperatureBinding: Binding<Double> {
+        Binding(
+            get: { activeProfileIndex.flatMap { profiles[$0].temperature } ?? temperature },
+            set: { value in
+                if let index = activeProfileIndex { profiles[index].temperature = value }
+                else { temperature = value }
+            }
+        )
+    }
+
+    private var activeMaxTokensBinding: Binding<Int> {
+        Binding(
+            get: { activeProfileIndex.flatMap { profiles[$0].maxTokens } ?? maxTokens },
+            set: { value in
+                if let index = activeProfileIndex { profiles[index].maxTokens = value }
+                else { maxTokens = value }
+            }
+        )
+    }
+
+    private var activeMaxTokens: Int { activeMaxTokensBinding.wrappedValue }
+
     // MARK: 生成参数页
 
     private var generationPage: some View {
@@ -1583,11 +1729,11 @@ struct SettingsView: View {
                         Spacer()
                         Text("0.0 – 2.0").font(.caption).foregroundColor(.secondary)
                     }
-                    Slider(value: $temperature, in: 0...2, step: 0.1)
+                    Slider(value: activeTemperatureBinding, in: 0...2, step: 0.1)
                 }
             }
             card("text.quote", "最大输出 tokens") {
-                Stepper("\(maxTokens)", value: $maxTokens, in: 512...32768, step: 512)
+                Stepper("\(activeMaxTokens)", value: activeMaxTokensBinding, in: 512...32768, step: 512)
                     .font(.system(size: 12, weight: .medium))
             }
         }
@@ -1715,6 +1861,75 @@ struct SettingsView: View {
                 }
             }
 
+            // 自定义 AI 命令
+            card("wand.and.stars", "自定义 AI 命令",
+                 note: customAICommands.isEmpty ? "还没有自定义命令" : "斜杠命令：/命令名") {
+                VStack(alignment: .leading, spacing: 8) {
+                    ForEach($customAICommands) { $command in
+                        VStack(alignment: .leading, spacing: 5) {
+                            HStack {
+                                Text("/\(command.name.isEmpty ? "未命名" : command.name)")
+                                    .font(.system(size: 12, weight: .semibold, design: .monospaced))
+                                    .foregroundStyle(Color.accentColor)
+                                Spacer()
+                                Toggle("启用", isOn: $command.enabled)
+                                    .toggleStyle(.checkbox)
+                                    .controlSize(.mini)
+                                Button(role: .destructive) {
+                                    customAICommands.removeAll { $0.id == command.id }
+                                } label: {
+                                    Image(systemName: "trash")
+                                }
+                                .buttonStyle(.borderless)
+                                .controlSize(.small)
+                            }
+                            TextField("命令名", text: $command.name)
+                                .textFieldStyle(.roundedBorder)
+                            if !CustomAICommand.hasValidName(command.name, existing: customAICommands, excludingID: command.id) {
+                                Text("命令名需 1–32 个字符，不能含空格、斜杠或反斜杠，也不能与其他自定义命令重复。")
+                                    .font(.caption2).foregroundColor(.red)
+                            }
+                            TextField("提示词", text: $command.prompt, axis: .vertical)
+                                .lineLimit(2...4)
+                                .textFieldStyle(.roundedBorder)
+                        }
+                    }
+                    if customAICommands.isEmpty {
+                        Text("创建后可直接在 Notes 或命令面板输入 /命令名 执行固定提示词。")
+                            .font(.caption).foregroundColor(.secondary)
+                    }
+                    TextField("新命令名（如 weekly）", text: $newAICommandName)
+                        .textFieldStyle(.roundedBorder)
+                    TextField("新提示词（如 把本周记录整理成周报）", text: $newAICommandPrompt, axis: .vertical)
+                        .lineLimit(2...3)
+                        .textFieldStyle(.roundedBorder)
+                    HStack {
+                        Spacer()
+                        Button("添加 AI 命令") {
+                            let name = newAICommandName.trimmingCharacters(in: .whitespacesAndNewlines)
+                            let prompt = newAICommandPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
+                            guard CustomAICommand.hasValidName(name, existing: customAICommands) else {
+                                newAICommandError = "命令名需 1–32 个字符，不能含空格、斜杠或反斜杠，也不能与其他自定义命令重复。"
+                                return
+                            }
+                            guard !prompt.isEmpty else {
+                                newAICommandError = "请填写提示词。"
+                                return
+                            }
+                            customAICommands.append(CustomAICommand(name: name, prompt: prompt))
+                            newAICommandName = ""
+                            newAICommandPrompt = ""
+                            newAICommandError = nil
+                        }
+                        .disabled(newAICommandName.trimmingCharacters(in: .whitespaces).isEmpty
+                                  || newAICommandPrompt.trimmingCharacters(in: .whitespaces).isEmpty)
+                        if let error = newAICommandError {
+                            Text(error).font(.caption2).foregroundColor(.red)
+                        }
+                    }
+                }
+            }
+
             // 新建模板
             card("plus.square.on.square", "新建模板") {
                 VStack(alignment: .leading, spacing: 8) {
@@ -1808,6 +2023,24 @@ struct SettingsView: View {
         }
     }
 
+    private func refreshPrivacyAppChoices() {
+        privacyAppChoices = NSWorkspace.shared.runningApplications
+            .filter { $0.activationPolicy == .regular }
+            .compactMap { app in app.bundleIdentifier ?? app.localizedName }
+            .filter { $0 != Bundle.main.bundleIdentifier }
+            .sorted { $0.caseInsensitiveCompare($1) == .orderedAscending }
+        if selectedPrivacyApp.isEmpty || !privacyAppChoices.contains(selectedPrivacyApp) {
+            selectedPrivacyApp = privacyAppChoices.first ?? ""
+        }
+    }
+
+    private func addPrivacyApp(_ rawIdentity: String) {
+        let identity = rawIdentity.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !identity.isEmpty, !selectionPrivacyApps.contains(identity) else { return }
+        selectionPrivacyApps.append(identity)
+        manualPrivacyApp = ""
+    }
+
     // MARK: 文本扩展页（KeywordListener）
 
     private var expansionPage: some View {
@@ -1821,10 +2054,58 @@ struct SettingsView: View {
                         Text("全局").tag(SelectionScope.global)
                     }
                     .pickerStyle(.segmented)
-                    Text(selectionScope == .global
-                         ? "在其他应用中选中文字即可显示工具。可以复制处理结果，在可编辑的输入框中还可替换或追加到选区末尾。"
-                         : "在 Notes 正文中选中文字后，可校对、润色或输入指令，审阅后可替换或追加。")
-                        .font(.caption).foregroundColor(.secondary)
+                    if selectionScope == .global {
+                        Toggle("临时暂停其他应用中的选区识别", isOn: $selectionPaused)
+                            .toggleStyle(.switch)
+                        Picker("应用权限", selection: $selectionPrivacyMode) {
+                            Text("黑名单").tag(SelectionScope.PrivacyMode.blocklist)
+                            Text("白名单").tag(SelectionScope.PrivacyMode.allowlist)
+                        }
+                        .pickerStyle(.segmented)
+                        HStack {
+                            Picker("运行中的应用", selection: $selectedPrivacyApp) {
+                                ForEach(privacyAppChoices, id: \.self) { app in
+                                    Text(verbatim: app).tag(app)
+                                }
+                            }
+                            .labelsHidden()
+                            Button("添加选中") { addPrivacyApp(selectedPrivacyApp) }
+                                .buttonStyle(.borderless)
+                                .font(.caption)
+                                .disabled(selectedPrivacyApp.isEmpty || selectionPrivacyApps.contains(selectedPrivacyApp))
+                            Spacer()
+                            Text("名单：\(selectionPrivacyApps.count) 个应用")
+                                .font(.caption).foregroundColor(.secondary)
+                        }
+                        HStack {
+                            TextField("手动输入 bundle ID 或应用名", text: $manualPrivacyApp)
+                                .textFieldStyle(.roundedBorder)
+                            Button("添加") { addPrivacyApp(manualPrivacyApp) }
+                                .buttonStyle(.borderless)
+                                .font(.caption)
+                                .disabled(manualPrivacyApp.trimmingCharacters(in: .whitespaces).isEmpty)
+                        }
+                        ForEach(selectionPrivacyApps, id: \.self) { app in
+                            HStack {
+                                Text(verbatim: app)
+                                    .font(.system(.caption, design: .monospaced))
+                                    .lineLimit(1).truncationMode(.middle)
+                                Spacer()
+                                Button {
+                                    selectionPrivacyApps.removeAll { $0 == app }
+                                } label: {
+                                    Image(systemName: "minus.circle")
+                                }
+                                .buttonStyle(.borderless)
+                                .controlSize(.small)
+                            }
+                        }
+                        Text("白名单只处理列出的应用；黑名单排除列出的应用。选择工具触发 AI 时，选中文字会发送到当前生效模型；本设置只保存应用标识，不保存选中文本。")
+                            .font(.caption).foregroundColor(.orange)
+                    } else {
+                        Text("在 Notes 正文中选中文字后，可校对、润色或输入指令，审阅后可替换或追加。")
+                            .font(.caption).foregroundColor(.secondary)
+                    }
                 }
                 Text("自动显示需要辅助功能权限，Notes 写回还需 Notes 自动化权限。也可通过「服务 → 用 NotesCopilot 处理选中文本」手动打开工具。")
                     .font(.caption).foregroundColor(.secondary)
@@ -1908,16 +2189,40 @@ struct SettingsView: View {
                     .foregroundColor(updater.availableRelease == nil ? .secondary : .orange)
                     .accessibilityIdentifier("settings.updates.status")
                 if let release = updater.availableRelease {
-                    Button(updater.isDownloading ? "正在下载 v\(release.version)…" : "直接下载 v\(release.version)") {
-                        Task { @MainActor in
-                            guard let fileURL = await updater.download() else { return }
-                            NSWorkspace.shared.activateFileViewerSelecting([fileURL])
+                    if updater.isDownloading {
+                        HStack {
+                            Button("取消下载") { updater.cancelDownload() }
+                                .controlSize(.small)
+                                .accessibilityIdentifier("settings.updates.cancelDownload")
+                            if let progress = updater.downloadProgress {
+                                ProgressView(value: progress)
+                                    .frame(maxWidth: 180)
+                            } else {
+                                ProgressView()
+                                    .controlSize(.small)
+                            }
                         }
-                    }
+                    } else {
+                        Button("直接下载 v\(release.version)") {
+                            Task { @MainActor in
+                                guard let fileURL = await updater.download() else { return }
+                                NSWorkspace.shared.activateFileViewerSelecting([fileURL])
+                            }
+                        }
                         .controlSize(.small)
-                        .disabled(updater.isDownloading)
                         .accessibilityIdentifier("settings.updates.download")
-                    Text("DMG 会下载到「下载」文件夹并在 Finder 中显示。安装时拖入「Applications」替换旧版本。若 macOS 提示无法验证应用，先点「完成」，再到「系统设置 → 隐私与安全性」点「仍要打开」。")
+                    }
+                    if let notes = release.alertNotes {
+                        ScrollView {
+                            Text(notes)
+                                .font(.caption2)
+                                .foregroundColor(.secondary)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                        .frame(maxHeight: 100)
+                        .background(.background.opacity(0.6), in: RoundedRectangle(cornerRadius: 5))
+                    }
+                    Text("DMG 会先校验 SHA-256，下载到「下载」文件夹并在 Finder 中显示。安装时拖入「Applications」替换旧版本。若 macOS 提示无法验证应用，先点「完成」，再到「系统设置 → 隐私与安全性」点「仍要打开」。")
                         .font(.caption2).foregroundColor(.secondary)
                     if !updater.downloadStatusMessage.isEmpty {
                         Text(updater.downloadStatusMessage)

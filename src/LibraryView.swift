@@ -9,6 +9,9 @@ struct LibraryView: View {
     @State private var foldersList: [(pk: Int64, name: String)] = []
     @State private var tags: [String] = []
     @State private var searchText = ""
+    @State private var searchTask: Task<Void, Never>?
+    @State private var recentSearches: [String] = UserDefaults.standard.stringArray(forKey: "nc.library.recentSearches") ?? []
+    @State private var showMarkdownPreview = false
     @State private var selectedNote: NoteSummary?
     @State private var selection = LibrarySelectionState()
     @State private var backlinksList: [NoteSummary] = []
@@ -55,6 +58,14 @@ struct LibraryView: View {
             }
         }
         .onAppear { reload() }
+        .onChange(of: searchText) { _ in
+            searchTask?.cancel()
+            searchTask = Task { @MainActor in
+                try? await Task.sleep(nanoseconds: 300_000_000)
+                guard !Task.isCancelled else { return }
+                reload()
+            }
+        }
         .onReceive(NotificationCenter.default.publisher(for: .init("nc.storeAvailable"))) { _ in reload() }
         // FSEvents 重索引完成后自动刷新（对应 ProNotes 的 Indexing completed → 刷新列表）
         .onReceive(NotificationCenter.default.publisher(for: .init("nc.storeDidReindex"))) { _ in
@@ -133,9 +144,37 @@ struct LibraryView: View {
                 Image(systemName: "magnifyingglass").foregroundColor(.secondary)
                 TextField("搜索标题和正文", text: $searchText)
                     .textFieldStyle(.roundedBorder)
-                    .onSubmit { reload() }
-                Button("搜") { reload() }
+                    .onSubmit { rememberSearch(); reload() }
+                if !searchText.isEmpty {
+                    Button {
+                        searchText = ""
+                        reload()
+                    } label: {
+                        Image(systemName: "xmark.circle.fill").foregroundColor(.secondary)
+                    }
+                    .buttonStyle(.plain)
+                    .help("清空搜索")
+                }
+                Button("搜") { rememberSearch(); reload() }
                     .disabled(searchText.trimmingCharacters(in: .whitespaces).isEmpty)
+                if !recentSearches.isEmpty {
+                    Menu {
+                        ForEach(recentSearches, id: \.self) { query in
+                            Button(query) {
+                                searchText = query
+                                rememberSearch(query)
+                                reload()
+                            }
+                        }
+                        Button("清空最近搜索") {
+                            recentSearches = []
+                            UserDefaults.standard.set([String](), forKey: "nc.library.recentSearches")
+                        }
+                    } label: {
+                        Label("最近", systemImage: "clock.arrow.circlepath")
+                    }
+                    .fixedSize()
+                }
                 // 排序菜单（证据：updatedDescending / updatedAscending / createdDescending / createdAscending）
                 Menu {
                     ForEach(SearchSort.allCases, id: \.self) { s in
@@ -154,7 +193,7 @@ struct LibraryView: View {
                 select(id.flatMap { value in notesList.first { $0.pk == value } })
             })) {
                 ForEach(notesList) { n in
-                    NoteRow(note: n)
+                    NoteRow(note: n, query: searchText.trimmingCharacters(in: .whitespaces))
                         .tag(n.pk)
                         .contentShape(Rectangle())
                 }
@@ -239,12 +278,28 @@ struct LibraryView: View {
                     Label(warning, systemImage: "exclamationmark.triangle")
                         .font(.caption).foregroundStyle(.orange).padding(12)
                 }
+                HStack {
+                    Picker("正文格式", selection: $showMarkdownPreview) {
+                        Text("Markdown").tag(false)
+                        Text("预览").tag(true)
+                    }
+                    .pickerStyle(.segmented)
+                    .frame(width: 180)
+                    Spacer()
+                }
+                .padding(.horizontal, 12)
                 ScrollView {
-                    Text(bodyMarkdown)
-                        .font(.system(size: 12, design: .monospaced))
-                        .textSelection(.enabled)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .padding(12)
+                    if showMarkdownPreview {
+                        MarkdownPreview(text: bodyMarkdown)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(12)
+                    } else {
+                        Text(bodyMarkdown)
+                            .font(.system(size: 12, design: .monospaced))
+                            .textSelection(.enabled)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(12)
+                    }
                 }
                 if !backlinksList.isEmpty {
                     Divider()
@@ -290,6 +345,15 @@ struct LibraryView: View {
 
     private var store: NotesStore? {
         (NSApp.delegate as? AppDelegate)?.notesStore
+    }
+
+    private func rememberSearch(_ rawQuery: String? = nil) {
+        let query = (rawQuery ?? searchText).trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !query.isEmpty else { return }
+        recentSearches.removeAll { $0 == query }
+        recentSearches.insert(query, at: 0)
+        recentSearches = Array(recentSearches.prefix(8))
+        UserDefaults.standard.set(recentSearches, forKey: "nc.library.recentSearches")
     }
 
     private func reload() {
@@ -365,12 +429,29 @@ struct LibraryView: View {
 
 struct NoteRow: View {
     let note: NoteSummary
+    let query: String
+
     var body: some View {
         VStack(alignment: .leading, spacing: 2) {
-            Text(note.title).font(.callout.weight(.medium)).lineLimit(1)
-            Text(note.snippet.replacingOccurrences(of: "\u{FFFC}", with: ""))
+            Self.highlighted(note.title, query: query).font(.callout.weight(.medium)).lineLimit(1)
+            Self.highlighted(note.snippet.replacingOccurrences(of: "\u{FFFC}", with: ""), query: query)
                 .font(.caption).foregroundColor(.secondary).lineLimit(1)
         }
         .padding(.vertical, 2)
+    }
+
+    static func highlighted(_ text: String, query: String) -> Text {
+        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return Text(verbatim: text) }
+        var result = Text("")
+        var start = text.startIndex
+        while let range = text.range(of: trimmed,
+                                     options: [.caseInsensitive, .diacriticInsensitive],
+                                     range: start..<text.endIndex) {
+            result = result + Text(verbatim: String(text[start..<range.lowerBound]))
+                + Text(verbatim: String(text[range])).foregroundColor(.orange).bold()
+            start = range.upperBound
+        }
+        return result + Text(verbatim: String(text[start...]))
     }
 }

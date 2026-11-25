@@ -65,4 +65,5 @@ if [ "${NC_TEST_SYSTEM_SERVICE:-0}" = 1 ]; then
   /System/Library/CoreServices/pbs -update
   /System/Library/CoreServices/pbs -dump 2>&1 | awk '/NotesCopilot Selection Fixture/ { found=1 } END { print "Service discovered in cache:", found ? "yes" : "no" }'
 fi
+codesign --force --sign - "$APP"
 "$APP/Contents/MacOS/NotesCopilotLaunchTests" --run-tests

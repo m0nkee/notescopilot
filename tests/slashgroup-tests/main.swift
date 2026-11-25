@@ -10,6 +10,48 @@ func check(_ cond: Bool, _ name: String) {
     else { fail += 1; print("FAIL  \(name)") }
 }
 
+// ---- 0. 命令缓存与自定义 AI 命令 ----
+do {
+    let first = buildSlashCommands()
+    let second = buildSlashCommands()
+    check(first.map(\.id) == second.map(\.id), "命令清单缓存复用同一批实例")
+    let oldCommands = CustomAICommandStore.commands
+    let oldTemplates = TemplateStore.templates
+    defer {
+        CustomAICommandStore.commands = oldCommands
+        TemplateStore.templates = oldTemplates
+    }
+    CustomAICommandStore.commands = [
+        CustomAICommand(name: "weekly", prompt: "请整理成周报"),
+        CustomAICommand(name: "disabled", prompt: "不会出现", enabled: false)
+    ]
+    let commands = buildSlashCommands()
+    let weekly = commands.first { $0.name == "weekly" }
+    check(weekly?.group == .ai && weekly?.alias == "weekly", "自定义 AI 命令进入 AI 分组并可按别名输入")
+    if case .run(let instruction)? = weekly?.action {
+        check(instruction.prompt(for: "") == "请整理成周报", "自定义 AI 命令保留原提示词")
+    } else { check(false, "自定义 AI 命令保留原提示词") }
+    check(commands.contains { $0.name == "disabled" } == false, "禁用的自定义命令不出现在命令面板")
+    CustomAICommandStore.commands = oldCommands
+    check(buildSlashCommands().contains { $0.name == "weekly" } == false, "删除自定义命令后立即失效缓存")
+    CustomAICommandStore.commands = [
+        CustomAICommand(name: "bad name", prompt: "invalid"),
+        CustomAICommand(name: "slash/name", prompt: "invalid"),
+        CustomAICommand(name: "back\\slash", prompt: "invalid"),
+        CustomAICommand(name: "weekly", prompt: "first"),
+        CustomAICommand(name: "WEEKLY", prompt: "duplicate"),
+        CustomAICommand(name: "polish", prompt: "conflict")
+    ]
+    let filteredCommands = buildSlashCommands()
+    check(!filteredCommands.contains { $0.name == "bad name" || $0.name == "slash/name" || $0.name == "back\\slash" },
+          "自定义命令拒绝空格和斜杠")
+    check(CustomAICommand.hasValidName("weekly", existing: [CustomAICommand(name: "WEEKLY", prompt: "x")]) == false
+          && !filteredCommands.contains { $0.detail.contains("first") || $0.detail.contains("duplicate") },
+          "自定义命令名不允许重复")
+    check(!filteredCommands.contains { $0.name == "polish" && $0.detail.contains("conflict") },
+          "自定义命令不覆盖内置命令")
+}
+
 // ---- 1. group 由 action 推导 ----
 do {
     let cmds = buildSlashCommands()
@@ -53,7 +95,7 @@ do {
     check(order == SlashGroup.displayOrder, "分组顺序与 displayOrder 一致")
     // 每个分组头后面紧跟命令行，无空组
     var ok = true
-    for (i, h) in headers where i + 1 >= rows.count || rows[i + 1].isHeader { ok = false }
+    for (i, _) in headers where i + 1 >= rows.count || rows[i + 1].isHeader { ok = false }
     check(ok, "每个分组头后至少一条命令")
     // 第一条命令行索引
     check(SlashSuggestPanel.firstCmdRow(in: rows) == 1, "首个命令行 = 索引 1（头后）")

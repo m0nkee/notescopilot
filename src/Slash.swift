@@ -45,7 +45,10 @@ enum TemplateStore {
                   let list = try? JSONDecoder().decode([TemplateNote].self, from: d) else { return [] }
             return list
         }
-        set { UserDefaults.standard.set(try? JSONEncoder().encode(newValue), forKey: key) }
+        set {
+            UserDefaults.standard.set(try? JSONEncoder().encode(newValue), forKey: key)
+            SlashCommandCache.invalidate()
+        }
     }
 
     static var notesTemplates: [TemplateNote] {
@@ -57,6 +60,7 @@ enum TemplateStore {
         notesLock.lock()
         notesSnapshot = templates
         notesLock.unlock()
+        SlashCommandCache.invalidate()
         NotificationCenter.default.post(name: notesChangedNotification, object: nil)
     }
 
@@ -128,6 +132,68 @@ enum SlashGroup: CaseIterable {
     static let displayOrder: [SlashGroup] = [.ai, .markdown, .template, .tool]
 }
 
+struct CustomAICommand: Codable, Identifiable, Equatable {
+    var id = UUID()
+    var name = ""
+    var prompt = ""
+    var enabled = true
+
+    /// Command names are typed after `/`; reject whitespace, separators and
+    /// duplicates so the suggestion menu remains deterministic.
+    static func hasValidName(_ rawName: String, existing: [CustomAICommand] = [],
+                             excludingID: UUID? = nil) -> Bool {
+        let name = rawName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty, name.count <= 32,
+              !name.contains(where: { $0.isWhitespace || $0 == "/" || $0 == "\\" }) else { return false }
+        return !existing.contains {
+            $0.id != excludingID
+                && $0.name.trimmingCharacters(in: .whitespacesAndNewlines).caseInsensitiveCompare(name) == .orderedSame
+        }
+    }
+}
+
+enum CustomAICommandStore {
+    private static let key = "nc.customAICommands"
+
+    static var commands: [CustomAICommand] {
+        get {
+            guard let data = UserDefaults.standard.data(forKey: key),
+                  let list = try? JSONDecoder().decode([CustomAICommand].self, from: data) else { return [] }
+            return list
+        }
+        set {
+            UserDefaults.standard.set(try? JSONEncoder().encode(newValue), forKey: key)
+            SlashCommandCache.invalidate()
+        }
+    }
+}
+
+/// AX 轮询每 120ms 会查询命令；缓存避免重复反序列化模板和重建全量清单。
+enum SlashCommandCache {
+    private static let lock = NSLock()
+    private static var cached: [SlashCommand]?
+
+    static func invalidate() {
+        lock.lock()
+        cached = nil
+        lock.unlock()
+    }
+
+    static func commands() -> [SlashCommand] {
+        lock.lock()
+        if let cached {
+            lock.unlock()
+            return cached
+        }
+        lock.unlock()
+        let commands = buildUncachedSlashCommands()
+        lock.lock()
+        if cached == nil { cached = commands }
+        lock.unlock()
+        return commands
+    }
+}
+
 struct SlashCommand: Identifiable {
     let id = UUID()
     let name: String      // 不带斜杠的命令名
@@ -194,7 +260,7 @@ enum SlashQuery {
     }
 }
 
-func buildSlashCommands() -> [SlashCommand] {
+func buildUncachedSlashCommands() -> [SlashCommand] {
     var cmds: [SlashCommand] = [
         SlashCommand(name: "续写", alias: "continue", detail: "基于笔记上下文自然续写", action: .run("请基于上文内容自然地续写下去，保持原文的风格与格式。")),
         SlashCommand(name: "总结", alias: "summarize", detail: "总结笔记上下文的要点", action: .run("请用简洁的要点总结以下内容的核心信息。")),
@@ -238,6 +304,21 @@ SlashCommand(name: "删除线", alias: "strikethrough", detail: "给选中文本
         SlashCommand(name: "停止", alias: "stop", detail: "停止当前生成", action: .stopGeneration),
         SlashCommand(name: "设置", alias: "set", detail: "打开设置", action: .openSettings),
     ]
+    // 用户自定义 AI 命令：与内置 /polish 等同级，可直接输入中文名或英文别名。
+    let allCustomCommands = CustomAICommandStore.commands
+    for custom in allCustomCommands where custom.enabled {
+        let name = custom.name.trimmingCharacters(in: .whitespacesAndNewlines)
+        let prompt = custom.prompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard CustomAICommand.hasValidName(custom.name, existing: allCustomCommands, excludingID: custom.id),
+              !prompt.isEmpty,
+              !cmds.contains(where: { $0.name.caseInsensitiveCompare(name) == .orderedSame
+                                      || $0.alias.caseInsensitiveCompare(name.lowercased().alnum()) == .orderedSame })
+        else { continue }
+        cmds.append(SlashCommand(name: name,
+                                  alias: name.lowercased().alnum(),
+                                  detail: "自定义 AI · \(prompt.replacingOccurrences(of: "\n", with: " ").prefix(48))",
+                                  action: .run(.text(prompt))))
+    }
     // 用户模板（ProNotes：模板经斜杠命令插入；NotesCopilot：变量引擎展开后插入）
     for t in TemplateStore.availableTemplates {
         let safe = t.commandName
@@ -251,6 +332,8 @@ SlashCommand(name: "删除线", alias: "strikethrough", detail: "给选中文本
     }
     return cmds
 }
+
+func buildSlashCommands() -> [SlashCommand] { SlashCommandCache.commands() }
 
 extension String {
     /// 全局键入匹配用：仅保留字母数字（模板名可能含中文——在 IME 下无法逐键匹配，

@@ -976,6 +976,88 @@ private final class ChatTests {
               "an unreadable active credential still blocks HTTP and displays the current configuration failure")
     }
 
+    func generationParametersFollowActiveProfile() {
+        let suite = "nc.chat-tests.profile-generation." + UUID().uuidString
+        let isolated = UserDefaults(suiteName: suite)!
+        let previousDefaults = ProfileStore.defaults
+        let previousConfigDefaults = Config.defaults
+        let previousSecrets = ProfileStore.secretStore
+        let previousArguments = previousDefaults.volatileDomain(forName: UserDefaults.argumentDomain)
+        isolated.setVolatileDomain([:], forName: UserDefaults.argumentDomain)
+        ProfileStore.defaults = isolated
+        Config.defaults = isolated
+        ProfileStore.secretStore = MemoryProfileSecretStore()
+        defer {
+            isolated.removePersistentDomain(forName: suite)
+            ProfileStore.defaults = previousDefaults
+            Config.defaults = previousConfigDefaults
+            ProfileStore.secretStore = previousSecrets
+            previousDefaults.setVolatileDomain(previousArguments, forName: UserDefaults.argumentDomain)
+        }
+        isolated.set(0.2, forKey: "nc.temp")
+        isolated.set(1024, forKey: "nc.maxTokens")
+        let fallback = ModelProfile(name: "fallback", baseURL: "https://fallback.invalid/v1", model: "fallback-model")
+        let tuned = ModelProfile(name: "tuned", baseURL: "https://tuned.invalid/v1", model: "tuned-model",
+                                 temperature: 0.4, maxTokens: 4096)
+        guard ProfileStore.save([fallback, tuned]) else {
+            check(false, "profile-generation fixture saves isolated profiles")
+            return
+        }
+        ProfileStore.activeID = tuned.id
+        let tunedConfiguration = try? AIRequestConfiguration.current()
+        check(tunedConfiguration?.temperature == 0.4 && tunedConfiguration?.maxTokens == 4096,
+              "生效配置的采样温度和输出上限优先于全局默认值")
+        ProfileStore.activeID = fallback.id
+        let fallbackConfiguration = try? AIRequestConfiguration.current()
+        check(fallbackConfiguration?.temperature == 0.2 && fallbackConfiguration?.maxTokens == 1024,
+              "未覆盖参数的配置回退到全局默认值")
+        let stored = ProfileStore.load()
+        check(stored.first { $0.id == tuned.id }?.temperature == 0.4
+              && stored.first { $0.id == tuned.id }?.maxTokens == 4096
+              && stored.first { $0.id == fallback.id }?.temperature == nil,
+              "Profile 参数持久化且空值保持回退语义")
+    }
+
+    func chatSessionPersistsAcrossEngineRestart() {
+        let suite = "nc.chat-tests.session-persistence." + UUID().uuidString
+        let isolated = UserDefaults(suiteName: suite)!
+        let previousDefaults = ChatSessionStore.defaults
+        ChatSessionStore.defaults = isolated
+        defer {
+            isolated.removePersistentDomain(forName: suite)
+            ChatSessionStore.defaults = previousDefaults
+        }
+        let record = ChatSessionRecord(
+            history: [ChatMessageRecord(role: "user", content: "上次问题"),
+                      ChatMessageRecord(role: "assistant", content: "上次回答")],
+            output: "上次回答",
+            submittedPrompt: "上次问题",
+            noteContext: "笔记上下文",
+            contextSource: "选中文本",
+            profileIdentity: "profile|https://model.invalid|model",
+            promptTokens: 11,
+            completionTokens: 7,
+            totalPromptTokens: 22,
+            totalCompletionTokens: 14,
+            savedAt: Date(timeIntervalSince1970: 1_800_000_000))
+        ChatSessionStore.save(record)
+        check(ChatSessionStore.load()?.history == record.history && ChatSessionStore.load()?.profileIdentity == record.profileIdentity,
+              "会话记录可本地持久化且不包含 API Key 字段")
+        let engine = ChatEngine()
+        check(engine.history.count == 2 && engine.output == "上次回答"
+              && engine.submittedPrompt == "上次问题" && engine.noteContext == "笔记上下文",
+              "新引擎恢复上一次多轮对话与上下文")
+        check(engine.responseStatus == "已恢复上次会话", "恢复状态对用户可见")
+        engine.stop()
+        check(ChatSessionStore.load()?.output == "上次回答", "停止生成也会保留可恢复的当前输出")
+        engine.continuous = false
+        check(engine.history.isEmpty && ChatSessionStore.load() == nil, "关闭连续对话会清除本地会话记录")
+        engine.continuous = true
+        engine.beginSession()
+        check(engine.history.isEmpty && engine.output.isEmpty && ChatSessionStore.load() == nil,
+              "新会话会清除本地恢复记录")
+    }
+
     func submittedTaskMatchesExternalRequests() async {
         configure()
         ChatTestProtocol.reset()
@@ -1059,6 +1141,8 @@ private final class ChatTests {
         await changingModelWithinProfileStartsANewConversation()
         userCanAuthorizeAndSaveUnavailableCredentials()
         await unrelatedProfileErrorsDoNotPolluteGeneration()
+        generationParametersFollowActiveProfile()
+        chatSessionPersistsAcrossEngineRestart()
         await submittedTaskMatchesExternalRequests()
         explicitKeychainRecoveryUsesDefaultSystemInteraction()
         print("chat-tests: \(passed) passed, \(failed) failed")
@@ -1071,6 +1155,7 @@ let chatTestSuite = "nc.chat-tests.session." + UUID().uuidString
 let chatTestDefaults = UserDefaults(suiteName: chatTestSuite)!
 ProfileStore.defaults = chatTestDefaults
 Config.defaults = chatTestDefaults
+ChatSessionStore.defaults = chatTestDefaults
 URLProtocol.registerClass(ChatTestProtocol.self)
 Task { @MainActor in await ChatTests().run() }
 RunLoop.main.run()

@@ -45,8 +45,10 @@ struct LaunchTests {
     }
 
     private static func moveOffscreen(_ window: NSWindow) {
-        let screen = NSScreen.screens[0].visibleFrame
-        window.setFrameOrigin(NSPoint(x: screen.maxX + 1000, y: screen.maxY + 1000))
+        let screens = NSScreen.screens
+        let maxX = screens.map(\.visibleFrame.maxX).max() ?? 0
+        let maxY = screens.map(\.visibleFrame.maxY).max() ?? 0
+        window.setFrameOrigin(NSPoint(x: maxX + 1000, y: maxY + 1000))
         settle()
     }
 
@@ -271,6 +273,9 @@ struct LaunchTests {
             await request.task?.value
             let before = writes
             sendToolKey(append ? "a" : "r", code: append ? 0 : 15)
+            check(tools.pendingWriteAppend == append && writes == before,
+                  "keyboard append and replace both request an explicit write preview, append=\(append)")
+            tools.confirmPendingWrite()
             let expectedRange = append ? NSRange(location: NSMaxRange(range), length: 0) : range
             check(writes == before + 1 && writtenRange == expectedRange && writtenText == candidate,
                   "explicit Notes confirmation writes the reviewed draft once to its bound range, append=\(append)")

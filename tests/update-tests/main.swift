@@ -1,4 +1,5 @@
 import Foundation
+import CryptoKit
 
 private final class UpdateProtocol: URLProtocol {
     private static let lock = NSLock()
@@ -61,6 +62,10 @@ private final class UpdateProtocol: URLProtocol {
     }
 }
 
+private func sha256(_ text: String) -> String {
+    SHA256.hash(data: Data(text.utf8)).map { String(format: "%02x", $0) }.joined()
+}
+
 private var passed = 0
 private var failed = 0
 private func check(_ condition: Bool, _ label: String) {
@@ -68,8 +73,13 @@ private func check(_ condition: Bool, _ label: String) {
     else { failed += 1; print("FAIL  \(label)") }
 }
 
-private func release(_ tag: String = "v2.7.0", draft: Bool = false, prerelease: Bool = false) -> String {
-    #"{"tag_name":"\#(tag)","draft":\#(draft),"prerelease":\#(prerelease)}"#
+private func release(_ tag: String = "v2.7.0", draft: Bool = false, prerelease: Bool = false,
+                       digest: String = "1111111111111111111111111111111111111111111111111111111111111111",
+                       notes: String = "测试发布说明") -> String {
+    let version = tag.hasPrefix("v") ? String(tag.dropFirst()) : tag
+    let asset = #"{"name":"NotesCopilot-\#(version)-arm64.dmg","size":13,"browser_download_url":"https://github.com/m0nkee/notescopilot/releases/download/\#(tag)/NotesCopilot-\#(version)-arm64.dmg","digest":"\#(digest)"}"#
+    let checksumAsset = #"{"name":"NotesCopilot-\#(version)-arm64.dmg.sha256","size":96,"browser_download_url":"https://github.com/m0nkee/notescopilot/releases/download/\#(tag)/NotesCopilot-\#(version)-arm64.dmg.sha256"}"#
+    return #"{"tag_name":"\#(tag)","draft":\#(draft),"prerelease":\#(prerelease),"body":"\#(notes)","assets":[\#(asset),\#(checksumAsset)]}"#
 }
 
 @MainActor
@@ -102,7 +112,7 @@ private func runTests() async {
     var completions: [Bool] = []
     updater.onCheckCompleted = { completions.append($0) }
     check(updater.automaticallyChecks && updater.status == .idle, "默认开启自动检查")
-    UpdateProtocol.fixture(release())
+    UpdateProtocol.fixture(release(digest: "sha256:\(sha256("SYNTHETIC-DMG"))"))
     await updater.checkIfNeeded()
     check(updater.status == .available && updater.availableRelease?.version == "2.7.0", "自动检测更新版本")
     check(completions == [false], "自动检查结果不会被当作手动请求")
@@ -112,6 +122,8 @@ private func runTests() async {
           "仅请求固定公开仓库，不发送模型凭据")
     check(request.timeoutInterval == 20 && request.value(forHTTPHeaderField: "Accept") == "application/vnd.github+json",
           "更新请求有超时并使用 GitHub JSON 接口")
+    check(updater.availableRelease?.notes == "测试发布说明", "更新信息包含发布说明")
+    check(updater.availableRelease?.asset?.digest?.hasPrefix("sha256:") == true, "更新元数据包含 SHA-256 摘要")
     check(updater.availableRelease?.pageURL.absoluteString == "https://github.com/m0nkee/notescopilot/releases/tag/v2.7.0",
           "下载入口指向对应正式发布页")
     check(updater.availableRelease?.downloadURL.absoluteString == "https://github.com/m0nkee/notescopilot/releases/download/v2.7.0/NotesCopilot-2.7.0-arm64.dmg",
@@ -128,6 +140,8 @@ private func runTests() async {
     check(updater.downloadStatusMessage.contains(downloadedURL?.path ?? ""),
           "下载状态显示本地文件路径")
     try? Data("OLD-DMG".utf8).write(to: downloadDirectory.appendingPathComponent("NotesCopilot-2.7.0-arm64.dmg"))
+    UpdateProtocol.fixture(release(digest: "sha256:\(sha256("REPLACED-DMG"))"))
+    await updater.check()
     UpdateProtocol.fixture("REPLACED-DMG")
     let replacedURL = await updater.download()
     let replacedData = replacedURL.map { try? Data(contentsOf: $0) } ?? nil
@@ -138,14 +152,58 @@ private func runTests() async {
     check(failedURL == nil && updater.downloadStatusMessage.contains("HTTP 404")
           && !updater.isDownloading,
           "下载失败保留可读错误并退出下载状态")
+    try? FileManager.default.removeItem(at: downloadDirectory.appendingPathComponent("NotesCopilot-2.7.0-arm64.dmg"))
+    UpdateProtocol.fixture(release(digest: "sha256:\(sha256("SYNTHETIC-DMG"))"))
+    await updater.check()
+    UpdateProtocol.fixture("CORRUPTED-DMG")
+    let corruptedURL = await updater.download()
+    check(corruptedURL == nil && updater.downloadStatusMessage.contains("校验失败")
+          && !FileManager.default.fileExists(atPath: downloadDirectory.appendingPathComponent("NotesCopilot-2.7.0-arm64.dmg").path),
+          "校验失败时删除损坏文件且不提供安装入口")
+    UpdateProtocol.fixture(release(digest: ""))
+    await updater.check()
+    UpdateProtocol.fixture("DMG-WITHOUT-CHECKSUM")
+    let noChecksumURL = await updater.download()
+    check(noChecksumURL == nil && updater.downloadStatusMessage.contains("缺少 SHA-256")
+          && updater.downloadState != .completed(downloadDirectory),
+          "缺少可信校验信息时拒绝下载")
+    UpdateProtocol.fixture(release(digest: "sha256:\(sha256("SYNTHETIC-DMG"))"))
+    await updater.check()
+    let cancelGate = DispatchSemaphore(value: 0)
+    UpdateProtocol.fixture("SYNTHETIC-DMG", responseGate: cancelGate)
+    let cancellationTask = Task { await updater.download() }
+    let downloadingDeadline = Date().addingTimeInterval(2)
+    while !updater.isDownloading && Date() < downloadingDeadline { await Task.yield() }
+    check(updater.isDownloading && updater.downloadProgress == 0, "下载中提供可观察进度")
+    updater.cancelDownload()
+    cancelGate.signal()
+    let cancelledURL = await cancellationTask.value
+    var downloadCancelled = false
+    if case .cancelled = updater.downloadState { downloadCancelled = true }
+    check(cancelledURL == nil && downloadCancelled && !updater.isDownloading
+          && updater.downloadStatusMessage.contains("已取消下载")
+          && !FileManager.default.fileExists(atPath: downloadDirectory.appendingPathComponent("NotesCopilot-2.7.0-arm64.dmg").path),
+          "取消下载会停止写入并清理临时文件")
     check(updater.shouldRemind(), "首次发现新版本需要提醒")
     updater.markReminded()
     check(!updater.shouldRemind(), "同一天不重复弹出提醒")
     await updater.checkIfNeeded()
     check(UpdateProtocol.captured.count == 1, "一天内不重复自动请求")
     let restored = make()
-    check(restored.availableRelease == updater.availableRelease && !restored.shouldRemind(),
+    check(restored.availableRelease?.tag == updater.availableRelease?.tag && !restored.shouldRemind(),
           "重新启动保留新版本入口和提醒间隔")
+    check(restored.availableRelease?.notes == "测试发布说明" && restored.availableRelease?.asset == nil,
+          "重启缓存保留发布说明但不信任本地资产元数据")
+    defaults.set(try? JSONEncoder().encode(AppRelease(
+        tag: "v9.9.9", notes: "tampered",
+        asset: ReleaseAsset(name: "NotesCopilot-9.9.9-arm64.dmg", size: 1,
+                            browserDownloadURL: URL(string: "https://evil.example/dmg")!,
+                            digest: "sha256:\(String(repeating: "0", count: 64))")
+    )), forKey: "nc.update.availableRelease")
+    let sanitized = make()
+    check(sanitized.availableRelease?.asset == nil
+          && sanitized.availableRelease?.downloadURL.absoluteString == "https://github.com/m0nkee/notescopilot/releases/download/v9.9.9/NotesCopilot-9.9.9-arm64.dmg",
+          "篡改的本地缓存不会提供任意下载地址或摘要")
     date = date.addingTimeInterval(AppUpdater.checkInterval)
     check(restored.shouldRemind(), "稍后提醒满一天后可再次提示")
     await updater.checkIfNeeded()

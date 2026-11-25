@@ -4,8 +4,16 @@ import ApplicationServices
 enum SelectionScope: String {
     case notes, global
 
+    enum PrivacyMode: String {
+        case blocklist, allowlist
+
+        static let defaultsKey = "nc.selai.privacy.mode"
+    }
+
     static let defaultsKey = "nc.selai.scope"
     static let enabledKey = "nc.selai.enabled"
+    static let pausedKey = "nc.selai.paused"
+    static let privacyAppsKey = "nc.selai.privacy.apps"
 
     static func current(in defaults: UserDefaults = .standard) -> Self {
         defaults.string(forKey: defaultsKey).flatMap(Self.init(rawValue:)) ?? .notes
@@ -15,8 +23,33 @@ enum SelectionScope: String {
         defaults.object(forKey: enabledKey) == nil || defaults.bool(forKey: enabledKey)
     }
 
+    static func privacyMode(in defaults: UserDefaults = .standard) -> PrivacyMode {
+        defaults.string(forKey: PrivacyMode.defaultsKey).flatMap(PrivacyMode.init(rawValue:)) ?? .blocklist
+    }
+
+    static func isPaused(in defaults: UserDefaults = .standard) -> Bool {
+        defaults.bool(forKey: pausedKey)
+    }
+
+    /// 只保存应用标识，不保存选中文本。
+    static func privacyApps(in defaults: UserDefaults = .standard) -> [String] {
+        (defaults.stringArray(forKey: privacyAppsKey) ?? []).filter { !$0.isEmpty }
+    }
+
     static func allowsGlobalSelection(in defaults: UserDefaults = .standard) -> Bool {
-        isEnabled(in: defaults) && current(in: defaults) == .global
+        isEnabled(in: defaults) && current(in: defaults) == .global && !isPaused(in: defaults)
+    }
+
+    static func allowsApplication(_ app: NSRunningApplication?, in defaults: UserDefaults = .standard) -> Bool {
+        guard allowsGlobalSelection(in: defaults), let app else { return false }
+        let identity = app.bundleIdentifier ?? app.localizedName ?? String(app.processIdentifier)
+        return allows(identity: identity, in: defaults)
+    }
+
+    static func allows(identity: String, in defaults: UserDefaults = .standard) -> Bool {
+        guard allowsGlobalSelection(in: defaults) else { return false }
+        let apps = Set(privacyApps(in: defaults))
+        return privacyMode(in: defaults) == .allowlist ? apps.contains(identity) : !apps.contains(identity)
     }
 }
 

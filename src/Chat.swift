@@ -17,12 +17,19 @@ struct ModelProfile: Codable, Identifiable, Equatable {
     var model: String = ""
     var hasStoredAPIKey = false
     var credentialUnavailable = false
+    /// nil 表示沿用全局默认值，便于旧配置无感升级。
+    var temperature: Double?
+    var maxTokens: Int?
 
-    init(id: UUID = UUID(), name: String = "", baseURL: String = "", apiKey: String = "", model: String = "") {
+    init(id: UUID = UUID(), name: String = "", baseURL: String = "", apiKey: String = "", model: String = "",
+         temperature: Double? = nil, maxTokens: Int? = nil) {
         self.id = id; self.name = name; self.baseURL = baseURL; self.apiKey = apiKey; self.model = model
+        self.temperature = temperature; self.maxTokens = maxTokens
     }
 
-    private enum CodingKeys: String, CodingKey { case id, name, baseURL, apiKey, model, hasStoredAPIKey }
+    private enum CodingKeys: String, CodingKey {
+        case id, name, baseURL, apiKey, model, hasStoredAPIKey, temperature, maxTokens
+    }
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         id = try c.decodeIfPresent(UUID.self, forKey: .id) ?? UUID()
@@ -31,6 +38,8 @@ struct ModelProfile: Codable, Identifiable, Equatable {
         apiKey = try c.decodeIfPresent(String.self, forKey: .apiKey) ?? ""
         model = try c.decodeIfPresent(String.self, forKey: .model) ?? ""
         hasStoredAPIKey = try c.decodeIfPresent(Bool.self, forKey: .hasStoredAPIKey) ?? false
+        temperature = try c.decodeIfPresent(Double.self, forKey: .temperature)
+        maxTokens = try c.decodeIfPresent(Int.self, forKey: .maxTokens)
     }
 }
 
@@ -367,8 +376,12 @@ enum Config {
         let prompt = defaults.string(forKey: "nc.sys") ?? ""
         return prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? defaultSystem : prompt
     }
-    static var temperature: Double { defaults.object(forKey: "nc.temp") as? Double ?? 0.7 }
-    static var maxTokens: Int { defaults.object(forKey: "nc.maxTokens") as? Int ?? 2048 }
+    static var temperature: Double {
+        activeProfile?.temperature ?? defaults.object(forKey: "nc.temp") as? Double ?? 0.7
+    }
+    static var maxTokens: Int {
+        activeProfile?.maxTokens ?? defaults.object(forKey: "nc.maxTokens") as? Int ?? 2048
+    }
 
     /// 多轮对话开关（对应 ProNotes ChatStore 的会话保持）
     static var continuous: Bool {
@@ -421,7 +434,8 @@ struct AIRequestConfiguration: Sendable {
         return AIRequestConfiguration(baseURL: base, apiKey: profile?.apiKey ?? "", model: model,
                                       systemPrompt: Config.systemPrompt, temperature: Config.temperature,
                                       maxTokens: Config.maxTokens,
-                                      profileIdentity: (profile?.id.uuidString ?? "") + "|" + base + "|" + model)
+                                      profileIdentity: (profile?.id.uuidString ?? "") + "|" + base + "|" + model
+                                          + "|t\(Config.temperature)|m\(Config.maxTokens)")
     }
 }
 
@@ -566,8 +580,50 @@ enum TokenMath {
 
 // MARK: - 对话引擎（对应 ProNotes 的 ChatStore + openAIClient，SSE 流式 + 多轮 + 多模态）
 
+// MARK: - 本地会话持久化（只保存对话内容，不保存 API Key）
+
+struct ChatMessageRecord: Codable, Equatable {
+    let role: String
+    let content: String
+}
+
+struct ChatSessionRecord: Codable, Equatable {
+    var history: [ChatMessageRecord] = []
+    var output = ""
+    var submittedPrompt = ""
+    var noteContext = ""
+    var contextSource = ""
+    var profileIdentity = ""
+    var promptTokens = 0
+    var completionTokens = 0
+    var totalPromptTokens = 0
+    var totalCompletionTokens = 0
+    var savedAt = Date.distantPast
+}
+
+enum ChatSessionStore {
+    static let key = "nc.chat.session"
+    static var defaults = UserDefaults.standard
+
+    static func save(_ record: ChatSessionRecord) {
+        guard let data = try? JSONEncoder().encode(record) else { return }
+        defaults.set(data, forKey: key)
+    }
+
+    static func load() -> ChatSessionRecord? {
+        guard let data = defaults.data(forKey: key) else { return nil }
+        return try? JSONDecoder().decode(ChatSessionRecord.self, from: data)
+    }
+
+    static func clear() {
+        defaults.removeObject(forKey: key)
+    }
+}
+
 @MainActor
 final class ChatEngine: ObservableObject {
+    init() { restoreSession() }
+
     /// 每次提交都发布，包括重复命令；面板草稿只在提交或新会话时同步。
     @Published private(set) var submittedPrompt = ""
     @Published var output = ""
@@ -582,7 +638,10 @@ final class ChatEngine: ObservableObject {
     @Published var continuous = Config.continuous {
         didSet {
             Config.continuous = continuous
-            if !continuous { history = [] }
+            if !continuous {
+                history = []
+                ChatSessionStore.clear()
+            }
         }
     }
     /// 本轮附带图片（多模态 content parts）
@@ -650,12 +709,51 @@ final class ChatEngine: ObservableObject {
             canRetry = lastRequest != nil
             canContinue = lastRequest != nil && !output.isEmpty
         }
+        // Preserve an interrupted response for the next launch, just as
+        // completed responses are preserved.
+        persistSession()
     }
 
     func dismissReview() {
         pendingReviewID = nil
         pendingResult = ""
         pendingTarget = nil
+    }
+
+    private func persistSession() {
+        guard continuous, !history.isEmpty || !output.isEmpty else { ChatSessionStore.clear(); return }
+        let record = ChatSessionRecord(
+            history: history.compactMap { message in
+                guard let role = message["role"] as? String,
+                      let content = message["content"] as? String else { return nil }
+                return ChatMessageRecord(role: role, content: content)
+            },
+            output: output,
+            submittedPrompt: submittedPrompt,
+            noteContext: noteContext,
+            contextSource: contextSource,
+            profileIdentity: sessionProfileIdentity ?? "",
+            promptTokens: promptTokens,
+            completionTokens: completionTokens,
+            totalPromptTokens: totalPromptTokens,
+            totalCompletionTokens: totalCompletionTokens,
+            savedAt: Date())
+        ChatSessionStore.save(record)
+    }
+
+    private func restoreSession() {
+        guard continuous, let record = ChatSessionStore.load() else { return }
+        history = record.history.map { ["role": $0.role, "content": $0.content] }
+        output = record.output
+        submittedPrompt = record.submittedPrompt
+        noteContext = record.noteContext
+        contextSource = record.contextSource
+        sessionProfileIdentity = record.profileIdentity.isEmpty ? nil : record.profileIdentity
+        promptTokens = record.promptTokens
+        completionTokens = record.completionTokens
+        totalPromptTokens = record.totalPromptTokens
+        totalCompletionTokens = record.totalCompletionTokens
+        responseStatus = "已恢复上次会话"
     }
 
     /// 新会话保留当前笔记上下文；换来源时由 setContext 自动调用。
@@ -675,6 +773,7 @@ final class ChatEngine: ObservableObject {
         tokensEstimated = false
         totalPromptTokens = 0
         totalCompletionTokens = 0
+        ChatSessionStore.clear()
     }
 
     func setContext(_ text: String, source: String, noteID: String? = nil) {
@@ -856,6 +955,7 @@ final class ChatEngine: ObservableObject {
                     self.pendingResult = result.output
                 }
             }
+            self.persistSession()
         }
     }
 

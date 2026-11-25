@@ -300,6 +300,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc func openUpdateDownload() {
+        let updater = AppUpdater.shared
+        if updater.isDownloading {
+            updater.cancelDownload()
+            return
+        }
         Task { @MainActor in
             guard let fileURL = await AppUpdater.shared.download() else { return }
             NSWorkspace.shared.activateFileViewerSelecting([fileURL])
@@ -309,7 +314,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func refreshUpdateMenu() {
         let release = AppUpdater.shared.availableRelease
         updateMenuItem?.isHidden = release == nil
-        updateMenuItem?.title = "下载新版本 v\(release?.version ?? "")…"
+        updateMenuItem?.title = AppUpdater.shared.isDownloading
+            ? "取消下载 v\(release?.version ?? "")…"
+            : "下载新版本 v\(release?.version ?? "")…"
     }
 
     private func presentUpdateResult(userInitiated: Bool) {
@@ -319,7 +326,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let alert = NSAlert()
         if updater.status == .available, let release = updater.availableRelease {
             alert.messageText = "NotesCopilot 有新版本 v\(release.version)"
-            alert.informativeText = "当前版本：v\(updater.currentVersion)\n建议更新以获取最新功能和修复。\n点击「直接下载」后，DMG 会下载到「下载」文件夹并在 Finder 中显示。安装时拖入「Applications」替换旧版本。\n若 macOS 提示无法验证应用，先点「完成」，再到「系统设置 → 隐私与安全性」点「仍要打开」。"
+            var informativeText = "当前版本：v\(updater.currentVersion)\n建议更新以获取最新功能和修复。\n点击「直接下载」后，DMG 会先校验 SHA-256，再下载到「下载」文件夹并在 Finder 中显示。安装时拖入「Applications」替换旧版本。\n若 macOS 提示无法验证应用，先点「完成」，再到「系统设置 → 隐私与安全性」点「仍要打开」。"
+            if let notes = release.alertNotes {
+                informativeText += "\n\n发布说明：\n\(notes)"
+            }
+            alert.informativeText = informativeText
             alert.addButton(withTitle: "直接下载")
             alert.addButton(withTitle: "稍后提醒")
             updater.markReminded()

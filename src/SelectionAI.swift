@@ -187,9 +187,9 @@ final class SelectionWatcher {
         let inNotes = front?.bundleIdentifier == NotesBridge.notesBundleID
         var anchor: TextSelectionAnchor?
         if front?.processIdentifier != ProcessInfo.processInfo.processIdentifier {
-            browserAccess.update(for: SelectionScope.allowsGlobalSelection(in: defaults) && !inNotes && AXIsProcessTrusted() ? front : nil)
+            browserAccess.update(for: SelectionScope.allowsApplication(front, in: defaults) && !inNotes && AXIsProcessTrusted() ? front : nil)
         }
-        if let front, !inNotes, SelectionScope.current(in: defaults) == .global {
+        if let front, !inNotes, SelectionScope.allowsApplication(front, in: defaults) {
             // A pause halfway through a drag is not a finished selection.
             if NSEvent.pressedMouseButtons & 1 != 0 { return }
             // Hit-testing an app directly looks through other windows. Once the
@@ -247,6 +247,47 @@ final class SelectionWatcher {
     }
 }
 
+struct SelectionDiffLine: Identifiable, Equatable {
+    enum Kind { case same, removed, added }
+    let id = UUID()
+    let kind: Kind
+    let text: String
+}
+
+enum SelectionDiff {
+    static func lines(original: String, result: String, limit: Int = 1000) -> [SelectionDiffLine] {
+        let left = original.isEmpty ? [] : original.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+        let right = result.isEmpty ? [] : result.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+        guard left.count <= limit, right.count <= limit else {
+            return right.map { SelectionDiffLine(kind: .added, text: $0) }
+        }
+        var table = [[Int]](repeating: [Int](repeating: 0, count: right.count + 1), count: left.count + 1)
+        for i in stride(from: left.count - 1, through: 0, by: -1) {
+            for j in stride(from: right.count - 1, through: 0, by: -1) {
+                table[i][j] = left[i] == right[j] ? table[i + 1][j + 1] + 1
+                    : max(table[i + 1][j], table[i][j + 1])
+            }
+        }
+        var lines: [SelectionDiffLine] = []
+        var i = 0, j = 0
+        while i < left.count && j < right.count {
+            if left[i] == right[j] {
+                lines.append(SelectionDiffLine(kind: .same, text: left[i]))
+                i += 1; j += 1
+            } else if table[i + 1][j] >= table[i][j + 1] {
+                lines.append(SelectionDiffLine(kind: .removed, text: left[i]))
+                i += 1
+            } else {
+                lines.append(SelectionDiffLine(kind: .added, text: right[j]))
+                j += 1
+            }
+        }
+        while i < left.count { lines.append(SelectionDiffLine(kind: .removed, text: left[i])); i += 1 }
+        while j < right.count { lines.append(SelectionDiffLine(kind: .added, text: right[j])); j += 1 }
+        return lines
+    }
+}
+
 // MARK: - 悬浮面板（非激活，hover 风格）
 
 /// 请求状态与选区一起失效；迟到的完成和错误均不能更新新选区。
@@ -259,6 +300,7 @@ final class SelectionAIRequest {
     private(set) var selection: WritingSelection?
     var snapshot: NotesBridge.SelectionSnapshot? { selection?.notesSnapshot }
     private(set) var resultText = ""
+    private(set) var generatedText = ""
     private(set) var busy = false
     private(set) var lastError: String?
     private(set) var needsConfiguration = false
@@ -279,6 +321,7 @@ final class SelectionAIRequest {
         task = nil
         selection = nil
         resultText = ""
+        generatedText = ""
         lastError = nil
         needsConfiguration = false
         busy = false
@@ -322,6 +365,7 @@ final class SelectionAIRequest {
                     throw APIError(status: -2, message: "模型返回了空文本，请重试。")
                 }
                 self.resultText = text
+                self.generatedText = text
                 self.busy = false
                 self.task = nil
                 self.onChange?()
@@ -335,7 +379,17 @@ final class SelectionAIRequest {
         }
     }
 
-    /// 写入失败不消费结果；关闭面板或切换请求后，迟到的写入回调不影响新结果。
+    /// 手动编辑会立即使旧的写入操作失效，写入前仍会校验选区未变化。
+    func editResult(_ text: String) {
+        guard !busy, resultText != text else { return }
+        writeOperationID = nil
+        resultText = text
+        onChange?()
+    }
+
+    var resultEdited: Bool { !generatedText.isEmpty && resultText != generatedText }
+
+    /// 写入失败不消耗结果；关闭面板或切换请求后，迟到的写入回调不影响新结果。
     func writeResult(using writer: (NotesBridge.SelectionSnapshot, String, @escaping () -> Bool, @escaping (String?) -> Void) -> Void,
                      completion: @escaping (String?) -> Void) {
         guard let snapshot, !busy, !resultText.isEmpty else { return }
@@ -381,6 +435,8 @@ final class SelectionAIPanel: NSObject, ObservableObject {
     @Published private(set) var writing = false
     @Published private(set) var staleSelection = false
     @Published var showingOriginal = false
+    @Published var showingDiff = false
+    @Published var pendingWriteAppend: Bool?
     @Published var customInstruction = ""
 
     init(request: SelectionAIRequest? = nil, notes: NotesBridge = .shared, defaults: UserDefaults = .standard,
@@ -425,6 +481,8 @@ final class SelectionAIPanel: NSObject, ObservableObject {
     }
     var original: String { request.selection?.text ?? "" }
     var result: String { request.resultText }
+    var resultEdited: Bool { request.resultEdited }
+    var diffLines: [SelectionDiffLine] { SelectionDiff.lines(original: original, result: result) }
     var needsConfiguration: Bool { request.needsConfiguration }
     var hasNotesTarget: Bool { request.snapshot != nil }
     var hasReplacementTarget: Bool {
@@ -432,11 +490,12 @@ final class SelectionAIPanel: NSObject, ObservableObject {
         return hasNotesTarget
     }
     var canWrite: Bool {
-        phase == .review && hasReplacementTarget && !staleSelection && !showingOriginal && !writing && !result.isEmpty
+        phase == .review && hasReplacementTarget && !staleSelection
+            && !showingOriginal && !showingDiff && !writing && !result.isEmpty
     }
 
     func showLauncher(at anchor: TextSelectionAnchor, onNewDrag: @escaping () -> Void = {}) {
-        if case .input = anchor.source, !SelectionScope.allowsGlobalSelection(in: defaults) { return }
+        if case .input(let host) = anchor.source, !SelectionScope.allowsApplication(host.application, in: defaults) { return }
         resetSession()
         self.anchor = anchor
         placement = Self.screenRect(for: anchor.bounds)
@@ -528,6 +587,8 @@ final class SelectionAIPanel: NSObject, ObservableObject {
         writing = false
         staleSelection = false
         showingOriginal = false
+        showingDiff = false
+        pendingWriteAppend = nil
         customInstruction = ""
     }
 
@@ -540,7 +601,7 @@ final class SelectionAIPanel: NSObject, ObservableObject {
         case .notes:
             guard front.bundleIdentifier == NotesBridge.notesBundleID else { return false }
         case .input(let host):
-            guard SelectionScope.allowsGlobalSelection(in: defaults), front.processIdentifier == host.application.processIdentifier,
+            guard SelectionScope.allowsApplication(host.application, in: defaults), front.processIdentifier == host.application.processIdentifier,
                   let window = AXText.element(app, kAXFocusedWindowAttribute), CFEqual(window, host.window) else { return false }
         }
         if let field = AXText.element(app, kAXFocusedUIElementAttribute),
@@ -612,6 +673,7 @@ final class SelectionAIPanel: NSObject, ObservableObject {
         self.action = action
         status = ""
         showingOriginal = false
+        showingDiff = false
         present(.working)
         request.run(instruction: action.instruction.prompt(for: original))
     }
@@ -637,10 +699,13 @@ final class SelectionAIPanel: NSObject, ObservableObject {
                 run(action)
             case .original, .copy:
                 guard !result.isEmpty else { return false }
-                if key == .original { showingOriginal.toggle() } else { copyPreview() }
+                if key == .original {
+                    showingOriginal.toggle()
+                    if showingOriginal { showingDiff = false }
+                } else { copyPreview() }
             case .append, .replace:
                 guard canWrite else { return false }
-                writeResult(append: key == .append)
+                prepareWrite(append: key == .append)
             }
         default: return false
         }
@@ -653,6 +718,8 @@ final class SelectionAIPanel: NSObject, ObservableObject {
         action = nil
         status = ""
         showingOriginal = false
+        showingDiff = false
+        pendingWriteAppend = nil
         present(.menu)
     }
 
@@ -669,6 +736,42 @@ final class SelectionAIPanel: NSObject, ObservableObject {
             if staleSelection { markStale() }
         }
         present(.review)
+    }
+
+    func updateResult(_ text: String) {
+        request.editResult(text)
+        if request.resultEdited { status = "结果已手动编辑；写入会使用当前编辑内容。" }
+        present(.review)
+    }
+
+    func showDiff() {
+        showingDiff = true
+        showingOriginal = false
+        present(.review)
+    }
+
+    func prepareWrite(append: Bool) {
+        guard canWrite else { return }
+        pendingWriteAppend = append
+    }
+
+    func cancelWritePreview() {
+        pendingWriteAppend = nil
+    }
+
+    func confirmPendingWrite() {
+        guard let append = pendingWriteAppend else { return }
+        pendingWriteAppend = nil
+        writeResult(append: append)
+    }
+
+    var writePreviewTitle: String {
+        pendingWriteAppend == true ? "追加到原选区末尾" : "替换原选区"
+    }
+
+    var writePreviewText: String {
+        guard let append = pendingWriteAppend else { return "" }
+        return append ? result : "原文：\n\(original)\n\n替换为：\n\(result)"
     }
 
     func copyPreview(to pb: NSPasteboard = .general) {

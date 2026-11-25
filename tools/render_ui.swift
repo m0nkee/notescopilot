@@ -22,7 +22,7 @@ struct RenderUI {
         let defaults = UserDefaults(suiteName: suite)!
         defer { defaults.removePersistentDomain(forName: suite) }
         let profile = ModelProfile(name: "本地写作", baseURL: "http://localhost:11434/v1", apiKey: "", model: "qwen3:32b")
-        let values: [String: Any] = [
+        var values: [String: Any] = [
             "nc.profiles": try JSONEncoder().encode([profile]), "nc.activeProfileID": profile.id.uuidString,
             "nc.templates": try JSONEncoder().encode([TemplateNote]()), "nc.kw.rules": Data(),
             "nc.sys": Config.defaultSystem, "nc.temp": 0.7, "nc.maxTokens": 2048, "nc.continuous": true,
@@ -32,6 +32,9 @@ struct RenderUI {
         ProfileStore.defaults = defaults
         Config.defaults = defaults
         ProfileStore.secretStore = MemoryProfileSecretStore()
+        values["nc.customAICommands"] = try JSONEncoder().encode([
+            CustomAICommand(name: "weekly", prompt: "请把本周记录整理成周报")
+        ])
         _ = NSApplication.shared
         NSApp.setActivationPolicy(.prohibited)
         let delegate = AppDelegate()
@@ -53,6 +56,7 @@ struct RenderUI {
             var selectionValues = values
             selectionValues[SelectionScope.enabledKey] = true
             selectionValues[SelectionScope.defaultsKey] = scope.rawValue
+            selectionValues[SelectionScope.privacyAppsKey] = ["com.example.chat", "com.example.editor"]
             defaults.setVolatileDomain(selectionValues, forName: UserDefaults.argumentDomain)
             UserDefaults.standard.setVolatileDomain(selectionValues, forName: UserDefaults.argumentDomain)
             try render(SettingsView(discoverLocalModels: false, notesAccessIssueProvider: { nil },
@@ -73,6 +77,10 @@ struct RenderUI {
         try render(SettingsView(discoverLocalModels: false, notesAccessIssueProvider: { .automationDenied }, initialPage: .general, updater: updater), size: NSSize(width: 940, height: 640), name: "settings-notes-access-light", directory: output)
         try render(SettingsView(discoverLocalModels: false, notesAccessIssueProvider: { .automationDenied }, initialPage: .general, updater: updater), size: NSSize(width: 940, height: 640), name: "settings-notes-access-dark", directory: output, dark: true)
         defaults.set("v2.7.0", forKey: "nc.update.availableTag")
+        defaults.set(try JSONEncoder().encode(AppRelease(
+            tag: "v2.7.0",
+            notes: "新增发布说明展示、下载进度和取消；下载完成后校验 SHA-256。"
+        )), forKey: "nc.update.availableRelease")
         let availableUpdater = AppUpdater(currentVersion: "2.6.1", defaults: defaults)
         try render(SettingsView(discoverLocalModels: false, notesAccessIssueProvider: { nil }, initialPage: .general, updater: availableUpdater), size: NSSize(width: 900, height: 620), name: "settings-update-available-light", directory: output)
         try render(SettingsView(discoverLocalModels: false, notesAccessIssueProvider: { nil }, initialPage: .general, updater: availableUpdater), size: NSSize(width: 900, height: 620), name: "settings-update-available-dark", directory: output, dark: true)

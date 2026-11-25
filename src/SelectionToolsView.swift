@@ -270,15 +270,60 @@ struct SelectionToolsView: View {
                     keyHint(SelectionReviewKey.original.rawValue)
                 }
                 .help("切换原文与结果（O）")
-                .disabled(model.writing)
-                ScrollView {
-                    Text(verbatim: model.showingOriginal ? model.original : model.result)
-                        .textSelection(.enabled)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .padding(8)
+                Button {
+                    model.showDiff()
+                } label: {
+                    Text("差异")
                 }
-                .frame(height: 124)
-                .background(.background.opacity(0.7), in: RoundedRectangle(cornerRadius: 5))
+                .buttonStyle(.borderless)
+                .disabled(model.writing || model.original.isEmpty || model.result.isEmpty)
+                if model.showingDiff {
+                    ScrollView {
+                        VStack(alignment: .leading, spacing: 2) {
+                            ForEach(model.diffLines) { line in
+                                HStack(alignment: .top, spacing: 6) {
+                                    Text(verbatim: line.kind == .removed ? "-" : line.kind == .added ? "+" : " ")
+                                        .font(.system(.caption, design: .monospaced))
+                                        .frame(width: 12)
+                                    Text(verbatim: line.text)
+                                        .font(.system(.caption, design: .monospaced))
+                                        .textSelection(.enabled)
+                                }
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .padding(.horizontal, 6).padding(.vertical, 1)
+                                .background(line.kind == .removed ? Color.red.opacity(0.12)
+                                            : line.kind == .added ? Color.green.opacity(0.12) : Color.clear)
+                            }
+                        }
+                        .padding(6)
+                    }
+                    .frame(height: 124)
+                    .background(.background.opacity(0.7), in: RoundedRectangle(cornerRadius: 5))
+                } else if model.showingOriginal {
+                    ScrollView {
+                        Text(verbatim: model.original)
+                            .textSelection(.enabled)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(8)
+                    }
+                    .frame(height: 124)
+                    .background(.background.opacity(0.7), in: RoundedRectangle(cornerRadius: 5))
+                } else {
+                    TextEditor(text: Binding(
+                        get: { model.result },
+                        set: { model.updateResult($0) }
+                    ))
+                    .font(.system(.callout, design: .default))
+                    .frame(height: 124)
+                    .scrollContentBackground(.hidden)
+                    .background(.background.opacity(0.5), in: RoundedRectangle(cornerRadius: 5))
+                    .disabled(model.writing)
+                    .accessibilityLabel("编辑 AI 结果")
+                    if model.resultEdited {
+                        Text("已手动编辑，写入会使用当前文本")
+                            .font(.caption2).foregroundStyle(.orange)
+                    }
+                }
             }
             feedback
             HStack {
@@ -297,14 +342,25 @@ struct SelectionToolsView: View {
                     let preferReplace = model.canWrite && model.action?.group == .edit
                     shortcutButton(model.showingOriginal ? "复制原文" : "复制结果", key: SelectionReviewKey.copy.rawValue, primary: !preferReplace) { model.copyPreview() }
                     if model.hasReplacementTarget && !model.staleSelection {
-                        shortcutButton("追加", key: SelectionReviewKey.append.rawValue) { model.writeResult(append: true) }
+                        shortcutButton("追加", key: SelectionReviewKey.append.rawValue) { model.prepareWrite(append: true) }
                             .help("追加到原选区末尾（A）").disabled(!model.canWrite)
-                        shortcutButton("替换选区", key: SelectionReviewKey.replace.rawValue, primary: preferReplace) { model.writeResult(append: false) }
+                        shortcutButton("替换选区", key: SelectionReviewKey.replace.rawValue, primary: preferReplace) { model.prepareWrite(append: false) }
                             .disabled(!model.canWrite)
                     }
                 }
             }
             .disabled(model.writing)
+            .confirmationDialog(model.writePreviewTitle, isPresented: Binding(
+                get: { model.pendingWriteAppend != nil },
+                set: { if !$0 { model.cancelWritePreview() } }
+            ), titleVisibility: .visible) {
+                Button(model.pendingWriteAppend == true ? "确认追加" : "确认替换", role: .destructive) {
+                    model.confirmPendingWrite()
+                }
+                Button("取消", role: .cancel) { model.cancelWritePreview() }
+            } message: {
+                Text(model.writePreviewText)
+            }
         }
     }
 

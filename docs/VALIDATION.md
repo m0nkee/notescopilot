@@ -1,5 +1,16 @@
 # 本次修复与验证
 
+## v2.9.0（2026-11-25）
+
+| 项目 | 验收结果 |
+| --- | --- |
+| 功能回归 | 十套完整回归共 **825 项通过、0 失败**，另有 5 项因当前沙箱缺少 AppKit HTML helper / named pasteboard service 明确跳过：选区 72、斜杠 100、模板 41、URL 28、写回 127、模板执行 39、聊天 198、资料库 88、产品 65、更新 67 |
+| 原生界面 | `scripts/check-ui.sh` 渲染 **25/25** 个原生布局，覆盖自定义命令、隐私名单、更新说明与进度 |
+| 启动生命周期 | `scripts/check-startup.sh` 非沙箱执行 **79/79** 通过，包含窗口恢复、离屏、写入确认与菜单栏路径 |
+| 发布构建 | `NC_BUILD_OUTPUT=build/release/NotesCopilot.app ./build.sh` 构建成功，严格 `codesign --verify`、`plutil`、`bash -n` 与 `git diff --check` 均通过；版本 `2.9.0`，build `11`，arm64 |
+| 发布包 | `scripts/package-dmg.sh` 生成 `NotesCopilot-2.9.0-arm64.dmg` 和同名 `.sha256`；`hdiutil verify` 通过，只读挂载后核对签名、版本、架构与 `/Applications` 软链接；SHA-256：`f41984a7935141223250b2d36561c7cdd4f9bf324bb236f02fc2853045eac3c3` |
+| 环境限制 | 5 项跳过均为沙箱 helper/剪贴板服务不可用，不代表功能失败；发布前已在非沙箱挂载、构建与启动回归中完成等效验证 |
+
 ## v2.8.4 应用内直接下载（2026-11-25）
 
 | 项目 | 验收结果 |

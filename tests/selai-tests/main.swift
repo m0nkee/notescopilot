@@ -25,6 +25,33 @@ do {
     check(SelectionScope.allowsGlobalSelection(in: prefs), "显式启用全局后允许其他输入框")
     prefs.set("unknown", forKey: SelectionScope.defaultsKey)
     check(SelectionScope.current(in: prefs) == .notes, "无法识别的范围回到仅 Notes")
+
+    prefs.set("global", forKey: SelectionScope.defaultsKey)
+    prefs.set(true, forKey: SelectionScope.pausedKey)
+    check(!SelectionScope.allowsGlobalSelection(in: prefs)
+          && !SelectionScope.allows(identity: "com.example.allowed", in: prefs),
+          "临时暂停会阻止所有其他应用触发选区工具")
+    prefs.set(false, forKey: SelectionScope.pausedKey)
+    prefs.set(["", "com.example.blocked"], forKey: SelectionScope.privacyAppsKey)
+    check(SelectionScope.privacyApps(in: prefs) == ["com.example.blocked"], "应用名单只保存非空标识")
+    check(SelectionScope.privacyMode(in: prefs) == .blocklist, "默认使用黑名单模式")
+    check(!SelectionScope.allows(identity: "com.example.blocked", in: prefs)
+          && SelectionScope.allows(identity: "com.example.other", in: prefs),
+          "黑名单应用不触发选区工具")
+    prefs.set("allowlist", forKey: SelectionScope.PrivacyMode.defaultsKey)
+    check(!SelectionScope.allows(identity: "com.example.other", in: prefs)
+          && SelectionScope.allows(identity: "com.example.blocked", in: prefs),
+          "白名单外的应用不触发选区工具")
+    prefs.set(true, forKey: SelectionScope.pausedKey)
+    check(!SelectionScope.allows(identity: "com.example.blocked", in: prefs), "暂停优先于白名单")
+}
+
+do {
+    let lines = SelectionDiff.lines(original: "第一行\n第二行\n第三行", result: "第一行\n修改后的第二行\n第三行\n新增")
+    check(lines.map(\.kind) == [.same, .removed, .added, .same, .added], "选区评审差异保留上下文并标记增删")
+    check(lines.map(\.text) == ["第一行", "第二行", "修改后的第二行", "第三行", "新增"], "选区评审差异文本顺序稳定")
+    let empty = SelectionDiff.lines(original: "", result: "新结果")
+    check(empty.map(\.kind) == [.added], "原文为空时差异全部标记为新增")
 }
 
 // ---- 1. 无选中：任何状态回 idle 并隐藏 ----

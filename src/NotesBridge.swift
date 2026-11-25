@@ -508,26 +508,167 @@ final class NotesBridge {
                 .documentType: NSAttributedString.DocumentType.html,
                 .characterEncoding: String.Encoding.utf8.rawValue,
             ], documentAttributes: nil)
-            let rtf = try richText.data(from: NSRange(location: 0, length: richText.length),
-                                       documentAttributes: [.documentType: NSAttributedString.DocumentType.rtf])
-            let rtfd = try? richText.data(from: NSRange(location: 0, length: richText.length),
-                                         documentAttributes: [.documentType: NSAttributedString.DocumentType.rtfd])
-            return (rtf, rtfd)
+            return try encodeRichText(richText)
         } catch {
-            return nil
+            // The HTML importer can be unavailable in sandboxed test processes.
+            // Keep the native RTF/RTFD path usable with a bounded fallback for
+            // the HTML subset emitted by MarkdownDocument.html.
+            guard let richText = fallbackRichText(fromHTML: html) else { return nil }
+            return try? encodeRichText(richText)
         }
     }
 
+    private static func encodeRichText(_ richText: NSAttributedString) throws -> (rtf: Data, rtfd: Data?) {
+        let range = NSRange(location: 0, length: richText.length)
+        let rtf = try richText.data(from: range, documentAttributes: [
+            .documentType: NSAttributedString.DocumentType.rtf
+        ])
+        let rtfd = try? richText.data(from: range, documentAttributes: [
+            .documentType: NSAttributedString.DocumentType.rtfd
+        ])
+        return (rtf, rtfd)
+    }
+
+    private static func fallbackRichText(fromHTML html: String) -> NSAttributedString? {
+        guard let regex = try? NSRegularExpression(pattern: #"(?s)<(h[1-6]|pre|p|li)([^>]*)>(.*?)</\1>"#)
+        else { return nil }
+        let source = htmlPasteboardData(html) == Data(html.utf8) ? html : html
+        let full = NSRange(source.startIndex..<source.endIndex, in: source)
+        let matches = regex.matches(in: source, range: full)
+        guard !matches.isEmpty else { return nil }
+
+        let output = NSMutableAttributedString()
+        func append(_ text: String, attributes: [NSAttributedString.Key: Any] = [:]) {
+            guard !text.isEmpty else { return }
+            output.append(NSAttributedString(string: text, attributes: attributes))
+        }
+
+        for match in matches {
+            guard let tagRange = Range(match.range(at: 1), in: source),
+                  let contentRange = Range(match.range(at: 3), in: source) else { continue }
+            let tag = String(source[tagRange])
+            let content = String(source[contentRange])
+            if !output.string.isEmpty { append("\n") }
+
+            if tag.hasPrefix("h") {
+                let level = Int(String(tag.dropFirst())) ?? 1
+                let size: CGFloat = level == 1 ? 24 : level == 2 ? 20 : 17
+                let paragraph = NSMutableParagraphStyle()
+                paragraph.paragraphSpacing = 7
+                append(decodedHTMLText(content), attributes: [
+                    .font: NSFont.systemFont(ofSize: size, weight: .bold),
+                    .paragraphStyle: paragraph,
+                ])
+            } else if tag == "pre" {
+                let code = decodedHTMLText(content.replacingOccurrences(of: "<[^>]+>", with: "", options: .regularExpression))
+                let paragraph = NSMutableParagraphStyle()
+                paragraph.lineBreakMode = .byCharWrapping
+                let codeBlock = NSTextBlock()
+                codeBlock.backgroundColor = NSColor(calibratedWhite: 0.95, alpha: 1)
+                paragraph.textBlocks = [codeBlock]
+                let codeFont = NSFont(name: "Menlo", size: 12)
+                    ?? NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
+                append(code, attributes: [
+                    .font: codeFont,
+                    .foregroundColor: NSColor.labelColor,
+                    .backgroundColor: NSColor(calibratedWhite: 0.95, alpha: 1),
+                    .paragraphStyle: paragraph,
+                ])
+            } else {
+                let paragraph = NSMutableParagraphStyle()
+                paragraph.paragraphSpacing = 5
+                appendInline(content, to: output)
+                if output.length > 0, output.attribute(.paragraphStyle, at: output.length - 1, effectiveRange: nil) == nil {
+                    output.addAttribute(.paragraphStyle, value: paragraph,
+                                        range: NSRange(location: max(0, output.length - 1), length: 1))
+                }
+            }
+        }
+
+        guard output.length > 0 else { return nil }
+        return output
+    }
+
+    private static func appendInline(_ html: String, to output: NSMutableAttributedString) {
+        guard let regex = try? NSRegularExpression(pattern: #"(?s)<(strong|span|em)([^>]*)>(.*?)</\1>"#)
+        else { return }
+        let source = html
+        let full = NSRange(source.startIndex..<source.endIndex, in: source)
+        var cursor = source.startIndex
+        for match in regex.matches(in: source, range: full) {
+            guard let matchRange = Range(match.range, in: source),
+                  let tagRange = Range(match.range(at: 1), in: source),
+                  let attributeRange = Range(match.range(at: 2), in: source),
+                  let contentRange = Range(match.range(at: 3), in: source) else { continue }
+            if cursor < matchRange.lowerBound {
+                let plain = decodedHTMLText(String(source[cursor..<matchRange.lowerBound]))
+                output.append(NSAttributedString(string: plain, attributes: [
+                    .font: NSFont.systemFont(ofSize: 13, weight: .regular)
+                ]))
+            }
+            let tag = String(source[tagRange])
+            let attributes = String(source[attributeRange])
+            let content = decodedHTMLText(String(source[contentRange]))
+            var attrs: [NSAttributedString.Key: Any] = [
+                .font: NSFont.systemFont(ofSize: 13, weight: tag == "em" ? .semibold : .regular)
+            ]
+            if tag == "strong" { attrs[.font] = NSFont.systemFont(ofSize: 13, weight: .bold) }
+            if tag == "span", let color = color(fromHTMLStyle: attributes) {
+                attrs[.foregroundColor] = color
+            }
+            output.append(NSAttributedString(string: content, attributes: attrs))
+            cursor = matchRange.upperBound
+        }
+        if cursor < source.endIndex {
+            let plain = decodedHTMLText(String(source[cursor...]))
+            output.append(NSAttributedString(string: plain, attributes: [
+                .font: NSFont.systemFont(ofSize: 13, weight: .regular)
+            ]))
+        }
+    }
+
+    private static func decodedHTMLText(_ text: String) -> String {
+        text.replacingOccurrences(of: "&quot;", with: "\"")
+            .replacingOccurrences(of: "&#39;", with: "'")
+            .replacingOccurrences(of: "&lt;", with: "<")
+            .replacingOccurrences(of: "&gt;", with: ">")
+            .replacingOccurrences(of: "&amp;", with: "&")
+    }
+
+    private static func color(fromHTMLStyle style: String) -> NSColor? {
+        guard let range = style.range(of: "color:") else { return nil }
+        var value = String(style[range.upperBound...]).prefix(10)
+        if let semicolon = value.firstIndex(of: ";") { value = value[..<semicolon] }
+        let hex = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard hex.count == 7, hex.hasPrefix("#"),
+              hex.dropFirst().allSatisfy({ $0.isHexDigit }) else { return nil }
+        let scalar = UInt32(hex.dropFirst(), radix: 16) ?? 0
+        return NSColor(calibratedRed: CGFloat((scalar >> 16) & 0xff) / 255,
+                       green: CGFloat((scalar >> 8) & 0xff) / 255,
+                       blue: CGFloat(scalar & 0xff) / 255,
+                       alpha: 1)
+    }
+
+    /// Build one item so RTFD, RTF, HTML and plain text stay together even
+    /// when the platform pasteboard service is unavailable in a test process.
+    static func pasteboardItem(text: String, html: String?,
+                               rich: (rtf: Data, rtfd: Data?)? = nil) -> NSPasteboardItem {
+        let rich = rich ?? html.flatMap(Self.richPasteboardData)
+        let item = NSPasteboardItem()
+        if let rtfd = rich?.rtfd { item.setData(rtfd, forType: .rtfd) }
+        if let rtf = rich?.rtf { item.setData(rtf, forType: .rtf) }
+        if let html { item.setData(Self.htmlPasteboardData(html), forType: .html) }
+        item.setString(text, forType: .string)
+        return item
+    }
+
     func preparePasteboard(text: String, html: String?, pasteboard pb: NSPasteboard = .general) -> () -> Void {
-        let rich = html.flatMap(Self.richPasteboardData)
         let saved = (pb.pasteboardItems ?? []).map { item in
             item.types.compactMap { type in item.data(forType: type).map { (type, $0) } }
         }
         pb.clearContents()
-        if let rtfd = rich?.rtfd { pb.setData(rtfd, forType: .rtfd) }
-        if let rtf = rich?.rtf { pb.setData(rtf, forType: .rtf) }
-        if let html { pb.setData(Self.htmlPasteboardData(html), forType: .html) }
-        pb.setString(text, forType: .string)
+        let item = Self.pasteboardItem(text: text, html: html)
+        pb.writeObjects([item])
         let changeCount = pb.changeCount
         return {
             guard pb.changeCount == changeCount else { return }
