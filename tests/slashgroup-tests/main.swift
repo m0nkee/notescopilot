@@ -32,7 +32,7 @@ do {
     check(cmd?.group == .ai, "格式检查归 AI 优化组")
     check(cmd?.alias == "format", "格式检查别名 format")
     let prompt = cmd.map { cmd -> String in
-        if case .run(let p) = cmd.action { return p } else { return "" }
+        if case .run(let p) = cmd.action { return p.prompt(for: "") } else { return "" }
     } ?? ""
     check(prompt.contains("格式问题") && prompt.contains("不要直接改写"), "格式检查提示词完整（列清单不改写）")
 }
@@ -106,6 +106,10 @@ do {
     check(category.count == 12 && category.allSatisfy { $0.group == .template },
           "/templates 列出全部模板，超过默认五项与八项上限")
     let commands = buildSlashCommands()
+    if let translate = AXSlashWatcher.matchSlashToken("/translate"), case .run(let instruction) = translate.action {
+        check(instruction == .translate && translate.detail == WritingInstruction.translationHint,
+              "/translate 的动作和说明都使用自动翻译方向")
+    } else { check(false, "缺少 /translate AI 指令") }
     for (query, group) in [("/template", SlashGroup.template), ("/模板", .template), ("/模版", .template),
                            ("/ai", .ai), ("/markdown", .markdown), ("/tools", .tool), ("/工具", .tool)] {
         let result = AXSlashWatcher.suggestCandidates(for: query, limit: 1)
@@ -176,7 +180,7 @@ do {
         let matched = AXSlashWatcher.matchSlashToken("/" + route.english.uppercased())
         let correctAction: Bool
         if let matched, case .run(let instruction) = matched.action {
-            correctAction = matched.name == route.name && instruction.contains(route.instruction)
+            correctAction = matched.name == route.name && instruction.prompt(for: "会议记录").contains(route.instruction)
         } else { correctAction = false }
         check(correctAction, "/\(route.english) 不区分大小写并匹配对应 AI 动作")
         let tail = AXSlashWatcher.matchAXSlashTail("合成段落 /\(route.english) ")

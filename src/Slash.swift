@@ -78,7 +78,7 @@ enum TemplateStore {
 // MARK: - 斜杠命令（对应 ProNotes 的 slash 命令面板 + Ask AI 指令）
 
 enum SlashAction {
-    case run(String)              // 填入提示词并立即执行
+    case run(WritingInstruction)  // 填入提示词并立即执行
     case fill(String)             // 仅填入提示词
     case format(FormatStyle)      // 触发 Notes 原生格式化（菜单/快捷键）
     case clearContext             // 清空笔记上下文
@@ -198,7 +198,7 @@ func buildSlashCommands() -> [SlashCommand] {
     var cmds: [SlashCommand] = [
         SlashCommand(name: "续写", alias: "continue", detail: "基于笔记上下文自然续写", action: .run("请基于上文内容自然地续写下去，保持原文的风格与格式。")),
         SlashCommand(name: "总结", alias: "summarize", detail: "总结笔记上下文的要点", action: .run("请用简洁的要点总结以下内容的核心信息。")),
-        SlashCommand(name: "翻译", alias: "translate", detail: "翻译成英文", action: .run("请将以下内容翻译成英文，保持原意与语气。")),
+        SlashCommand(name: "翻译", alias: "translate", detail: WritingInstruction.translationHint, action: .run(.translate)),
         SlashCommand(name: "润色", alias: "polish", detail: "让文字更通顺专业", action: .run("请润色以下文字，使其更通顺、专业，保持原意与格式。")),
         SlashCommand(name: "解释", alias: "explain", detail: "解释关键概念与逻辑", action: .run("请解释以下内容的关键概念与逻辑。")),
         SlashCommand(name: "扩写", alias: "expand", detail: "补充细节与论据", action: .run("请扩展以下内容，补充细节与论据，保持原有结构。")),
@@ -623,7 +623,7 @@ static func performGlobalSlash(_ cmd: SlashCommand, deleteCount: Int,
 @MainActor
 private static func executeGlobalSlash(_ cmd: SlashCommand, target: NotesBridge.SelectionSnapshot) {
     switch cmd.action {
-    case .run(let prompt):
+    case .run(let instruction):
         #if NC_APP
         guard let delegate = NSApp.delegate as? AppDelegate else { return }
         let engine = delegate.engine
@@ -631,7 +631,7 @@ private static func executeGlobalSlash(_ cmd: SlashCommand, target: NotesBridge.
         engine.setContext(context?.text ?? "", source: context?.source ?? "", noteID: target.noteID)
         engine.autoInsertNext = true
         delegate.revealPanel(captureContext: false)
-        engine.run(prompt: prompt, writebackTarget: target)
+        engine.run(prompt: instruction.prompt(for: engine.noteContext), writebackTarget: target)
         #endif
     case .insertTemplate:
         break // 模板已在删除命令之前绑定原始目标并执行。

@@ -9,7 +9,7 @@ struct SelectionQuickAction: Equatable {
     let name: String
     let group: Group
     let shortcut: String?
-    let instruction: String
+    let instruction: WritingInstruction
 }
 
 /// 快捷加工清单：指令要求「只输出加工后的文本」，保证替换动作可直接落笔
@@ -18,7 +18,7 @@ let selectionQuickActions: [SelectionQuickAction] = [
     .init(name: "润色", group: .edit, shortcut: "r", instruction: "请润色以下文字，使其更通顺、专业，保持原意与格式。只输出润色后的文本，不要解释。"),
     .init(name: "精简", group: .edit, shortcut: "c", instruction: "请把以下内容压缩得更简洁，保留核心信息。只输出精简后的文本。"),
     .init(name: "总结", group: .read, shortcut: "s", instruction: "请用简洁的要点总结以下内容的核心信息。只输出总结内容。"),
-    .init(name: "翻译", group: .read, shortcut: "t", instruction: "请将以下内容翻译成英文，保持原意与语气。只输出译文。"),
+    .init(name: "翻译", group: .read, shortcut: "t", instruction: .translate),
     .init(name: "解释", group: .read, shortcut: "e", instruction: "请简要解释以下内容的关键概念与逻辑。"),
 ]
 
@@ -613,13 +613,13 @@ final class SelectionAIPanel: NSObject, ObservableObject {
         status = ""
         showingOriginal = false
         present(.working)
-        request.run(instruction: action.instruction)
+        request.run(instruction: action.instruction.prompt(for: original))
     }
 
     func runCustom() {
         let instruction = customInstruction.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !instruction.isEmpty else { return }
-        run(.init(name: "自定义", group: .edit, shortcut: nil, instruction: instruction))
+        run(.init(name: "自定义", group: .edit, shortcut: nil, instruction: .text(instruction)))
     }
 
     private func performToolKey(_ key: String) -> Bool {
@@ -753,7 +753,7 @@ final class SelectionAIPanel: NSObject, ObservableObject {
         } else {
             window = SelectionKeyPanel(contentRect: .zero, styleMask: [.borderless, .nonactivatingPanel],
                                        backing: .buffered, defer: false)
-            window.title = "NotesCopilot 写作工具"
+            window.title = SelectionLauncherButton.displayName
             window.backgroundColor = .clear
             window.isOpaque = false
             window.hasShadow = true

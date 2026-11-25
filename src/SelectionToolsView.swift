@@ -106,24 +106,33 @@ private struct SelectionInstructionField: NSViewRepresentable {
 
 /// A nonactivating panel receives its first click directly in this AppKit button.
 final class SelectionLauncherButton: NSButton {
-    static let size = NSSize(width: 154, height: 30)
+    static let displayName = "Copilot 写作阅读助手"
+    static let size = NSSize(width: 184, height: 32)
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
     override var needsPanelToBecomeKey: Bool { false }
 
     init(target: AnyObject, action: Selector) {
         super.init(frame: NSRect(origin: .zero, size: Self.size))
-        let label = "Copilot 写作工具"
+        let label = Self.displayName
         title = label
         setAccessibilityLabel(label)
-        toolTip = "打开写作工具（M）"
-        setAccessibilityHelp("按 M 打开写作工具")
-        image = NSImage(systemSymbolName: "pencil.and.outline", accessibilityDescription: nil)
+        toolTip = "打开\(label)（M）"
+        setAccessibilityHelp("按 M 打开\(label)")
+        image = NSImage(systemSymbolName: "book", accessibilityDescription: nil)
+        symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 14, weight: .medium)
         imagePosition = .imageLeading
-        bezelStyle = .rounded
+        imageHugsTitle = true
+        isBordered = false
+        contentTintColor = .labelColor
         controlSize = .regular
-        let caption = NSMutableAttributedString(string: label, attributes: [.font: NSFont.systemFont(ofSize: NSFont.smallSystemFontSize, weight: .medium)])
-        caption.append(NSAttributedString(string: "   M", attributes: [.font: NSFont.monospacedSystemFont(ofSize: NSFont.smallSystemFontSize, weight: .regular),
-                                                                         .foregroundColor: NSColor.secondaryLabelColor]))
+        let caption = NSMutableAttributedString(string: label, attributes: [
+            .font: NSFont.systemFont(ofSize: NSFont.smallSystemFontSize, weight: .semibold),
+            .foregroundColor: NSColor.labelColor
+        ])
+        caption.append(NSAttributedString(string: "   M", attributes: [
+            .font: NSFont.monospacedSystemFont(ofSize: NSFont.smallSystemFontSize, weight: .medium),
+            .foregroundColor: NSColor.labelColor
+        ]))
         attributedTitle = caption
         self.target = target
         self.action = action
@@ -133,6 +142,22 @@ final class SelectionLauncherButton: NSButton {
     }
 
     required init?(coder: NSCoder) { nil }
+
+    override func draw(_ dirtyRect: NSRect) {
+        // The host can be any colour, even when its appearance differs from ours.
+        let bezel = NSBezierPath(roundedRect: bounds.insetBy(dx: 1, dy: 1), xRadius: 9, yRadius: 9)
+        NSColor.controlBackgroundColor.setFill()
+        bezel.fill()
+        if isHighlighted {
+            NSColor.labelColor.withAlphaComponent(0.10).setFill()
+            bezel.fill()
+        }
+        let highContrast = NSWorkspace.shared.accessibilityDisplayShouldIncreaseContrast
+        NSColor.labelColor.withAlphaComponent(highContrast ? 0.9 : 0.6).setStroke()
+        bezel.lineWidth = highContrast ? 2 : 1.5
+        bezel.stroke()
+        super.draw(dirtyRect)
+    }
 }
 
 struct SelectionToolsView: View {
@@ -170,8 +195,8 @@ struct SelectionToolsView: View {
 
     private var header: some View {
         HStack(spacing: 6) {
-            Image(systemName: "pencil.and.outline").foregroundStyle(Color.accentColor)
-            Text(model.phase == .review ? (model.action?.name ?? "写作结果") : "Copilot 写作工具")
+            Image(systemName: "book").foregroundStyle(Color.accentColor)
+            Text(model.phase == .review ? (model.action?.name ?? "处理结果") : SelectionLauncherButton.displayName)
                 .font(.headline)
             Spacer()
             if let source = model.sourceName {
@@ -182,8 +207,8 @@ struct SelectionToolsView: View {
                 Image(systemName: "xmark.circle.fill").foregroundStyle(.secondary)
             }
             .buttonStyle(.plain)
-            .accessibilityLabel("关闭写作工具")
-            .help("关闭写作工具（Esc）")
+            .accessibilityLabel("关闭写作阅读助手")
+            .help("关闭写作阅读助手（Esc）")
         }
     }
 
@@ -206,7 +231,7 @@ struct SelectionToolsView: View {
                     ForEach(selectionQuickActions.filter { $0.group == group }, id: \.name) { action in
                         if let key = action.shortcut {
                             shortcutButton(action.name, key: key) { model.run(action) }
-                                .help(action.name == "翻译" ? "翻译成英文（T）" : "\(action.name)（\(key.uppercased())）")
+                                .help("\(action.instruction == .translate ? WritingInstruction.translationHint : action.name)（\(key.uppercased())）")
                         }
                     }
                 }

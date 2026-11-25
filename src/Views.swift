@@ -8,19 +8,19 @@ import ServiceManagement
 struct QuickAction: Identifiable {
     let id = UUID()
     let title: String
-    let prompt: String
+    let instruction: WritingInstruction
 }
 
 let quickActions: [QuickAction] = [
-    QuickAction(title: "续写", prompt: "请基于上文内容自然地续写下去，保持原文的风格与格式。"),
-    QuickAction(title: "总结", prompt: "请用简洁的要点总结以下内容的核心信息。"),
-    QuickAction(title: "翻译", prompt: "请将以下内容翻译成英文，保持原意与语气。"),
-    QuickAction(title: "润色", prompt: "请润色以下文字，使其更通顺、专业，保持原意与格式。"),
-    QuickAction(title: "解释", prompt: "请解释以下内容的关键概念与逻辑。"),
-    QuickAction(title: "扩写", prompt: "请扩展以下内容，补充细节与论据，保持原有结构。"),
-    QuickAction(title: "修拼写", prompt: "请修复以下文字的拼写与语法错误，只输出修正后的文本，不要解释。"),
-    QuickAction(title: "变短", prompt: "请把以下内容压缩得更简洁，保留核心信息。"),
-    QuickAction(title: "变长", prompt: "请把以下内容写得更丰富、有细节，保持原意。"),
+    QuickAction(title: "续写", instruction: "请基于上文内容自然地续写下去，保持原文的风格与格式。"),
+    QuickAction(title: "总结", instruction: "请用简洁的要点总结以下内容的核心信息。"),
+    QuickAction(title: "翻译", instruction: .translate),
+    QuickAction(title: "润色", instruction: "请润色以下文字，使其更通顺、专业，保持原意与格式。"),
+    QuickAction(title: "解释", instruction: "请解释以下内容的关键概念与逻辑。"),
+    QuickAction(title: "扩写", instruction: "请扩展以下内容，补充细节与论据，保持原有结构。"),
+    QuickAction(title: "修拼写", instruction: "请修复以下文字的拼写与语法错误，只输出修正后的文本，不要解释。"),
+    QuickAction(title: "变短", instruction: "请把以下内容压缩得更简洁，保留核心信息。"),
+    QuickAction(title: "变长", instruction: "请把以下内容写得更丰富、有细节，保持原意。"),
 ]
 
 // MARK: - 服务商预设（自配置模型的核心：任意 OpenAI 兼容端点）
@@ -588,9 +588,8 @@ struct PanelView: View {
             HStack(spacing: 6) {
                 ForEach(quickActions) { qa in
                     Button(qa.title) {
-                        prompt = qa.prompt
                         suggestions = []
-                        engine.run(prompt: qa.prompt)
+                        run(qa.instruction)
                     }
                     .buttonStyle(.bordered)
                     .controlSize(.small)
@@ -784,12 +783,16 @@ struct PanelView: View {
         return name + " · " + model
     }
 
+    private func run(_ instruction: WritingInstruction) {
+        prompt = instruction.prompt(for: engine.noteContext)
+        engine.run(prompt: prompt)
+    }
+
     private func perform(_ cmd: SlashCommand) {
         suggestions = []
         switch cmd.action {
-        case .run(let p):
-            prompt = p
-            engine.run(prompt: p)
+        case .run(let instruction):
+            run(instruction)
         case .fill(let p):
             prompt = p
         case .clearContext:

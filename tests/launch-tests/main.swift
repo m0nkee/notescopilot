@@ -222,9 +222,11 @@ struct LaunchTests {
         check(reads == 0 && inputs.isEmpty && tools.phase == .launcher && !tools.panelIsKey,
               "a passive Notes button takes no focus, reads no document and sends no request")
         if let launcher = NSApp.windows.compactMap({ $0.isVisible ? $0.contentView as? SelectionLauncherButton : nil }).first {
-            check(launcher.attributedTitle.string.hasSuffix("M") && launcher.accessibilityLabel() == "Copilot 写作工具",
+            check(launcher.attributedTitle.string.hasSuffix("M") && launcher.accessibilityLabel() == "Copilot 写作阅读助手",
                   "the launcher labels its shortcut visually and exposes its action to Accessibility")
             try captureSelectionPreview("selection-launcher", view: launcher)
+        } else {
+            check(false, "the passive panel contains the native launcher button")
         }
         tools.openTools()
         check(tools.formats.map(\.menuTitle) == ["标题", "正文"] && inputs.isEmpty,
@@ -277,7 +279,7 @@ struct LaunchTests {
 
     /// Deliver through the app so AppKit dispatches to the real key window and its field editor.
     static func sendToolKey(_ text: String, code: UInt16, modifiers: NSEvent.ModifierFlags = [], repeating: Bool = false) {
-        guard let window = NSApp.windows.first(where: { $0.isVisible && $0.title == "NotesCopilot 写作工具" }),
+        guard let window = NSApp.windows.first(where: { $0.isVisible && $0.title == SelectionLauncherButton.displayName }),
               let event = NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: modifiers,
                                            timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber,
                                            context: nil, characters: text, charactersIgnoringModifiers: text,
@@ -298,7 +300,7 @@ struct LaunchTests {
         defer { panel.hide() }
         panel.openSelectionWritingTools(board, userData: nil, error: nil)
         settle()
-        guard let window = NSApp.windows.first(where: { $0.isKeyWindow && $0.title == "NotesCopilot 写作工具" }) else {
+        guard let window = NSApp.windows.first(where: { $0.isKeyWindow && $0.title == SelectionLauncherButton.displayName }) else {
             check(false, "the tool menu takes keyboard focus")
             return
         }
@@ -312,7 +314,7 @@ struct LaunchTests {
             sendToolKey(letter, code: code, repeating: true)
             await request.task?.value
             check(panel.phase == .review && instructions.count == previous + 1 &&
-                  instructions.last == selectionQuickActions.first(where: { $0.name == title })?.instruction,
+                  instructions.last == selectionQuickActions.first(where: { $0.name == title })?.instruction.prompt(for: excerpt),
                   "the displayed \(letter.uppercased()) key runs \(title) once")
             sendToolKey("b", code: 11)
             check(panel.phase == .menu && panel.original == excerpt, "B returns to the same excerpt after \(title)")
@@ -354,11 +356,23 @@ struct LaunchTests {
         check(instructions.count == count + 1 && instructions.last == draft && !panel.showingOriginal, "G regenerates the same instruction")
         sendToolKey("\u{1b}", code: 53)
         check(!window.isVisible, "Escape outside the editor closes the review")
+
+        check(quickActions.first { $0.title == "翻译" }?.instruction == .translate,
+              "the main AI panel uses automatic translation")
+        for (source, target) in [("雨伞在哪里？", "英文"), ("Where is the umbrella?", "简体中文")] {
+            board.clearContents()
+            board.setString(source, forType: .string)
+            panel.openSelectionWritingTools(board, userData: nil, error: nil)
+            sendToolKey("t", code: 17)
+            await request.task?.value
+            check(panel.original == source && panel.phase == .review && instructions.last?.hasPrefix("请将原文翻译成" + target) == true,
+                  "T sends the direction for the current selection, target=\(target)")
+        }
     }
 
     private static func checkToolWindow(_ name: String, width: CGFloat) throws {
         settle()
-        guard let view = NSApp.windows.first(where: { $0.title == "NotesCopilot 写作工具" && $0.isVisible })?.contentView else {
+        guard let view = NSApp.windows.first(where: { $0.title == SelectionLauncherButton.displayName && $0.isVisible })?.contentView else {
             check(false, "missing native panel for \(name)")
             return
         }
@@ -368,18 +382,54 @@ struct LaunchTests {
     }
 
     private static func captureSelectionPreview(_ name: String, view: NSView) throws {
-        guard let path = ProcessInfo.processInfo.environment["NC_SELECTION_PREVIEWS"], let window = view.window else { return }
+        let directory = ProcessInfo.processInfo.environment["NC_SELECTION_PREVIEWS"].map { URL(fileURLWithPath: $0, isDirectory: true) }
+        guard let window = view.window, directory != nil || view is SelectionLauncherButton else { return }
         let originalAppearance = window.appearance
         defer { window.appearance = originalAppearance }
-        let directory = URL(fileURLWithPath: path, isDirectory: true)
-        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        if let directory { try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true) }
         for (appearance, suffix) in [(originalAppearance, ""), (NSAppearance(named: .aqua), "-light"), (NSAppearance(named: .darkAqua), "-dark")] {
             window.appearance = appearance
             settle()
             view.displayIfNeeded()
-            guard let bitmap = view.bitmapImageRepForCachingDisplay(in: view.bounds) else { continue }
-            view.cacheDisplay(in: view.bounds, to: bitmap)
-            try bitmap.representation(using: .png, properties: [:])?.write(to: directory.appendingPathComponent(name + suffix + ".png"))
+            guard let bitmap = view.bitmapImageRepForCachingDisplay(in: view.bounds) else {
+                check(false, "failed to capture \(name)\(suffix)")
+                continue
+            }
+            view.effectiveAppearance.performAsCurrentDrawingAppearance { view.cacheDisplay(in: view.bounds, to: bitmap) }
+            if view is SelectionLauncherButton && !suffix.isEmpty { checkLauncherContrast(bitmap, appearance: suffix) }
+            if let directory {
+                try bitmap.representation(using: .png, properties: [:])?.write(to: directory.appendingPathComponent(name + suffix + ".png"))
+            }
+        }
+    }
+
+    private static func checkLauncherContrast(_ image: NSBitmapImageRep, appearance: String) {
+        let width = image.pixelsWide, height = image.pixelsHigh
+        func pixel(_ x: Int, _ y: Int) -> NSColor {
+            image.colorAt(x: x, y: y)!.usingColorSpace(.sRGB)!
+        }
+        func luminance(_ color: NSColor, over gray: CGFloat) -> CGFloat {
+            func linear(_ channel: CGFloat) -> CGFloat {
+                let v = channel * color.alphaComponent + gray * (1 - color.alphaComponent)
+                return v <= 0.04045 ? v / 12.92 : pow((v + 0.055) / 1.055, 2.4)
+            }
+            return 0.2126 * linear(color.redComponent) + 0.7152 * linear(color.greenComponent) + 0.0722 * linear(color.blueComponent)
+        }
+        func contrast(_ a: CGFloat, _ b: CGFloat) -> CGFloat { (max(a, b) + 0.05) / (min(a, b) + 0.05) }
+
+        let surface = pixel(width / 2, height / 6)
+        check(surface.alphaComponent > 0.99, "the launcher has an opaque surface in \(appearance)")
+        let topEdge = (0...height / 6).map { pixel(width / 2, $0) }
+        for gray: CGFloat in [0, 1] {
+            let visible = topEdge.contains { contrast(luminance($0, over: gray), gray) >= 3 }
+            check(visible, "the launcher silhouette contrasts with \(gray == 0 ? "black" : "white") in \(appearance)")
+        }
+        let background = luminance(surface, over: 0)
+        for (label, region) in [("title", width / 3..<width * 2 / 3), ("M", width * 4 / 5..<width * 19 / 20)] {
+            let visible = region.contains { x in
+                (height / 3..<height * 2 / 3).contains { y in contrast(luminance(pixel(x, y), over: 0), background) >= 4.5 }
+            }
+            check(visible, "the launcher \(label) has readable ink in \(appearance)")
         }
     }
 

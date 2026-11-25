@@ -81,9 +81,31 @@ do {
 // ---- 7. 快捷动作清单完整性 ----
 do {
     check(selectionQuickActions.count == 6, "6 个快捷动作")
-    check(selectionQuickActions.allSatisfy { !$0.instruction.isEmpty }, "全部动作有指令")
+    check(selectionQuickActions.allSatisfy { !$0.instruction.prompt(for: "原文").isEmpty }, "全部动作有指令")
     check(selectionQuickActions.filter { $0.group == .edit }.map(\.name) == ["校对", "润色", "精简"], "编辑组选区改写")
     check(selectionQuickActions.filter { $0.group == .read }.map(\.name) == ["总结", "翻译", "解释"], "阅读组选区加工")
+}
+
+do {
+    let translation = selectionQuickActions.first { $0.shortcut == "t" }?.instruction
+    for (source, target) in [
+        ("这是什么？", "英文"), ("這是什麼？", "英文"), ("蓝色雨伞", "英文"),
+        ("Where is my umbrella?", "简体中文"), ("Bonjour tout le monde !", "简体中文"),
+        ("会議の資料をご確認ください。", "简体中文"), ("다음 주에 만나요.", "简体中文"),
+        ("这个 API 支持离线翻译。", "英文"), ("Please return the 蓝色雨伞 tomorrow.", "简体中文")
+    ] {
+        check(translation?.prompt(for: source).hasPrefix("请将原文翻译成" + target) == true, "翻译「\(source)」的目标是\(target)")
+    }
+    for source in ["我们的 NotesCopilot 已经发布", "苹果发布了 Apple Intelligence 和 Writing Tools。"] {
+        let prompt = translation?.prompt(for: source) ?? ""
+        check(prompt.contains("翻译成英文") && !prompt.hasPrefix("请将原文翻译成简体中文"), "英文产品名不会强制中文句子译为中文：\(source)")
+    }
+    for source in ["123 🌻", ""] {
+        let prompt = translation?.prompt(for: source) ?? ""
+        check(prompt.contains("主要语言") && prompt.contains("翻译成英文") && prompt.contains("翻译成简体中文")
+              && prompt.contains("只输出译文"), "混合文字或无可识别文字时，在同一次翻译中判断方向：\(source)")
+    }
+    check(WritingInstruction.text("请译成日文").prompt(for: "蓝色雨伞") == "请译成日文", "保留自定义指令的目标语言")
 }
 
 // ---- 8. Notes 原生格式菜单（动态枚举 → 本地化标签） ----

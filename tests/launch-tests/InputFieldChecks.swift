@@ -74,7 +74,7 @@ extension LaunchTests {
         try await send("readonly")
         try await waitFor("read-only translation launcher") { panel.isInputSession && panel.phase == .launcher }
         panel.openTools()
-        let toolWindow = NSApp.windows.first { $0.isVisible && $0.title == "NotesCopilot 写作工具" }
+        let toolWindow = NSApp.windows.first { $0.isVisible && $0.title == SelectionLauncherButton.displayName }
         let menuFrame = toolWindow?.frame
         delayTranslation = true
         panel.run(translate)
@@ -153,7 +153,7 @@ extension LaunchTests {
         try await Task.sleep(nanoseconds: 480_000_000)
         // The fixture deliberately reactivates the source to collapse its range.
         // Re-enter the tool window before sending a panel-local shortcut.
-        NSApp.windows.first { $0.isVisible && $0.title == "NotesCopilot 写作工具" }?.makeKeyAndOrderFront(nil)
+        NSApp.windows.first { $0.isVisible && $0.title == SelectionLauncherButton.displayName }?.makeKeyAndOrderFront(nil)
         sendToolKey("t", code: 17)
         await request.task?.value
         let copy = NSPasteboard.withUniqueName()
@@ -188,7 +188,7 @@ extension LaunchTests {
                 throw error
             }
             let count = requests.count
-            if clickLauncher, let window = NSApp.windows.first(where: { $0.isVisible && $0.title == "NotesCopilot 写作工具" }) {
+            if clickLauncher, let window = NSApp.windows.first(where: { $0.isVisible && $0.title == SelectionLauncherButton.displayName }) {
                 guard let content = window.contentView,
                       let button = content.hitTest(NSPoint(x: content.bounds.midX, y: content.bounds.midY)) as? NSButton,
                       button.acceptsFirstMouse(for: nil), !button.needsPanelToBecomeKey else {
@@ -200,7 +200,7 @@ extension LaunchTests {
             } else {
                 panel.openTools()
             }
-            if hoverMenu, let window = NSApp.windows.first(where: { $0.isVisible && $0.title == "NotesCopilot 写作工具" }),
+            if hoverMenu, let window = NSApp.windows.first(where: { $0.isVisible && $0.title == SelectionLauncherButton.displayName }),
                let screen = NSScreen.screens.first, let previous = CGEvent(source: nil)?.location {
                 let point = CGPoint(x: window.frame.midX, y: screen.frame.maxY - window.frame.midY)
                 CGWarpMouseCursorPosition(point)

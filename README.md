@@ -6,21 +6,21 @@
 
 在 Apple Notes 里写作，也能在 Mac 上直接处理选中的文字。
 
-[下载 v2.8.1 · Apple Silicon](https://github.com/m0nkee/notescopilot/releases/download/v2.8.1/NotesCopilot-2.8.1-arm64.dmg) · [发布说明与校验文件](https://github.com/m0nkee/notescopilot/releases/tag/v2.8.1) · [使用手册](docs/USAGE.md)
+[下载 v2.8.2 · Apple Silicon](https://github.com/m0nkee/notescopilot/releases/download/v2.8.2/NotesCopilot-2.8.2-arm64.dmg) · [发布说明与校验文件](https://github.com/m0nkee/notescopilot/releases/tag/v2.8.2) · [使用手册](docs/USAGE.md)
 
 </div>
 
-## 选中文字，打开写作工具
+## 选中文字，打开 Copilot 写作阅读助手
 
 NotesCopilot 是一个原生 macOS 菜单栏应用。默认在 **Notes 正文**显示选区浮钮。要在其他应用使用，打开「设置 → 斜杠与文本扩展 → 选区写作工具」，将「应用范围」切到 **全局**。
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/images/selection-launcher-dark.png">
-  <img src="docs/images/selection-launcher-light.png" width="154" height="30" alt="Copilot 写作工具浮钮，右侧标出 M 快捷键">
+  <img src="docs/images/selection-launcher-light.png" width="184" height="32" alt="Copilot 写作阅读助手浮钮，右侧标出 M 快捷键">
 </picture>
 
 1. 选中要处理的文字。浮钮出现后，**单击浮钮或按一次 `M`** 打开同一个菜单。
-2. 核对原文摘录，点击动作或按按钮旁的字母。例如，按 `T` 直接翻译为英文，按 `I` 输入自己的指令，再按回车执行。
+2. 按 `T` 翻译。简体和繁体中文默认译成英文，其他语言默认译成简体中文。中外文混排时按原文的主要语言决定方向。需要其他译文语言时，按 `I` 输入指令，例如「翻译成日文」，再按回车。
 3. 在结果面板对照原文，复制需要的版本。打开工具和选择动作是两个独立步骤，点动作或提交指令时才会向配置的模型发送所选文字。
 
 | 划选位置 | 可用操作 |

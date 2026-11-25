@@ -11,7 +11,7 @@ MODULE_CACHE="${TMPDIR:-/private/tmp}/notescopilot-swift-module-cache"
 mkdir -p "$MODULE_CACHE"
 trap 'rm -rf "$OUT"' EXIT
 
-COMMON_SOURCES=(src/InputFieldSelection.swift src/NotesBridge.swift src/Slash.swift src/SlashSuggest.swift src/UrlTitle.swift
+COMMON_SOURCES=(src/WritingInstruction.swift src/InputFieldSelection.swift src/NotesBridge.swift src/Slash.swift src/SlashSuggest.swift src/UrlTitle.swift
   src/TemplateEngine.swift src/FormatBridge.swift src/Topotext.swift src/FrontmostTracker.swift
   src/LiberatorLite.swift src/Chat.swift src/Markdown.swift src/NotesTemplateImporter.swift)
 
