@@ -1108,7 +1108,7 @@ struct SettingsView: View {
             .padding(.bottom, 8)
             if let release = updater.availableRelease {
                 Button("新版本 v\(release.version) 可下载") {
-                    NSWorkspace.shared.open(release.pageURL)
+                    NSWorkspace.shared.open(release.downloadURL)
                 }
                 .buttonStyle(.borderless)
                 .font(.caption2)
@@ -1897,10 +1897,10 @@ struct SettingsView: View {
                     .foregroundColor(updater.availableRelease == nil ? .secondary : .orange)
                     .accessibilityIdentifier("settings.updates.status")
                 if let release = updater.availableRelease {
-                    Button("下载新版本 v\(release.version)…") { NSWorkspace.shared.open(release.pageURL) }
+                    Button("下载新版本 v\(release.version)…") { NSWorkspace.shared.open(release.downloadURL) }
                         .controlSize(.small)
                         .accessibilityIdentifier("settings.updates.download")
-                    Text("下载 DMG 后，将 NotesCopilot 拖入「Applications」替换旧版本。")
+                    Text("下载 DMG 后，将 NotesCopilot 拖入「Applications」替换旧版本。若 macOS 提示无法验证应用，先点「完成」，再到「系统设置 → 隐私与安全性」点「仍要打开」。")
                         .font(.caption2).foregroundColor(.secondary)
                 }
                 Toggle("自动检查更新并提醒", isOn: $updater.automaticallyChecks)

@@ -33,6 +33,13 @@ struct AppRelease: Codable, Equatable {
     var pageURL: URL {
         AppUpdater.releasesURL.appendingPathComponent("tag").appendingPathComponent(tag)
     }
+
+    var downloadURL: URL {
+        AppUpdater.releasesURL
+            .appendingPathComponent("download")
+            .appendingPathComponent(tag)
+            .appendingPathComponent("NotesCopilot-\(version)-arm64.dmg")
+    }
 }
 
 @MainActor

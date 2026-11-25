@@ -110,6 +110,8 @@ private func runTests() async {
           "更新请求有超时并使用 GitHub JSON 接口")
     check(updater.availableRelease?.pageURL.absoluteString == "https://github.com/m0nkee/notescopilot/releases/tag/v2.7.0",
           "下载入口指向对应正式发布页")
+    check(updater.availableRelease?.downloadURL.absoluteString == "https://github.com/m0nkee/notescopilot/releases/download/v2.7.0/NotesCopilot-2.7.0-arm64.dmg",
+          "更新按钮直接下载对应版本 DMG")
     check(updater.shouldRemind(), "首次发现新版本需要提醒")
     updater.markReminded()
     check(!updater.shouldRemind(), "同一天不重复弹出提醒")
