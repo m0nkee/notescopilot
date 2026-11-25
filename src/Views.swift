@@ -1660,6 +1660,11 @@ struct SettingsView: View {
 
     private var activeMaxTokens: Int { activeMaxTokensBinding.wrappedValue }
 
+    private var activeModelSupportsTemperature: Bool {
+        let model = activeProfileIndex.map { profiles[$0].model } ?? ""
+        return AIRequestConfiguration.temperatureIsSupported(for: model)
+    }
+
     // MARK: 生成参数页
 
     private var generationPage: some View {
@@ -1667,12 +1672,20 @@ struct SettingsView: View {
             card("thermometer.medium", "采样温度", note: "越高越有创造性，越低越稳定") {
                 VStack(alignment: .leading, spacing: 6) {
                     HStack {
-                        Text("Temperature：\(String(format: "%.1f", temperature))")
+                        Text(activeModelSupportsTemperature
+                             ? "Temperature：\(String(format: "%.1f", activeTemperatureBinding.wrappedValue))"
+                             : "Temperature：1.0（模型默认）")
                             .font(.system(size: 12, weight: .medium))
                         Spacer()
-                        Text("0.0 – 2.0").font(.caption).foregroundColor(.secondary)
+                        Text(activeModelSupportsTemperature ? "0.0 – 2.0" : "仅默认值")
+                            .font(.caption).foregroundColor(.secondary)
                     }
-                    Slider(value: activeTemperatureBinding, in: 0...2, step: 0.1)
+                    if activeModelSupportsTemperature {
+                        Slider(value: activeTemperatureBinding, in: 0...2, step: 0.1)
+                    } else {
+                        Text("此模型只支持服务端默认温度；请求会自动省略 temperature 参数。")
+                            .font(.caption).foregroundColor(.secondary)
+                    }
                 }
             }
             card("text.quote", "最大输出 tokens") {

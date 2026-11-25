@@ -160,9 +160,29 @@ struct AIRequestConfiguration: Sendable {
     let apiKey: String
     let model: String
     let systemPrompt: String
-    let temperature: Double
+    let temperature: Double?
     let maxTokens: Int
     let profileIdentity: String
+
+    /// 一些模型只接受服务端默认采样温度（例如 gpt-6.1-terra）。
+    /// 对这类模型必须省略 temperature，而不是强行发送 1。
+    static func temperatureIsSupported(for model: String) -> Bool {
+        let normalized = model.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
+        return !normalized.contains("gpt-6.1-terra")
+    }
+
+    static func isTemperatureUnsupportedError(_ message: String) -> Bool {
+        message.localizedCaseInsensitiveContains("temperature")
+            && (message.localizedCaseInsensitiveContains("unsupported")
+                || message.localizedCaseInsensitiveContains("does not support")
+                || message.localizedCaseInsensitiveContains("only the default"))
+    }
+
+    func omittingTemperature() -> AIRequestConfiguration {
+        AIRequestConfiguration(baseURL: baseURL, apiKey: apiKey, model: model,
+                               systemPrompt: systemPrompt, temperature: nil, maxTokens: maxTokens,
+                               profileIdentity: profileIdentity)
+    }
 
     static func current() throws -> AIRequestConfiguration {
         let profile = Config.activeProfile
@@ -174,11 +194,13 @@ struct AIRequestConfiguration: Sendable {
         guard let model = profile?.model.trimmingCharacters(in: .whitespacesAndNewlines), !model.isEmpty else {
             throw APIError(status: -1, message: "尚未配置模型名，请先打开设置")
         }
+        let temperature = Self.temperatureIsSupported(for: model) ? Config.temperature : nil
+        let temperatureIdentity = temperature.map { "\($0)" } ?? "default"
         return AIRequestConfiguration(baseURL: base, apiKey: profile?.apiKey ?? "", model: model,
-                                      systemPrompt: Config.systemPrompt, temperature: Config.temperature,
+                                      systemPrompt: Config.systemPrompt, temperature: temperature,
                                       maxTokens: Config.maxTokens,
                                       profileIdentity: (profile?.id.uuidString ?? "") + "|" + base + "|" + model
-                                          + "|t\(Config.temperature)|m\(Config.maxTokens)")
+                                          + "|t\(temperatureIdentity)|m\(Config.maxTokens)")
     }
 }
 
@@ -229,16 +251,17 @@ enum AIService {
         let key = configuration.apiKey
         if !key.isEmpty { req.setValue("Bearer " + key, forHTTPHeaderField: "Authorization") }
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        req.httpBody = try JSONSerialization.data(withJSONObject: [
+        var body: [String: Any] = [
             "model": configuration.model,
             "messages": [
                 ["role": "system", "content": configuration.systemPrompt],
                 ["role": "user", "content": user],
             ],
             "stream": false,
-            "temperature": configuration.temperature,
             "max_tokens": configuration.maxTokens,
-        ])
+        ]
+        if let temperature = configuration.temperature { body["temperature"] = temperature }
+        req.httpBody = try JSONSerialization.data(withJSONObject: body)
         let (data, resp) = try await URLSession.shared.data(for: req)
         try Task.checkCancellation()
         if let http = resp as? HTTPURLResponse, http.statusCode != 200 {
@@ -653,18 +676,10 @@ final class ChatEngine: ObservableObject {
             var result = StreamResult(output: continuationPrefix)
             var completed = false
             do {
-                try await self.stream(configuration: configuration, messages: messages, includeUsage: true, requestID: requestID, result: &result)
+                try await self.streamWithCompatibility(configuration: configuration, messages: messages,
+                                                        includeUsage: true, requestID: requestID,
+                                                        continuationPrefix: continuationPrefix, result: &result)
                 completed = true
-            } catch let e as APIError where e.status == 400 && e.message.contains("stream_options") {
-                guard self.currentRequestID == requestID, !Task.isCancelled else { return }
-                do {
-                    result = StreamResult(output: continuationPrefix)
-                    try await self.stream(configuration: configuration, messages: messages, includeUsage: false, requestID: requestID, result: &result)
-                    completed = true
-                } catch {
-                    guard self.currentRequestID == requestID, !Task.isCancelled else { return }
-                    self.lastError = "请求失败：" + error.localizedDescription
-                }
             } catch {
                 guard self.currentRequestID == requestID, !Task.isCancelled else { return }
                 if !(error is CancellationError) { self.lastError = "请求失败：" + error.localizedDescription }
@@ -702,6 +717,29 @@ final class ChatEngine: ObservableObject {
         }
     }
 
+    /// 兼容不支持 stream_options 或自定义 temperature 的服务商；每种兼容问题最多重试一次。
+    private func streamWithCompatibility(configuration: AIRequestConfiguration, messages: [[String: Any]],
+                                          includeUsage: Bool, requestID: UUID, continuationPrefix: String,
+                                          result: inout StreamResult) async throws {
+        do {
+            try await stream(configuration: configuration, messages: messages, includeUsage: includeUsage,
+                             requestID: requestID, result: &result)
+        } catch let error as APIError
+            where error.status == 400 && includeUsage && error.message.contains("stream_options") {
+            result = StreamResult(output: continuationPrefix)
+            try await streamWithCompatibility(configuration: configuration, messages: messages,
+                                              includeUsage: false, requestID: requestID,
+                                              continuationPrefix: continuationPrefix, result: &result)
+        } catch let error as APIError
+            where error.status == 400 && configuration.temperature != nil
+                && AIRequestConfiguration.isTemperatureUnsupportedError(error.message) {
+            result = StreamResult(output: continuationPrefix)
+            try await streamWithCompatibility(configuration: configuration.omittingTemperature(), messages: messages,
+                                              includeUsage: includeUsage, requestID: requestID,
+                                              continuationPrefix: continuationPrefix, result: &result)
+        }
+    }
+
     /// 发起 SSE 流式请求；includeUsage 时带 stream_options.include_usage
     private func stream(configuration: AIRequestConfiguration, messages: [[String: Any]], includeUsage: Bool, requestID: UUID,
                         result: inout StreamResult) async throws {
@@ -709,9 +747,9 @@ final class ChatEngine: ObservableObject {
             "model": configuration.model,
             "messages": messages,
             "stream": true,
-            "temperature": configuration.temperature,
             "max_tokens": configuration.maxTokens,
         ]
+        if let temperature = configuration.temperature { body["temperature"] = temperature }
         if includeUsage { body["stream_options"] = ["include_usage": true] }
 
         guard let url = URL(string: configuration.baseURL + "/chat/completions") else {

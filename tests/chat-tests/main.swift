@@ -317,6 +317,44 @@ private final class ChatTests {
         await settle()
     }
 
+    func defaultOnlyTemperatureModelsOmitParameter() async {
+        configure(model: "gpt-6.1-terra")
+        ChatTestProtocol.reset()
+        let engine = ChatEngine()
+        engine.run(prompt: "default temperature model")
+        await wait("default temperature request starts") { ChatTestProtocol.count == 1 }
+        let body = ChatTestProtocol.capturedRequest(0)?.httpBody
+            .flatMap { try? JSONSerialization.jsonObject(with: $0) } as? [String: Any]
+        check(body?["temperature"] == nil, "gpt-6.1-terra requests omit unsupported temperature")
+        check(body?["model"] as? String == "gpt-6.1-terra", "gpt-6.1-terra requests keep the configured model")
+        check(body?["stream_options"] != nil, "gpt-6.1-terra requests still request usage accounting")
+        ChatTestProtocol.respond(0, body: "data: {\"choices\":[{\"delta\":{\"content\":\"default temperature result\"}}]}\n\n")
+        await wait("default temperature request finishes") { !engine.busy }
+        check(engine.lastError == nil && engine.output == "default temperature result",
+              "omitting temperature lets gpt-6.1-terra complete normally")
+    }
+
+    func temperatureCompatibilityRetryOmitsParameter() async {
+        configure()
+        ChatTestProtocol.reset()
+        let engine = ChatEngine()
+        engine.run(prompt: "temperature compatibility")
+        await wait("temperature compatibility first request starts") { ChatTestProtocol.count == 1 }
+        ChatTestProtocol.respond(
+            0, status: 400,
+            body: #"{"error":{"message":"Unsupported value: 'temperature' does not support 0.25 with this model. Only the default (1) value is supported."}}"#
+        )
+        await wait("temperature compatibility retry starts") { ChatTestProtocol.count == 2 }
+        let body = ChatTestProtocol.capturedRequest(1)?.httpBody
+            .flatMap { try? JSONSerialization.jsonObject(with: $0) } as? [String: Any]
+        check(body?["temperature"] == nil, "temperature compatibility retry omits the rejected parameter")
+        check(body?["stream_options"] != nil, "temperature compatibility retry preserves usage accounting")
+        ChatTestProtocol.respond(1, body: "data: {\"choices\":[{\"delta\":{\"content\":\"temperature retry result\"}}]}\n\n")
+        await wait("temperature compatibility retry finishes") { !engine.busy }
+        check(engine.lastError == nil && engine.output == "temperature retry result",
+              "temperature compatibility retry publishes the completed response")
+    }
+
     func malformedModelURLIsRecoverable() async {
         do {
             _ = try await AIService.fetchModels(base: "https://bad host/v1", key: "")
@@ -720,6 +758,8 @@ private final class ChatTests {
         await reviewTargetBelongsToTheCompletedRequest()
         await configurationBelongsToTheRequest()
         await retryUsesTheOriginalConfiguration()
+        await defaultOnlyTemperatureModelsOmitParameter()
+        await temperatureCompatibilityRetryOmitsParameter()
         await malformedModelURLIsRecoverable()
         await invalidStreamsCannotPublishCompletedResults()
         await continuationCompletesTheOriginalResponse()

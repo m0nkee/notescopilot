@@ -1,5 +1,17 @@
 # 本次修复与验证
 
+## v2.9.3（2026-11-25）
+
+| 项目 | 验收结果 |
+| --- | --- |
+| 根因修复 | `gpt-6.1-terra` 请求体不再发送 `temperature`，仍发送 `model` 与 `stream_options.include_usage`；配置身份使用 `default` 标记省略温度 |
+| 兼容重试 | 未知模型流式请求返回 HTTP 400 且错误说明 `temperature` 不支持时，自动省略该参数重试一次，并保留 `stream_options` 与续写前缀 |
+| 功能回归 | 非沙箱十套完整回归共 **781 项通过、0 失败、0 跳过**：选区 72、斜杠 100、模板 41、URL 28、写回 136、模板执行 39、聊天 135、资料库 98、产品 65、更新 67 |
+| 原生界面 | `scripts/check-ui.sh` 渲染 **25/25** 个原生布局，包含默认温度模型提示所在设置页与深浅色模型偏好存储页面 |
+| 启动生命周期 | `scripts/check-startup.sh` 非沙箱执行 **79/79** 通过，包含冷启动、窗口恢复、离屏、系统服务、选区工具与真实原生面板尺寸 |
+| 发布构建 | `NC_BUILD_OUTPUT=build/release/NotesCopilot-2.9.3.app ./build.sh` 构建成功，严格 `codesign --verify`、`plutil`、`bash -n` 与 `git diff --check` 均通过；版本 `2.9.3`，build `14`，arm64，使用稳定 Apple Development 身份签名。按约定跳过 Developer ID 签名与公证 |
+| 发布包 | `scripts/package-dmg.sh` 生成 `NotesCopilot-2.9.3-arm64.dmg` 和同名 `.sha256`；两次 `hdiutil verify` 通过，只读挂载后核对签名、版本、架构与 `/Applications` 软链接；SHA-256：`7b35322cc1dbcc3086fcd9cc3c94323b3beb5c558bfa5910b7d40522683740f9` |
+
 ## v2.9.2（2026-11-25）
 
 | 项目 | 验收结果 |
