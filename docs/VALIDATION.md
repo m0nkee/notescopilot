@@ -5,12 +5,12 @@
 | 项目 | 验收结果 |
 | --- | --- |
 | 钥匙串交互移除 | 代码不再包含“授权钥匙串并保存”、交互 Keychain backend 或授权凭据缓存；配置读写始终使用 `interactionNotAllowed = true` 的 `LAContext`。读取失败仅标记“API Key 不可用”并提示重新填写 |
-| 功能回归 | 十套完整回归共 **775 项通过、0 失败**，另有 5 项因当前沙箱缺少 AppKit HTML helper / named pasteboard service 明确跳过：选区 72、斜杠 100、模板 41、URL 28、写回 127、模板执行 39、聊天 148、资料库 88、产品 65、更新 67 |
+| 功能回归 | 非沙箱十套完整回归共 **794 项通过、0 失败、0 跳过**：选区 72、斜杠 100、模板 41、URL 28、写回 136、模板执行 39、聊天 148、资料库 98、产品 65、更新 67。沙箱首轮运行中 5 项 helper/剪贴板用例受限跳过，随后已在非沙箱全量复跑通过 |
 | 原生界面 | `scripts/check-ui.sh` 渲染 **25/25** 个原生布局，包含密钥不可用状态的浅色与深色设置页，且不再渲染授权恢复卡 |
 | 启动生命周期 | `scripts/check-startup.sh` 非沙箱执行 **79/79** 通过，包含冷启动、窗口恢复、离屏、系统服务、选区工具与真实原生面板尺寸 |
 | 发布构建 | `NC_BUILD_OUTPUT=build/release/NotesCopilot-2.9.1.app ./build.sh` 构建成功，严格 `codesign --verify`、`plutil`、`bash -n` 与 `git diff --check` 均通过；版本 `2.9.1`，build `12`，arm64。本机当前无可用的签名证书，发布包按约定跳过 Developer ID 签名，使用 ad-hoc 签名 |
 | 发布包 | `scripts/package-dmg.sh` 生成 `NotesCopilot-2.9.1-arm64.dmg` 和同名 `.sha256`；`hdiutil verify` 通过，只读挂载后核对签名、版本、架构与 `/Applications` 软链接；SHA-256：`8bb7bdc429d5cc56f7cbeda646b8241136a28f5b015a70253b342830a832a92a` |
-| 环境限制 | 5 项跳过均为沙箱 helper/剪贴板服务不可用，不代表功能失败；发布前已在非沙箱启动回归与只读挂载验证中完成等效验证 |
+| 环境限制 | 无未验收项；沙箱首轮 5 项 helper/剪贴板跳过已在非沙箱全量回归中消除 |
 
 ## v2.9.0（2026-11-25）
 
