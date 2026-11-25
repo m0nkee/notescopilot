@@ -1,8 +1,6 @@
 import Foundation
 import Combine
 import AppKit
-import Security
-import LocalAuthentication
 
 // MARK: - 配置（全部可自配置：Base URL / API Key / 模型 / 系统提示词 / 参数）
 
@@ -12,11 +10,8 @@ struct ModelProfile: Codable, Identifiable, Equatable {
     var id: UUID = UUID()
     var name: String = ""
     var baseURL: String = ""
-    /// 仅内存中用于编辑/请求；ProfileStore 写盘前会移除。
     var apiKey: String = ""
     var model: String = ""
-    var hasStoredAPIKey = false
-    var credentialUnavailable = false
     /// nil 表示沿用全局默认值，便于旧配置无感升级。
     var temperature: Double?
     var maxTokens: Int?
@@ -26,93 +21,14 @@ struct ModelProfile: Codable, Identifiable, Equatable {
         self.id = id; self.name = name; self.baseURL = baseURL; self.apiKey = apiKey; self.model = model
         self.temperature = temperature; self.maxTokens = maxTokens
     }
-
-    private enum CodingKeys: String, CodingKey {
-        case id, name, baseURL, apiKey, model, hasStoredAPIKey, temperature, maxTokens
-    }
-    init(from decoder: Decoder) throws {
-        let c = try decoder.container(keyedBy: CodingKeys.self)
-        id = try c.decodeIfPresent(UUID.self, forKey: .id) ?? UUID()
-        name = try c.decodeIfPresent(String.self, forKey: .name) ?? ""
-        baseURL = try c.decodeIfPresent(String.self, forKey: .baseURL) ?? ""
-        apiKey = try c.decodeIfPresent(String.self, forKey: .apiKey) ?? ""
-        model = try c.decodeIfPresent(String.self, forKey: .model) ?? ""
-        hasStoredAPIKey = try c.decodeIfPresent(Bool.self, forKey: .hasStoredAPIKey) ?? false
-        temperature = try c.decodeIfPresent(Double.self, forKey: .temperature)
-        maxTokens = try c.decodeIfPresent(Int.self, forKey: .maxTokens)
-    }
-}
-
-/// 单项实现应在抛错时保持该项原值；ProfileStore 会补偿此前已成功的写入。
-protocol ProfileSecretStore {
-    func read(id: UUID) throws -> String?
-    func write(_ secret: String, id: UUID) throws
-    func remove(id: UUID) throws
-}
-
-final class MemoryProfileSecretStore: ProfileSecretStore {
-    var values: [UUID: String] = [:]
-    func read(id: UUID) throws -> String? { values[id] }
-    func write(_ secret: String, id: UUID) throws { values[id] = secret }
-    func remove(id: UUID) throws { values.removeValue(forKey: id) }
-}
-
-struct KeychainProfileSecretStore: ProfileSecretStore {
-    private let service = "NotesCopilot.model-api-key"
-
-    func query(_ id: UUID, quietContext: LAContext? = nil) -> [String: Any] {
-        var query: [String: Any] = [kSecClass as String: kSecClassGenericPassword,
-                                   kSecAttrService as String: service, kSecAttrAccount as String: id.uuidString]
-        let context = quietContext ?? LAContext()
-        context.interactionNotAllowed = true
-        query[kSecUseAuthenticationContext as String] = context
-        return query
-    }
-    private func check(_ status: OSStatus) throws {
-        guard status == errSecSuccess else {
-            let message = SecCopyErrorMessageString(status, nil) as String? ?? "错误 \(status)"
-            throw APIError(status: Int(status), message: "钥匙串访问失败：" + message)
-        }
-    }
-    func read(id: UUID) throws -> String? {
-        var q = query(id)
-        q[kSecReturnData as String] = true
-        q[kSecMatchLimit as String] = kSecMatchLimitOne
-        var value: CFTypeRef?
-        let status = SecItemCopyMatching(q as CFDictionary, &value)
-        if status == errSecItemNotFound { return nil }
-        try check(status)
-        guard let data = value as? Data, let secret = String(data: data, encoding: .utf8) else {
-            throw APIError(status: -1, message: "钥匙串中的 API Key 无法读取，请重新填写")
-        }
-        return secret
-    }
-    func write(_ secret: String, id: UUID) throws {
-        let q = query(id)
-        let values = [kSecValueData as String: Data(secret.utf8)]
-        let status = SecItemUpdate(q as CFDictionary, values as CFDictionary)
-        if status == errSecItemNotFound {
-            var item = q.merging(values) { _, new in new }
-            item[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
-            try check(SecItemAdd(item as CFDictionary, nil))
-        } else { try check(status) }
-    }
-    func remove(id: UUID) throws {
-        let status = SecItemDelete(query(id) as CFDictionary)
-        if status != errSecItemNotFound { try check(status) }
-    }
 }
 
 enum ProfileStore {
-    /// 测试可注入隔离的 defaults/secretStore；非 App 测试构建永不访问真实钥匙串。
+    /// 测试可注入隔离的 defaults；非 App 测试构建不访问真实用户配置。
     static var defaults = UserDefaults.standard
-    #if NC_APP
-    static var secretStore: any ProfileSecretStore = KeychainProfileSecretStore()
-    #else
-    static var secretStore: any ProfileSecretStore = MemoryProfileSecretStore()
-    #endif
     static let key = "nc.profiles"
     static let activeKey = "nc.activeProfileID"
+    /// 生效配置切换通知（面板头部实时刷新）
     static let changedNotification = Notification.Name("nc.profileChanged")
     static let errorNotification = Notification.Name("nc.profileStoreError")
     private(set) static var lastError: String?
@@ -126,31 +42,19 @@ enum ProfileStore {
 
     static func load() -> [ModelProfile] {
         if let data = defaults.data(forKey: key) {
-            guard var list = try? JSONDecoder().decode([ModelProfile].self, from: data) else {
+            do {
+                let list = try JSONDecoder().decode([ModelProfile].self, from: data)
+                // 空列表也是已保存状态，绝不重新导入旧配置。
+                if list.isEmpty {
+                    for legacyKey in ["nc.baseURL", "nc.apiKey", "nc.model"] { defaults.removeObject(forKey: legacyKey) }
+                }
+                return list
+            } catch {
                 report(APIError(status: -1, message: "模型配置无法读取，请检查本机配置备份"))
                 return []
             }
-            // 命令行/测试的易失配置不落盘，也不访问钥匙串。
-            if defaults.volatileDomain(forName: UserDefaults.argumentDomain)[key] != nil { return list }
-            // 空列表也是已保存状态，绝不重新导入旧配置。
-            if list.isEmpty {
-                for legacyKey in ["nc.baseURL", "nc.apiKey", "nc.model"] { defaults.removeObject(forKey: legacyKey) }
-            }
-            let hasPlaintext = list.contains { !$0.apiKey.isEmpty }
-            for i in list.indices where list[i].apiKey.isEmpty && list[i].hasStoredAPIKey {
-                do {
-                    guard let secret = try secretStore.read(id: list[i].id), !secret.isEmpty else {
-                        throw APIError(status: -1, message: "配置「\(list[i].name)」的 API Key 未能从钥匙串读取，请重新填写")
-                    }
-                    list[i].apiKey = secret
-                } catch {
-                    list[i].credentialUnavailable = true
-                    report(error)
-                }
-            }
-            if hasPlaintext { _ = save(list) }
-            return list
         }
+        // 迁移：旧版单配置（nc.baseURL/nc.apiKey/nc.model）→ 第一份 Profile，只迁移一次。
         let legacy = ModelProfile(name: "默认配置",
                                   baseURL: defaults.string(forKey: "nc.baseURL") ?? "",
                                   apiKey: defaults.string(forKey: "nc.apiKey") ?? "",
@@ -160,85 +64,24 @@ enum ProfileStore {
         return [legacy]
     }
 
-    /// 偏好设置与钥匙串不共享事务：先预检/备份，再写入；写入失败时尽力恢复并明确报告恢复失败。
+    /// API Key 随 Profile 一起保存在应用偏好配置中，不访问系统钥匙串。
     @discardableResult
     static func save(_ list: [ModelProfile]) -> Bool {
-        save(list, using: secretStore)
-    }
-
-    private static func save(_ list: [ModelProfile], using backend: any ProfileSecretStore) -> Bool {
-        struct SecretChange {
-            let id: UUID
-            let value: String
-            let previous: String?
+        guard Set(list.map(\.id)).count == list.count else {
+            report(APIError(status: -1, message: "模型配置存在重复标识，请重新建立重复的配置"))
+            return false
         }
-        var written: [SecretChange] = []
         do {
-            let old = defaults.data(forKey: key).flatMap { try? JSONDecoder().decode([ModelProfile].self, from: $0) } ?? []
-            // 所有配置先预检，避免前面的 Key 已改、后面才发现不可保存的配置。
-            guard Set(list.map(\.id)).count == list.count else {
-                throw APIError(status: -1, message: "模型配置存在重复标识，请重新建立重复的配置")
-            }
-            var metadata = list
-            for i in list.indices {
-                let p = list[i]
-                if p.credentialUnavailable && p.apiKey.isEmpty {
-                    throw APIError(status: -1, message: "API Key 暂时无法读取，配置尚未保存，请重新填写 API Key 后保存")
-                }
-                metadata[i].apiKey = ""
-                metadata[i].hasStoredAPIKey = !p.apiKey.isEmpty
-            }
-            let data = try JSONEncoder().encode(metadata)
-            // 在任何覆写前读取所有旧值；无法备份时，任何 Key 都保持原样。
-            var changes: [SecretChange] = []
-            for p in list where !p.apiKey.isEmpty {
-                let previous = try backend.read(id: p.id)
-                if previous != p.apiKey { changes.append(SecretChange(id: p.id, value: p.apiKey, previous: previous)) }
-            }
-            for change in changes {
-                try backend.write(change.value, id: change.id)
-                written.append(change)
-            }
+            let data = try JSONEncoder().encode(list)
             defaults.set(data, forKey: key)
             for legacyKey in ["nc.baseURL", "nc.apiKey", "nc.model"] { defaults.removeObject(forKey: legacyKey) }
             lastError = nil
-            let retained = Set(list.filter { !$0.apiKey.isEmpty }.map(\.id))
-            var cleanupErrors: [String] = []
-            for id in Set(old.map(\.id)).subtracting(retained) {
-                do { try backend.remove(id: id) }
-                catch { cleanupErrors.append(error.localizedDescription) }
-            }
-            if !cleanupErrors.isEmpty {
-                report(APIError(status: -1, message: "配置已保存，但旧 API Key 未能从钥匙串清除：" + cleanupErrors.joined(separator: "；")))
-            }
             NotificationCenter.default.post(name: changedNotification, object: nil)
             return true
         } catch {
-            var rollbackErrors: [String] = []
-            for change in written.reversed() {
-                do {
-                    if let previous = change.previous { try backend.write(previous, id: change.id) }
-                    else { try backend.remove(id: change.id) }
-                } catch {
-                    rollbackErrors.append(error.localizedDescription)
-                }
-            }
-            let message: String
-            if !rollbackErrors.isEmpty {
-                message = "配置未保存，部分 API Key 恢复失败，请重新检查相关配置。保存错误：" + error.localizedDescription
-                    + "；恢复错误：" + rollbackErrors.joined(separator: "；")
-            } else if wasCancelled(error) {
-                message = "已取消钥匙串访问，配置尚未保存。" + (written.isEmpty ? "" : "本次已写入的 API Key 已恢复。")
-            } else {
-                message = "配置未保存" + (written.isEmpty ? "：" : "，已恢复本次修改的 API Key：") + error.localizedDescription
-            }
-            report(APIError(status: -1, message: message))
+            report(APIError(status: -1, message: "模型配置无法保存：\(error.localizedDescription)"))
             return false
         }
-    }
-
-    private static func wasCancelled(_ error: Error) -> Bool {
-        (error as? APIError)?.status == Int(errSecUserCanceled) || error is CancellationError
     }
 
     static var activeID: UUID? {
@@ -327,9 +170,6 @@ struct AIRequestConfiguration: Sendable {
               let url = URL(string: base), let host = url.host, !host.isEmpty,
               url.scheme == "https" || url.scheme == "http" else {
             throw APIError(status: -1, message: "Base URL 为空或无效，请检查设置")
-        }
-        if profile?.credentialUnavailable == true {
-            throw APIError(status: -1, message: ProfileStore.lastError ?? "API Key 暂时无法读取，请检查钥匙串")
         }
         guard let model = profile?.model.trimmingCharacters(in: .whitespacesAndNewlines), !model.isEmpty else {
             throw APIError(status: -1, message: "尚未配置模型名，请先打开设置")

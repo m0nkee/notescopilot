@@ -465,28 +465,20 @@ private final class ChatTests {
         check(error?.contains("长度限制") == true, "nonstreaming selection/template calls reject truncated responses")
     }
 
-    func profileMigrationAndSecretFailures() {
-        final class FailingSecrets: ProfileSecretStore {
-            func read(id: UUID) throws -> String? { throw APIError(status: -1, message: "synthetic keychain locked") }
-            func write(_ secret: String, id: UUID) throws { throw APIError(status: -1, message: "synthetic keychain locked") }
-            func remove(id: UUID) throws { throw APIError(status: -1, message: "synthetic keychain locked") }
-        }
+    func profileStorageUsesOriginalPlaintextLogic() {
         let suite = "nc.chat-tests." + UUID().uuidString
         let isolated = UserDefaults(suiteName: suite)!
         let originalDefaults = ProfileStore.defaults
         let originalConfigDefaults = Config.defaults
         let originalArgumentDomain = originalDefaults.volatileDomain(forName: UserDefaults.argumentDomain)
         isolated.setVolatileDomain([:], forName: UserDefaults.argumentDomain)
-        let originalSecrets = ProfileStore.secretStore
         ProfileStore.defaults = isolated
         Config.defaults = isolated
-        ProfileStore.secretStore = MemoryProfileSecretStore()
         defer {
             isolated.removePersistentDomain(forName: suite)
             ProfileStore.defaults = originalDefaults
             Config.defaults = originalConfigDefaults
             originalDefaults.setVolatileDomain(originalArgumentDomain, forName: UserDefaults.argumentDomain)
-            ProfileStore.secretStore = originalSecrets
         }
         isolated.set("https://legacy.invalid", forKey: "nc.baseURL")
         isolated.set("legacy-secret", forKey: "nc.apiKey")
@@ -494,15 +486,15 @@ private final class ChatTests {
         let migrated = ProfileStore.load()
         check(migrated.first?.apiKey == "legacy-secret", "legacy migration retains the working key")
         let stored = isolated.data(forKey: ProfileStore.key)!
-        check(!String(decoding: stored, as: UTF8.self).contains("legacy-secret"), "persisted profile metadata contains no plaintext key")
-        check(isolated.string(forKey: "nc.apiKey") == nil, "successful migration removes the legacy plaintext key")
-        check(ProfileStore.load().first?.apiKey == "legacy-secret", "profile credentials are restored from the injected secret store")
+        check(String(decoding: stored, as: UTF8.self).contains("legacy-secret"),
+              "persisted profiles use the original plaintext API Key storage")
+        check(isolated.string(forKey: "nc.apiKey") == nil, "successful migration removes the legacy single-profile key")
+        check(ProfileStore.load().first?.apiKey == "legacy-secret", "profile credentials are restored directly from preferences")
         var mixed = try! JSONDecoder().decode([ModelProfile].self, from: stored)
         mixed.append(ModelProfile(name: "inline", baseURL: "https://other.invalid", apiKey: "another-secret", model: "m"))
         isolated.set(try! JSONEncoder().encode(mixed), forKey: ProfileStore.key)
-        let mixedLoaded = ProfileStore.load()
-        check(mixedLoaded.map(\.apiKey) == ["legacy-secret", "another-secret"], "mixed migration retains both existing secure and legacy inline keys")
-        check(ProfileStore.load().map(\.apiKey) == ["legacy-secret", "another-secret"], "migrating an inline key never deletes another profile's secured key")
+        check(ProfileStore.load().map(\.apiKey) == ["legacy-secret", "another-secret"],
+              "mixed profile keys remain stable in preferences")
         ProfileStore.save([])
         check(ProfileStore.load().isEmpty, "deleting the last profile cannot resurrect legacy configuration")
         var notifications = 0
@@ -513,92 +505,29 @@ private final class ChatTests {
         ProfileStore.save([profile])
         NotificationCenter.default.removeObserver(observer)
         check(notifications == 2, "editing a profile notifies active model labels")
-        let beforeFailure = isolated.data(forKey: ProfileStore.key)
-        ProfileStore.secretStore = FailingSecrets()
-        profile.apiKey = "replacement-key"
-        check(!ProfileStore.save([profile]) && ProfileStore.lastError?.contains("keychain locked") == true,
-              "secret write failure is visible")
-        check(isolated.data(forKey: ProfileStore.key) == beforeFailure, "secret write failure preserves previous metadata")
-        let unavailable = ProfileStore.load()
-        check(unavailable.first?.credentialUnavailable == true, "secret read failure is marked instead of silently using an empty key")
-        check(!ProfileStore.save(unavailable), "an unreadable secret cannot be silently overwritten by an unrelated edit")
         isolated.set("   \n", forKey: "nc.sys")
         check(Config.systemPrompt == Config.defaultSystem, "blank system prompt uses the documented default")
     }
 
-    func multiProfileSaveRestoresEarlierSecretsOnFailure() {
-        final class SelectiveSecrets: ProfileSecretStore {
-            var values: [UUID: String] = [:]
-            var writeAttempts: [UUID] = []
-            var readFailures: Set<UUID> = []
-            var writeFailures: [UUID: Set<String>] = [:]
-            var removeFailures: Set<UUID> = []
-            func read(id: UUID) throws -> String? {
-                if readFailures.contains(id) { throw APIError(status: -1, message: "synthetic backup failure") }
-                return values[id]
-            }
-            func write(_ secret: String, id: UUID) throws {
-                writeAttempts.append(id)
-                if writeFailures[id]?.contains(secret) == true { throw APIError(status: -1, message: "synthetic write failure") }
-                values[id] = secret
-            }
-            func remove(id: UUID) throws {
-                if removeFailures.contains(id) { throw APIError(status: -1, message: "synthetic cleanup failure") }
-                values.removeValue(forKey: id)
-            }
-        }
-        let suite = "nc.chat-tests.rollback." + UUID().uuidString
+    func duplicateProfilesAreRejectedWithoutPartialWrites() {
+        let suite = "nc.chat-tests.duplicate." + UUID().uuidString
         let isolated = UserDefaults(suiteName: suite)!
         let previousDefaults = ProfileStore.defaults
-        let previousSecrets = ProfileStore.secretStore
         let previousArguments = previousDefaults.volatileDomain(forName: UserDefaults.argumentDomain)
         isolated.setVolatileDomain([:], forName: UserDefaults.argumentDomain)
-        let secrets = SelectiveSecrets()
         ProfileStore.defaults = isolated
-        ProfileStore.secretStore = secrets
         defer {
             isolated.removePersistentDomain(forName: suite)
             ProfileStore.defaults = previousDefaults
-            ProfileStore.secretStore = previousSecrets
             previousDefaults.setVolatileDomain(previousArguments, forName: UserDefaults.argumentDomain)
         }
-        let first = ModelProfile(name: "A", baseURL: "https://a.invalid", apiKey: "old-a", model: "m")
-        let second = ModelProfile(name: "B", baseURL: "https://b.invalid", apiKey: "old-b", model: "m")
-        check(ProfileStore.save([first, second]), "rollback fixture saves the original profile secrets")
-        let previousMetadata = isolated.data(forKey: ProfileStore.key)
-        var editedFirst = first
-        var editedSecond = second
-        editedFirst.apiKey = "new-a"
-        editedSecond.apiKey = "new-b"
-        secrets.writeFailures[second.id] = ["new-b"]
-        check(!ProfileStore.save([editedFirst, editedSecond]), "a later profile's failed secret write rejects the save")
-        check(secrets.values[first.id] == "old-a" && secrets.values[second.id] == "old-b", "later write failure restores the earlier profile's original key")
-        check(isolated.data(forKey: ProfileStore.key) == previousMetadata, "later write failure preserves the previous metadata")
-        check(ProfileStore.lastError?.contains("已恢复") == true, "successful compensation is reported accurately")
-
-        secrets.writeAttempts = []
-        var unavailableSecond = second
-        unavailableSecond.apiKey = ""
-        unavailableSecond.credentialUnavailable = true
-        check(!ProfileStore.save([editedFirst, unavailableSecond]) && secrets.writeAttempts.isEmpty,
-              "all unavailable credentials are rejected before any secret is modified")
-        secrets.readFailures = [second.id]
-        secrets.writeAttempts = []
-        check(!ProfileStore.save([editedFirst, editedSecond]) && secrets.writeAttempts.isEmpty,
-              "all old keys are backed up before the first overwrite")
-        secrets.readFailures = []
-
-        secrets.writeFailures[first.id] = ["old-a"]
-        check(!ProfileStore.save([editedFirst, editedSecond]), "rollback failure still rejects the save")
-        check(ProfileStore.lastError?.contains("恢复失败") == true && secrets.values[first.id] == "new-a",
-              "failed compensation explicitly warns that a key needs attention")
-        check(isolated.data(forKey: ProfileStore.key) == previousMetadata, "failed compensation does not commit new metadata")
-
-        secrets.writeFailures = [:]
-        secrets.removeFailures = [first.id]
-        check(ProfileStore.save([]), "profile removal commits even if orphaned key cleanup fails")
-        check(ProfileStore.load().isEmpty && ProfileStore.lastError?.contains("未能从钥匙串清除") == true,
-              "failed deletion cleanup is visible without reviving removed profiles")
+        let profile = ModelProfile(name: "唯一配置", baseURL: "https://one.invalid/v1", apiKey: "one-key", model: "m")
+        check(ProfileStore.save([profile]), "the duplicate fixture saves the original profile")
+        let before = isolated.data(forKey: ProfileStore.key)
+        let duplicate = ModelProfile(id: profile.id, name: "重复配置", baseURL: "https://two.invalid/v1", apiKey: "two-key", model: "m")
+        check(!ProfileStore.save([profile, duplicate]) && ProfileStore.lastError?.contains("重复标识") == true,
+              "duplicate profile identifiers are rejected")
+        check(isolated.data(forKey: ProfileStore.key) == before, "a rejected duplicate save preserves previous profiles")
     }
 
     func reviewIdentityIsInvalidatedWhenDismissed() async {
@@ -674,88 +603,19 @@ private final class ChatTests {
               "changing a model within the same profile rejects retrying an older model's input")
     }
 
-    func unrelatedProfileErrorsDoNotPolluteGeneration() async {
-        final class Secrets: ProfileSecretStore {
-            var values: [UUID: String] = [:]
-            var readFailures: [UUID: String] = [:]
-            func read(id: UUID) throws -> String? {
-                if let message = readFailures[id] { throw APIError(status: -25308, message: message) }
-                return values[id]
-            }
-            func write(_ secret: String, id: UUID) throws { values[id] = secret }
-            func remove(id: UUID) throws { values.removeValue(forKey: id) }
-        }
-        let suite = "nc.chat-tests.request-errors." + UUID().uuidString
-        let isolated = UserDefaults(suiteName: suite)!
-        let previousDefaults = ProfileStore.defaults
-        let previousConfigDefaults = Config.defaults
-        let previousSecrets = ProfileStore.secretStore
-        let previousArguments = previousDefaults.volatileDomain(forName: UserDefaults.argumentDomain)
-        isolated.setVolatileDomain([:], forName: UserDefaults.argumentDomain)
-        let secrets = Secrets()
-        ProfileStore.defaults = isolated
-        Config.defaults = isolated
-        ProfileStore.secretStore = secrets
-        defer {
-            isolated.removePersistentDomain(forName: suite)
-            ProfileStore.defaults = previousDefaults
-            Config.defaults = previousConfigDefaults
-            ProfileStore.secretStore = previousSecrets
-            previousDefaults.setVolatileDomain(previousArguments, forName: UserDefaults.argumentDomain)
-        }
-        let active = ModelProfile(name: "active", baseURL: "https://active.invalid/v1", apiKey: "synthetic-active", model: "active-model")
-        let inactive = ModelProfile(name: "inactive", baseURL: "https://inactive.invalid/v1", apiKey: "synthetic-inactive", model: "inactive-model")
-        guard ProfileStore.save([active, inactive]) else { check(false, "request-error fixture saves isolated profiles"); return }
-        ProfileStore.activeID = active.id
-        secrets.readFailures[inactive.id] = "synthetic inactive credential unavailable"
-        ChatTestProtocol.reset()
-        let engine = ChatEngine()
-        engine.run(prompt: "use the available active model")
-        await wait("active request starts despite inactive credential error") { ChatTestProtocol.count == 1 }
-        check(engine.busy && engine.lastError == nil,
-              "an inactive profile credential error does not appear as an error on a valid active request")
-        check(ProfileStore.lastError?.contains("inactive credential") == true,
-              "unrelated profile errors remain available to the settings view")
-        ChatTestProtocol.respond(0, body: "data: {\"choices\":[{\"delta\":{\"content\":\"active result\"},\"finish_reason\":\"stop\"}]}\n\n")
-        await wait("active request completes despite inactive credential error") { !engine.busy }
-        check(engine.output == "active result" && engine.responseStatus == "已完成" && engine.lastError == nil,
-              "a successful active response does not retain the unrelated profile error")
-
-        secrets.readFailures = [:]
-        engine.lastError = "synthetic earlier request error"
-        engine.run(prompt: "ignore an older global profile error")
-        await wait("request starts after inactive credential recovers") { ChatTestProtocol.count == 2 }
-        check(engine.lastError == nil && ProfileStore.lastError?.contains("inactive credential") == true,
-              "a valid new request clears its own previous error without copying a stale global save error")
-        ChatTestProtocol.respond(1, body: "data: {\"choices\":[{\"delta\":{\"content\":\"next result\"},\"finish_reason\":\"stop\"}]}\n\n")
-        await wait("request completes with stale global profile error") { !engine.busy }
-        check(engine.output == "next result" && engine.lastError == nil,
-              "stale global profile errors remain separate after a valid response completes")
-
-        secrets.readFailures[active.id] = "synthetic active credential unavailable"
-        engine.run(prompt: "must not send with an unreadable active credential")
-        await settle()
-        check(ChatTestProtocol.count == 2 && !engine.busy && engine.responseStatus == "配置不可用"
-              && engine.lastError == "synthetic active credential unavailable",
-              "an unreadable active credential still blocks HTTP and displays the current configuration failure")
-    }
-
     func generationParametersFollowActiveProfile() {
         let suite = "nc.chat-tests.profile-generation." + UUID().uuidString
         let isolated = UserDefaults(suiteName: suite)!
         let previousDefaults = ProfileStore.defaults
         let previousConfigDefaults = Config.defaults
-        let previousSecrets = ProfileStore.secretStore
         let previousArguments = previousDefaults.volatileDomain(forName: UserDefaults.argumentDomain)
         isolated.setVolatileDomain([:], forName: UserDefaults.argumentDomain)
         ProfileStore.defaults = isolated
         Config.defaults = isolated
-        ProfileStore.secretStore = MemoryProfileSecretStore()
         defer {
             isolated.removePersistentDomain(forName: suite)
             ProfileStore.defaults = previousDefaults
             Config.defaults = previousConfigDefaults
-            ProfileStore.secretStore = previousSecrets
             previousDefaults.setVolatileDomain(previousArguments, forName: UserDefaults.argumentDomain)
         }
         isolated.set(0.2, forKey: "nc.temp")
@@ -867,12 +727,11 @@ private final class ChatTests {
         await conversationBoundariesDiscardOldHistory()
         imagesAreBoundedBeforeSending()
         await nonStreamingTruncationIsAnError()
-        profileMigrationAndSecretFailures()
-        multiProfileSaveRestoresEarlierSecretsOnFailure()
+        profileStorageUsesOriginalPlaintextLogic()
+        duplicateProfilesAreRejectedWithoutPartialWrites()
         await reviewIdentityIsInvalidatedWhenDismissed()
         operationGenerationInvalidatesPendingWrites()
         await changingModelWithinProfileStartsANewConversation()
-        await unrelatedProfileErrorsDoNotPolluteGeneration()
         generationParametersFollowActiveProfile()
         chatSessionPersistsAcrossEngineRestart()
         await submittedTaskMatchesExternalRequests()

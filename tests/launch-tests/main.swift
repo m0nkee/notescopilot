@@ -67,7 +67,6 @@ struct LaunchTests {
         UserDefaults.standard.setVolatileDomain(values, forName: UserDefaults.argumentDomain)
         ProfileStore.defaults = isolated
         Config.defaults = isolated
-        ProfileStore.secretStore = MemoryProfileSecretStore()
     }
 
     private static func launch(configured: Bool, defaultLaunch: Bool = true) throws -> AppDelegate {

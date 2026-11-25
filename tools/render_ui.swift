@@ -3,15 +3,6 @@ import SwiftUI
 import Accessibility
 import SQLite3
 
-/// Exercises recovery UI without reading or changing the user's Keychain.
-private final class SyntheticFailingProfileSecretStore: ProfileSecretStore {
-    private(set) var readCount = 0
-    private var error: APIError { APIError(status: -25308, message: "钥匙串访问失败：Synthetic Keychain access denied") }
-    func read(id: UUID) throws -> String? { readCount += 1; throw error }
-    func write(_ secret: String, id: UUID) throws { throw error }
-    func remove(id: UUID) throws { throw error }
-}
-
 /// Render the actual native views with synthetic, isolated data. No Notes or AI calls.
 @main
 struct RenderUI {
@@ -31,7 +22,6 @@ struct RenderUI {
         UserDefaults.standard.setVolatileDomain(values, forName: UserDefaults.argumentDomain)
         ProfileStore.defaults = defaults
         Config.defaults = defaults
-        ProfileStore.secretStore = MemoryProfileSecretStore()
         values["nc.customAICommands"] = try JSONEncoder().encode([
             CustomAICommand(name: "weekly", prompt: "请把本周记录整理成周报")
         ])
@@ -94,22 +84,22 @@ struct RenderUI {
         try render(notices, size: NSSize(width: 560, height: 450), name: "notes-access-notices-light", directory: output)
         try render(notices, size: NSSize(width: 560, height: 450), name: "notes-access-notices-dark", directory: output, dark: true)
 
-        // A real save preflight reaches the fake backend even while the profile
-        // metadata remains volatile. A failed save must preserve that metadata
-        // and expose the credential-unavailable state without any authorization UI.
-        let failingSecrets = SyntheticFailingProfileSecretStore()
-        ProfileStore.secretStore = failingSecrets
-        var deniedDraft = profile
-        deniedDraft.apiKey = "synthetic-key-render-only"
-        let metadataBeforeSave = defaults.data(forKey: ProfileStore.key)
-        precondition(!ProfileStore.save([deniedDraft]) && ProfileStore.lastError?.contains("钥匙串") == true,
-                     "Synthetic credential failure must reach the recovery UI")
-        precondition(defaults.data(forKey: ProfileStore.key) == metadataBeforeSave,
-                     "Failed synthetic credential save must preserve existing metadata")
-        precondition(failingSecrets.readCount > 0 && UserDefaults.standard.volatileDomain(forName: UserDefaults.argumentDomain)[ProfileStore.key] != nil,
-                     "Recovery fixture must use only the isolated store and preserve standard synthetic defaults")
-        try render(SettingsView(discoverLocalModels: false, notesAccessIssueProvider: { nil }, updater: updater), size: NSSize(width: 940, height: 640), name: "settings-keychain-unavailable-light", directory: output)
-        try render(SettingsView(discoverLocalModels: false, notesAccessIssueProvider: { nil }, updater: updater), size: NSSize(width: 940, height: 640), name: "settings-keychain-unavailable-dark", directory: output, dark: true)
+        // Verify the model page in the storage mode used by the app: profiles are
+        // persisted in isolated UserDefaults and no Keychain service is involved.
+        var storedProfile = profile
+        storedProfile.apiKey = ""
+        let storedValues = values
+        values[ProfileStore.key] = try JSONEncoder().encode([storedProfile])
+        defaults.setVolatileDomain(values, forName: UserDefaults.argumentDomain)
+        UserDefaults.standard.setVolatileDomain(values, forName: UserDefaults.argumentDomain)
+        try render(SettingsView(discoverLocalModels: false, notesAccessIssueProvider: { nil },
+                                initialPage: .model, updater: updater),
+                   size: NSSize(width: 940, height: 640), name: "settings-model-storage-light", directory: output)
+        try render(SettingsView(discoverLocalModels: false, notesAccessIssueProvider: { nil },
+                                initialPage: .model, updater: updater),
+                   size: NSSize(width: 940, height: 640), name: "settings-model-storage-dark", directory: output, dark: true)
+        defaults.setVolatileDomain(storedValues, forName: UserDefaults.argumentDomain)
+        UserDefaults.standard.setVolatileDomain(storedValues, forName: UserDefaults.argumentDomain)
         print("UI smoke: 25 native layouts rendered with isolated data")
     }
 

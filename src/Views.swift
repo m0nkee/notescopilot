@@ -982,7 +982,7 @@ struct SettingsView: View {
             refreshPermissionStatus()
         }
         .onReceive(NotificationCenter.default.publisher(for: ProfileStore.errorNotification).receive(on: DispatchQueue.main)) { note in
-            statusText = note.object as? String ?? "配置保存失败，请检查钥匙串权限。"
+            statusText = note.object as? String ?? "配置保存失败，请检查模型配置。"
         }
         .onReceive(NotificationCenter.default.publisher(for: TemplateStore.notesChangedNotification).receive(on: DispatchQueue.main)) { _ in
             refreshNotesTemplatesStatus()
@@ -1207,9 +1207,6 @@ struct SettingsView: View {
     }
 
     private var profileSaveStatus: (text: String, icon: String, color: Color) {
-        if profiles.contains(where: \.credentialUnavailable) {
-            return ("API Key 不可用", "exclamationmark.triangle.fill", .orange)
-        }
         guard let saved = lastSavedProfiles else { return ("正在读取配置…", "ellipsis.circle", .secondary) }
         if profiles != saved { return ("未保存的更改", "circle.fill", .orange) }
         if profiles.isEmpty { return ("尚无模型配置", "tray", .secondary) }
@@ -1329,7 +1326,7 @@ struct SettingsView: View {
             }
         }
         .confirmationDialog("删除这份模型配置？", isPresented: pendingDeleteBinding, titleVisibility: .visible) {
-            Button("删除配置和钥匙串中的 API Key", role: .destructive) {
+            Button("删除这份模型配置", role: .destructive) {
                 if let id = pendingDeleteID { performDelete(id) }
             }
             Button("取消", role: .cancel) { pendingDeleteID = nil }
@@ -1350,7 +1347,7 @@ struct SettingsView: View {
         card("sparkles", "快速上手（4 步）", note: "可随时跳过；只授予当前功能需要的权限") {
             VStack(alignment: .leading, spacing: 8) {
                 Label("1. 添加模型：选云端预设、本地服务，或手动填写 Base URL 与模型名。", systemImage: "1.circle")
-                Label("2. 填入 API Key（云端）或确认本地服务地址；密钥只存系统钥匙串。", systemImage: "2.circle")
+                Label("2. 填入 API Key（云端）或确认本地服务地址；配置保存在本机偏好设置。", systemImage: "2.circle")
                 HStack {
                     Label("3. 测试生成：发送「请只回复 OK」验证端点、凭据和参数。", systemImage: "3.circle")
                     Spacer()
@@ -1418,17 +1415,13 @@ struct SettingsView: View {
     @ViewBuilder private var activeStatusRow: some View {
         if let active = profiles.first(where: { $0.id == activeID }) ?? profiles.first {
             HStack(alignment: .top, spacing: 6) {
-                Image(systemName: active.credentialUnavailable ? "exclamationmark.triangle.fill" : "checkmark.circle.fill")
-                    .foregroundStyle(active.credentialUnavailable ? Color.orange : Color.green).font(.caption)
+                Image(systemName: "checkmark.circle.fill")
+                    .foregroundStyle(Color.green).font(.caption)
                 VStack(alignment: .leading, spacing: 3) {
-                    Text("\(active.credentialUnavailable ? "当前选择" : "当前生效")：\(active.name.isEmpty ? "未命名" : active.name) ｜ \(active.baseURL) ｜ \(active.model.isEmpty ? "未填模型名" : active.model)")
+                    Text("当前生效：\(active.name.isEmpty ? "未命名" : active.name) ｜ \(active.baseURL) ｜ \(active.model.isEmpty ? "未填模型名" : active.model)")
                         .font(.caption).foregroundColor(.secondary)
                         .textSelection(.enabled)
                         .lineLimit(1).truncationMode(.middle)
-                    if active.credentialUnavailable {
-                        Text("API Key 暂时无法读取，请重新填写。")
-                            .font(.caption).foregroundColor(.orange)
-                    }
                 }
             }
         } else {
@@ -1443,7 +1436,7 @@ struct SettingsView: View {
         let p = binding.wrappedValue
         let isActive = p.id == (activeID ?? profiles.first?.id)
         let isExpanded = expandedIDs.contains(p.id)
-        let activeColor: Color = p.credentialUnavailable ? .orange : .green
+        let activeColor: Color = .green
         return VStack(alignment: .leading, spacing: 10) {
             // ── 头部（常显）：单选 + 名称 + 摘要 + 操作 ──
             HStack(spacing: 10) {
@@ -1469,7 +1462,7 @@ struct SettingsView: View {
                 Spacer()
 
                 if isActive {
-                    Text(p.credentialUnavailable ? "密钥不可用" : "生效中")
+                    Text("生效中")
                         .font(.caption2).foregroundColor(activeColor)
                         .padding(.horizontal, 7).padding(.vertical, 2)
                         .background(Capsule().fill(activeColor.opacity(0.12)))
@@ -1514,7 +1507,7 @@ struct SettingsView: View {
                             .font(.caption).foregroundColor(.secondary)
                             .frame(width: 58, alignment: .leading)
                         HStack(spacing: 4) {
-                            SecureField("存储于系统钥匙串，本地服务可留空", text: binding.apiKey)
+                            SecureField("本机偏好设置保存，本地服务可留空", text: binding.apiKey)
                                 .contextMenu { pasteMenuItems(for: binding.apiKey) }
                             Button {
                                 if let s = NSPasteboard.general.string(forType: .string) {
@@ -1622,7 +1615,7 @@ struct SettingsView: View {
         if ProfileStore.save(profiles) {
             lastSavedProfiles = profiles
             if let error = ProfileStore.lastError { statusText = error }
-            else if statusText.contains("钥匙串") || statusText.hasPrefix("配置未保存") {
+            else if statusText.hasPrefix("配置未保存") {
                 statusText = "配置已保存。"
             }
         } else {

@@ -1,5 +1,17 @@
 # 本次修复与验证
 
+## v2.9.2（2026-11-25）
+
+| 项目 | 验收结果 |
+| --- | --- |
+| 存储逻辑回退 | API Key 随 `ModelProfile` 直接保存在本机偏好设置；`src/` 中不再导入 Security/LocalAuthentication，也没有 ProfileSecretStore、Keychain backend、SecItem 或 LAContext 调用，应用不会触发钥匙串授权弹窗 |
+| 兼容与降级 | 旧版单配置仍迁移为 Profile；旧 Profile JSON 可解码。2.9.1 仅存钥匙串标识的 API Key 不再自动回读，界面会显示为空，需重新填写并保存一次 |
+| 功能回归 | 非沙箱十套完整回归共 **774 项通过、0 失败、0 跳过**：选区 72、斜杠 100、模板 41、URL 28、写回 136、模板执行 39、聊天 128、资料库 98、产品 65、更新 67 |
+| 原生界面 | `scripts/check-ui.sh` 渲染 **25/25** 个原生布局，包含新的模型偏好存储浅色与深色页面 |
+| 启动生命周期 | `scripts/check-startup.sh` 非沙箱执行 **79/79** 通过，包含冷启动、窗口恢复、离屏、系统服务、选区工具与真实原生面板尺寸 |
+| 发布构建 | `NC_BUILD_OUTPUT=build/release/NotesCopilot-2.9.2.app ./build.sh` 构建成功，严格 `codesign --verify`、`plutil`、`bash -n` 与 `git diff --check` 均通过；版本 `2.9.2`，build `13`，arm64。按约定跳过 Developer ID 签名，使用 ad-hoc 签名 |
+| 发布包 | `scripts/package-dmg.sh` 生成 `NotesCopilot-2.9.2-arm64.dmg` 和同名 `.sha256`；`hdiutil verify` 通过，只读挂载后核对签名、版本、架构与 `/Applications` 软链接；SHA-256：`9424b1d04dd5850fb2e6df89e8045f09bc410c997878c359282b9611cb51e291` |
+
 ## v2.9.1（2026-11-25）
 
 | 项目 | 验收结果 |
