@@ -48,11 +48,6 @@ protocol ProfileSecretStore {
     func read(id: UUID) throws -> String?
     func write(_ secret: String, id: UUID) throws
     func remove(id: UUID) throws
-    func allowingUserInteraction() -> any ProfileSecretStore
-}
-
-extension ProfileSecretStore {
-    func allowingUserInteraction() -> any ProfileSecretStore { self }
 }
 
 final class MemoryProfileSecretStore: ProfileSecretStore {
@@ -64,24 +59,14 @@ final class MemoryProfileSecretStore: ProfileSecretStore {
 
 struct KeychainProfileSecretStore: ProfileSecretStore {
     private let service = "NotesCopilot.model-api-key"
-    private let allowsUserInteraction: Bool
-
-    init(allowsUserInteraction: Bool = false) { self.allowsUserInteraction = allowsUserInteraction }
 
     func query(_ id: UUID, quietContext: LAContext? = nil) -> [String: Any] {
         var query: [String: Any] = [kSecClass as String: kSecClassGenericPassword,
                                    kSecAttrService as String: service, kSecAttrAccount as String: id.uuidString]
-        if !allowsUserInteraction {
-            let context = quietContext ?? LAContext()
-            context.interactionNotAllowed = true
-            query[kSecUseAuthenticationContext as String] = context
-        }
+        let context = quietContext ?? LAContext()
+        context.interactionNotAllowed = true
+        query[kSecUseAuthenticationContext as String] = context
         return query
-    }
-
-    func allowingUserInteraction() -> any ProfileSecretStore {
-        // 显式恢复使用 file-based Keychain 默认的 ACL 交互，不复用 LAContext。
-        return KeychainProfileSecretStore(allowsUserInteraction: true)
     }
     private func check(_ status: OSStatus) throws {
         guard status == errSecSuccess else {
@@ -120,64 +105,17 @@ struct KeychainProfileSecretStore: ProfileSecretStore {
 
 enum ProfileStore {
     /// 测试可注入隔离的 defaults/secretStore；非 App 测试构建永不访问真实钥匙串。
-    static var defaults = UserDefaults.standard { didSet { clearAuthorizedCredentialCache() } }
+    static var defaults = UserDefaults.standard
     #if NC_APP
-    static var secretStore: any ProfileSecretStore = KeychainProfileSecretStore() { didSet { clearAuthorizedCredentialCache() } }
+    static var secretStore: any ProfileSecretStore = KeychainProfileSecretStore()
     #else
-    static var secretStore: any ProfileSecretStore = MemoryProfileSecretStore() { didSet { clearAuthorizedCredentialCache() } }
+    static var secretStore: any ProfileSecretStore = MemoryProfileSecretStore()
     #endif
     static let key = "nc.profiles"
     static let activeKey = "nc.activeProfileID"
     static let changedNotification = Notification.Name("nc.profileChanged")
     static let errorNotification = Notification.Name("nc.profileStoreError")
     private(set) static var lastError: String?
-
-    // 只缓存用户主动授权且已经完整提交的凭据，不持久化、不保留交互 LAContext。
-    // 锁只保护内存映射；任何钥匙串访问、偏好设置写入和通知均在锁外执行。
-    private static let credentialCacheLock = NSLock()
-    private static var authorizedCredentials: [UUID: String] = [:]
-    private static var credentialCacheGeneration = UUID()
-
-    private static func clearAuthorizedCredentialCache() {
-        credentialCacheLock.lock()
-        authorizedCredentials.removeAll()
-        credentialCacheGeneration = UUID()
-        credentialCacheLock.unlock()
-    }
-
-    private static func credentialCacheScope() -> UUID {
-        credentialCacheLock.lock()
-        defer { credentialCacheLock.unlock() }
-        return credentialCacheGeneration
-    }
-
-    private static func cachedCredential(for id: UUID) -> String? {
-        credentialCacheLock.lock()
-        defer { credentialCacheLock.unlock() }
-        return authorizedCredentials[id]
-    }
-
-    private static func synchronizeCredentialCache(_ list: [ModelProfile], authorizing: Bool, scope: UUID) {
-        let saved = Dictionary(uniqueKeysWithValues: list.filter { !$0.apiKey.isEmpty }.map { ($0.id, $0.apiKey) })
-        credentialCacheLock.lock()
-        defer { credentialCacheLock.unlock() }
-        guard credentialCacheGeneration == scope else { return }
-        if authorizing {
-            authorizedCredentials = saved
-        } else {
-            // 常规保存只能更新已授权缓存项；不能把未授权的新 Key 顺带加入缓存。
-            authorizedCredentials = authorizedCredentials.reduce(into: [:]) { result, entry in
-                if let value = saved[entry.key] { result[entry.key] = value }
-            }
-        }
-    }
-
-    private static func invalidateCachedCredentials(_ ids: Set<UUID>, scope: UUID) {
-        credentialCacheLock.lock()
-        defer { credentialCacheLock.unlock() }
-        guard credentialCacheGeneration == scope else { return }
-        for id in ids { authorizedCredentials.removeValue(forKey: id) }
-    }
 
     private static func report(_ error: Error) {
         let message = error.localizedDescription
@@ -200,10 +138,6 @@ enum ProfileStore {
             }
             let hasPlaintext = list.contains { !$0.apiKey.isEmpty }
             for i in list.indices where list[i].apiKey.isEmpty && list[i].hasStoredAPIKey {
-                if let cached = cachedCredential(for: list[i].id) {
-                    list[i].apiKey = cached
-                    continue
-                }
                 do {
                     guard let secret = try secretStore.read(id: list[i].id), !secret.isEmpty else {
                         throw APIError(status: -1, message: "配置「\(list[i].name)」的 API Key 未能从钥匙串读取，请重新填写")
@@ -229,11 +163,10 @@ enum ProfileStore {
     /// 偏好设置与钥匙串不共享事务：先预检/备份，再写入；写入失败时尽力恢复并明确报告恢复失败。
     @discardableResult
     static func save(_ list: [ModelProfile]) -> Bool {
-        save(list, using: secretStore, authorizing: false, cacheScope: credentialCacheScope())
+        save(list, using: secretStore)
     }
 
-    private static func save(_ list: [ModelProfile], using backend: any ProfileSecretStore,
-                             authorizing: Bool, cacheScope: UUID) -> Bool {
+    private static func save(_ list: [ModelProfile], using backend: any ProfileSecretStore) -> Bool {
         struct SecretChange {
             let id: UUID
             let value: String
@@ -250,7 +183,7 @@ enum ProfileStore {
             for i in list.indices {
                 let p = list[i]
                 if p.credentialUnavailable && p.apiKey.isEmpty {
-                    throw APIError(status: -1, message: "API Key 暂时无法读取，配置尚未保存，请解锁钥匙串后重试")
+                    throw APIError(status: -1, message: "API Key 暂时无法读取，配置尚未保存，请重新填写 API Key 后保存")
                 }
                 metadata[i].apiKey = ""
                 metadata[i].hasStoredAPIKey = !p.apiKey.isEmpty
@@ -269,7 +202,6 @@ enum ProfileStore {
             defaults.set(data, forKey: key)
             for legacyKey in ["nc.baseURL", "nc.apiKey", "nc.model"] { defaults.removeObject(forKey: legacyKey) }
             lastError = nil
-            synchronizeCredentialCache(list, authorizing: authorizing, scope: cacheScope)
             let retained = Set(list.filter { !$0.apiKey.isEmpty }.map(\.id))
             var cleanupErrors: [String] = []
             for id in Set(old.map(\.id)).subtracting(retained) {
@@ -283,55 +215,26 @@ enum ProfileStore {
             return true
         } catch {
             var rollbackErrors: [String] = []
-            var uncertainCredentialIDs: Set<UUID> = []
             for change in written.reversed() {
                 do {
                     if let previous = change.previous { try backend.write(previous, id: change.id) }
                     else { try backend.remove(id: change.id) }
                 } catch {
                     rollbackErrors.append(error.localizedDescription)
-                    uncertainCredentialIDs.insert(change.id)
                 }
             }
-            invalidateCachedCredentials(uncertainCredentialIDs, scope: cacheScope)
             let message: String
             if !rollbackErrors.isEmpty {
                 message = "配置未保存，部分 API Key 恢复失败，请重新检查相关配置。保存错误：" + error.localizedDescription
                     + "；恢复错误：" + rollbackErrors.joined(separator: "；")
             } else if wasCancelled(error) {
-                message = "已取消钥匙串授权，配置尚未保存。" + (written.isEmpty ? "" : "本次已写入的 API Key 已恢复。")
+                message = "已取消钥匙串访问，配置尚未保存。" + (written.isEmpty ? "" : "本次已写入的 API Key 已恢复。")
             } else {
                 message = "配置未保存" + (written.isEmpty ? "：" : "，已恢复本次修改的 API Key：") + error.localizedDescription
             }
             report(APIError(status: -1, message: message))
             return false
         }
-    }
-
-    /// 仅供用户主动授权：此 backend 只用于本次完整保存，不改变默认静默访问模式。
-    /// 同步调用；调用方应在后台队列执行，并在完成前保留/锁定 UI 草稿。
-    static func authorizeAndSave(_ drafts: [ModelProfile]) -> [ModelProfile]? {
-        let scope = credentialCacheScope()
-        let backend = secretStore.allowingUserInteraction()
-        var resolved = drafts
-        do {
-            for i in resolved.indices where resolved[i].credentialUnavailable && resolved[i].apiKey.isEmpty {
-                guard let secret = try backend.read(id: resolved[i].id), !secret.isEmpty else {
-                    throw APIError(status: -1, message: "配置「\(resolved[i].name)」的 API Key 未在钥匙串中找到，请重新填写后保存")
-                }
-                resolved[i].apiKey = secret
-            }
-        } catch {
-            let message = wasCancelled(error) ? "已取消钥匙串授权，配置尚未保存。" : "配置未保存：" + error.localizedDescription
-            report(APIError(status: -1, message: message))
-            return nil
-        }
-        guard save(resolved, using: backend, authorizing: true, cacheScope: scope) else { return nil }
-        for i in resolved.indices {
-            resolved[i].credentialUnavailable = false
-            resolved[i].hasStoredAPIKey = !resolved[i].apiKey.isEmpty
-        }
-        return resolved
     }
 
     private static func wasCancelled(_ error: Error) -> Bool {

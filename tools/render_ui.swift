@@ -96,7 +96,7 @@ struct RenderUI {
 
         // A real save preflight reaches the fake backend even while the profile
         // metadata remains volatile. A failed save must preserve that metadata
-        // and expose the same recovery card shown after a credential-load error.
+        // and expose the credential-unavailable state without any authorization UI.
         let failingSecrets = SyntheticFailingProfileSecretStore()
         ProfileStore.secretStore = failingSecrets
         var deniedDraft = profile
@@ -108,8 +108,8 @@ struct RenderUI {
                      "Failed synthetic credential save must preserve existing metadata")
         precondition(failingSecrets.readCount > 0 && UserDefaults.standard.volatileDomain(forName: UserDefaults.argumentDomain)[ProfileStore.key] != nil,
                      "Recovery fixture must use only the isolated store and preserve standard synthetic defaults")
-        try render(SettingsView(discoverLocalModels: false, notesAccessIssueProvider: { nil }, updater: updater), size: NSSize(width: 940, height: 640), name: "settings-keychain-recovery-light", directory: output)
-        try render(SettingsView(discoverLocalModels: false, notesAccessIssueProvider: { nil }, updater: updater), size: NSSize(width: 940, height: 640), name: "settings-keychain-recovery-dark", directory: output, dark: true)
+        try render(SettingsView(discoverLocalModels: false, notesAccessIssueProvider: { nil }, updater: updater), size: NSSize(width: 940, height: 640), name: "settings-keychain-unavailable-light", directory: output)
+        try render(SettingsView(discoverLocalModels: false, notesAccessIssueProvider: { nil }, updater: updater), size: NSSize(width: 940, height: 640), name: "settings-keychain-unavailable-dark", directory: output, dark: true)
         print("UI smoke: 25 native layouts rendered with isolated data")
     }
 

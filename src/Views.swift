@@ -920,7 +920,6 @@ struct SettingsView: View {
     @AppStorage("nc.temp") private var temperature = 0.7
     @AppStorage("nc.maxTokens") private var maxTokens = 2048
     @State private var statusText = ""
-    @State private var recoveringCredentials = false
     @State private var lastSavedProfiles: [ModelProfile]?
     @State private var profileSaveTask: Task<Void, Never>?
     @State private var pendingDeleteID: UUID?
@@ -978,7 +977,6 @@ struct SettingsView: View {
             settingsDetail
         }
         .frame(minWidth: 900, minHeight: 620)
-        .disabled(recoveringCredentials)
         .onReceive(NotificationCenter.default.publisher(for: .init("nc.kwStatus")).receive(on: DispatchQueue.main)) { n in
             kwStatus = n.object as? String
             refreshPermissionStatus()
@@ -1209,8 +1207,9 @@ struct SettingsView: View {
     }
 
     private var profileSaveStatus: (text: String, icon: String, color: Color) {
-        if recoveringCredentials { return ("保存中…", "arrow.clockwise", .secondary) }
-        if needsCredentialRecovery { return ("未保存 · 需要钥匙串授权", "exclamationmark.triangle.fill", .orange) }
+        if profiles.contains(where: \.credentialUnavailable) {
+            return ("API Key 不可用", "exclamationmark.triangle.fill", .orange)
+        }
         guard let saved = lastSavedProfiles else { return ("正在读取配置…", "ellipsis.circle", .secondary) }
         if profiles != saved { return ("未保存的更改", "circle.fill", .orange) }
         if profiles.isEmpty { return ("尚无模型配置", "tray", .secondary) }
@@ -1231,15 +1230,11 @@ struct SettingsView: View {
                     .foregroundColor(.secondary)
             }
             Spacer(minLength: 8)
-            Button { recoverCredentials() } label: {
-                HStack(spacing: 6) {
-                    if recoveringCredentials { ProgressView().controlSize(.small) }
-                    Label(recoveringCredentials ? "保存中…" : "保存配置", systemImage: "square.and.arrow.down")
-                }
+            Button { saveProfilesNow() } label: {
+                Label("保存配置", systemImage: "square.and.arrow.down")
             }
             .buttonStyle(.borderedProminent)
             .controlSize(.regular)
-            .disabled(recoveringCredentials)
             .accessibilityIdentifier("settings.saveProfiles")
         }
     }
@@ -1318,20 +1313,6 @@ struct SettingsView: View {
             card("checkmark.seal", "生效状态") {
                 activeStatusRow
             }
-            if needsCredentialRecovery || recoveringCredentials {
-                card("key.fill", "保存配置需要钥匙串授权", note: "完成系统认证后重试保存；取消可继续编辑当前草稿。") {
-                    HStack(spacing: 10) {
-                        Button("授权钥匙串并保存") { recoverCredentials() }
-                            .buttonStyle(.borderedProminent)
-                            .accessibilityIdentifier("settings.authorizeCredentials")
-                        if recoveringCredentials {
-                            ProgressView().controlSize(.small)
-                            Text("请在系统提示中完成授权或取消。")
-                                .font(.caption).foregroundColor(.secondary)
-                        }
-                    }
-                }
-            }
             ForEach($profiles) { $p in
                 profileCard($p)
             }
@@ -1385,37 +1366,6 @@ struct SettingsView: View {
                 }
                 Text("未授权时的降级：无辅助功能则斜杠命令和选区浮钮不触发；无 Notes 自动化则不能写回，只能复制结果；无完全磁盘访问则笔记库和模板不可读。")
                     .font(.caption).foregroundColor(.secondary)
-            }
-        }
-    }
-
-    private var needsCredentialRecovery: Bool {
-        let error = ProfileStore.lastError ?? ""
-        return !profiles.isEmpty && (profiles.contains { $0.credentialUnavailable }
-            || (error.contains("钥匙串") && !error.hasPrefix("配置已保存")))
-    }
-
-    private func recoverCredentials() {
-        guard !recoveringCredentials else { return }
-        // A model-list response from before authorization must not mutate the
-        // captured draft while the user is completing the system prompt.
-        modelFetchGeneration = UUID()
-        fetchingID = nil
-        let drafts = profiles
-        profileSaveTask?.cancel()
-        recoveringCredentials = true
-        DispatchQueue.global(qos: .userInitiated).async {
-            let saved = ProfileStore.authorizeAndSave(drafts)
-            DispatchQueue.main.async {
-                if let saved {
-                    // The interactive transaction already persisted this exact list.
-                    lastSavedProfiles = saved
-                    profiles = saved
-                    statusText = ProfileStore.lastError ?? "配置已保存到系统钥匙串。"
-                } else {
-                    statusText = ProfileStore.lastError ?? "配置尚未保存，当前编辑内容已保留。"
-                }
-                recoveringCredentials = false
             }
         }
     }
@@ -1476,7 +1426,7 @@ struct SettingsView: View {
                         .textSelection(.enabled)
                         .lineLimit(1).truncationMode(.middle)
                     if active.credentialUnavailable {
-                        Text("API Key 暂时无法读取，请授权钥匙串后使用。")
+                        Text("API Key 暂时无法读取，请重新填写。")
                             .font(.caption).foregroundColor(.orange)
                     }
                 }
@@ -1519,7 +1469,7 @@ struct SettingsView: View {
                 Spacer()
 
                 if isActive {
-                    Text(p.credentialUnavailable ? "待授权" : "生效中")
+                    Text(p.credentialUnavailable ? "密钥不可用" : "生效中")
                         .font(.caption2).foregroundColor(activeColor)
                         .padding(.horizontal, 7).padding(.vertical, 2)
                         .background(Capsule().fill(activeColor.opacity(0.12)))
@@ -1668,7 +1618,7 @@ struct SettingsView: View {
     }
 
     private func saveProfilesNow() {
-        guard !recoveringCredentials, profiles != lastSavedProfiles else { return }
+        guard profiles != lastSavedProfiles else { return }
         if ProfileStore.save(profiles) {
             lastSavedProfiles = profiles
             if let error = ProfileStore.lastError { statusText = error }
@@ -2374,7 +2324,7 @@ struct SettingsView: View {
     /// 拉取指定配置的模型列表（GET /models），写入该配置的模型菜单；
     /// 模型名为空时自动填第一个
     private func fetchModels(for id: UUID) {
-        guard !recoveringCredentials, let idx = profiles.firstIndex(where: { $0.id == id }) else { return }
+        guard let idx = profiles.firstIndex(where: { $0.id == id }) else { return }
         let raw = profiles[idx].baseURL
         let key = profiles[idx].apiKey
         let name = profiles[idx].name.isEmpty ? "未命名" : profiles[idx].name
@@ -2389,7 +2339,7 @@ struct SettingsView: View {
                 }
                 let list = try await AIService.fetchModels(base: base, key: key)
                 await MainActor.run {
-                    guard modelFetchGeneration == generation, !recoveringCredentials else { return }
+                    guard modelFetchGeneration == generation else { return }
                     guard let current = profiles.first(where: { $0.id == id }),
                           current.baseURL == raw, current.apiKey == key else {
                         fetchingID = nil
@@ -2407,7 +2357,7 @@ struct SettingsView: View {
                 }
             } catch {
                 await MainActor.run {
-                    guard modelFetchGeneration == generation, !recoveringCredentials else { return }
+                    guard modelFetchGeneration == generation else { return }
                     statusText = "\(name)：失败：\(error.localizedDescription)"
                     fetchingID = nil
                 }
