@@ -88,9 +88,13 @@ private func runTests() async {
     configuration.protocolClasses = [UpdateProtocol.self]
     let session = URLSession(configuration: configuration)
     defer { session.invalidateAndCancel() }
+    let downloadDirectory = URL(fileURLWithPath: NSTemporaryDirectory())
+        .appendingPathComponent("notescopilot-update-downloads-\(UUID().uuidString)")
+    defer { try? FileManager.default.removeItem(at: downloadDirectory) }
     var date = Date(timeIntervalSince1970: 1_800_000_000)
     func make(_ version: String = "2.6.1") -> AppUpdater {
-        AppUpdater(currentVersion: version, defaults: defaults, session: session, now: { date })
+        AppUpdater(currentVersion: version, defaults: defaults, session: session,
+                   downloadDirectory: downloadDirectory, now: { date })
     }
     func reset() { defaults.removePersistentDomain(forName: suite) }
 
@@ -112,6 +116,28 @@ private func runTests() async {
           "下载入口指向对应正式发布页")
     check(updater.availableRelease?.downloadURL.absoluteString == "https://github.com/m0nkee/notescopilot/releases/download/v2.7.0/NotesCopilot-2.7.0-arm64.dmg",
           "更新按钮直接下载对应版本 DMG")
+    UpdateProtocol.fixture("SYNTHETIC-DMG")
+    let downloadedURL = await updater.download()
+    let downloadedData = downloadedURL.flatMap { try? Data(contentsOf: $0) }
+    var downloadCompleted = false
+    if case .completed = updater.downloadState { downloadCompleted = true }
+    check(downloadedURL?.lastPathComponent == "NotesCopilot-2.7.0-arm64.dmg"
+          && downloadedData == Data("SYNTHETIC-DMG".utf8)
+          && downloadCompleted,
+          "直接下载写入下载目录并保存完整 DMG")
+    check(updater.downloadStatusMessage.contains(downloadedURL?.path ?? ""),
+          "下载状态显示本地文件路径")
+    try? Data("OLD-DMG".utf8).write(to: downloadDirectory.appendingPathComponent("NotesCopilot-2.7.0-arm64.dmg"))
+    UpdateProtocol.fixture("REPLACED-DMG")
+    let replacedURL = await updater.download()
+    let replacedData = replacedURL.map { try? Data(contentsOf: $0) } ?? nil
+    check(replacedURL == downloadedURL && replacedData == Data("REPLACED-DMG".utf8),
+          "重复下载同版本会替换旧文件")
+    UpdateProtocol.fixture("not-found", status: 404)
+    let failedURL = await updater.download()
+    check(failedURL == nil && updater.downloadStatusMessage.contains("HTTP 404")
+          && !updater.isDownloading,
+          "下载失败保留可读错误并退出下载状态")
     check(updater.shouldRemind(), "首次发现新版本需要提醒")
     updater.markReminded()
     check(!updater.shouldRemind(), "同一天不重复弹出提醒")

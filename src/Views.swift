@@ -1107,13 +1107,24 @@ struct SettingsView: View {
             .padding(.horizontal, 14)
             .padding(.bottom, 8)
             if let release = updater.availableRelease {
-                Button("新版本 v\(release.version) 可下载") {
-                    NSWorkspace.shared.open(release.downloadURL)
+                Button(updater.isDownloading ? "正在下载 v\(release.version)…" : "直接下载 v\(release.version)") {
+                    Task { @MainActor in
+                        guard let fileURL = await updater.download() else { return }
+                        NSWorkspace.shared.activateFileViewerSelecting([fileURL])
+                    }
                 }
                 .buttonStyle(.borderless)
                 .font(.caption2)
+                .disabled(updater.isDownloading)
                 .padding(.horizontal, 14)
                 .padding(.bottom, 8)
+                if !updater.downloadStatusMessage.isEmpty {
+                    Text(updater.downloadStatusMessage)
+                        .font(.caption2)
+                        .foregroundColor(.secondary)
+                        .padding(.horizontal, 14)
+                        .padding(.bottom, 8)
+                }
             }
             Text("v\(updater.currentVersion.isEmpty ? "-" : updater.currentVersion)")
                 .font(.caption2)
@@ -1897,11 +1908,22 @@ struct SettingsView: View {
                     .foregroundColor(updater.availableRelease == nil ? .secondary : .orange)
                     .accessibilityIdentifier("settings.updates.status")
                 if let release = updater.availableRelease {
-                    Button("下载新版本 v\(release.version)…") { NSWorkspace.shared.open(release.downloadURL) }
+                    Button(updater.isDownloading ? "正在下载 v\(release.version)…" : "直接下载 v\(release.version)") {
+                        Task { @MainActor in
+                            guard let fileURL = await updater.download() else { return }
+                            NSWorkspace.shared.activateFileViewerSelecting([fileURL])
+                        }
+                    }
                         .controlSize(.small)
+                        .disabled(updater.isDownloading)
                         .accessibilityIdentifier("settings.updates.download")
-                    Text("下载 DMG 后，将 NotesCopilot 拖入「Applications」替换旧版本。若 macOS 提示无法验证应用，先点「完成」，再到「系统设置 → 隐私与安全性」点「仍要打开」。")
+                    Text("DMG 会下载到「下载」文件夹并在 Finder 中显示。安装时拖入「Applications」替换旧版本。若 macOS 提示无法验证应用，先点「完成」，再到「系统设置 → 隐私与安全性」点「仍要打开」。")
                         .font(.caption2).foregroundColor(.secondary)
+                    if !updater.downloadStatusMessage.isEmpty {
+                        Text(updater.downloadStatusMessage)
+                            .font(.caption2)
+                            .foregroundColor(.secondary)
+                    }
                 }
                 Toggle("自动检查更新并提醒", isOn: $updater.automaticallyChecks)
                     .toggleStyle(.switch)

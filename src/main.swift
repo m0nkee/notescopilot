@@ -300,7 +300,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc func openUpdateDownload() {
-        NSWorkspace.shared.open(AppUpdater.shared.availableRelease?.downloadURL ?? AppUpdater.releasesURL)
+        Task { @MainActor in
+            guard let fileURL = await AppUpdater.shared.download() else { return }
+            NSWorkspace.shared.activateFileViewerSelecting([fileURL])
+        }
     }
 
     private func refreshUpdateMenu() {
@@ -316,7 +319,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let alert = NSAlert()
         if updater.status == .available, let release = updater.availableRelease {
             alert.messageText = "NotesCopilot 有新版本 v\(release.version)"
-            alert.informativeText = "当前版本：v\(updater.currentVersion)\n建议更新以获取最新功能和修复。\n下载 DMG 后，将 NotesCopilot 拖入「Applications」替换旧版本。\n若 macOS 提示无法验证应用，先点「完成」，再到「系统设置 → 隐私与安全性」点「仍要打开」。"
+            alert.informativeText = "当前版本：v\(updater.currentVersion)\n建议更新以获取最新功能和修复。\n点击「直接下载」后，DMG 会下载到「下载」文件夹并在 Finder 中显示。安装时拖入「Applications」替换旧版本。\n若 macOS 提示无法验证应用，先点「完成」，再到「系统设置 → 隐私与安全性」点「仍要打开」。"
             alert.addButton(withTitle: "直接下载")
             alert.addButton(withTitle: "稍后提醒")
             updater.markReminded()

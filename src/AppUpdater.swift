@@ -53,8 +53,16 @@ final class AppUpdater: ObservableObject {
         case idle, checking, current, available, failed(String)
     }
 
+    enum DownloadState: Equatable {
+        case idle
+        case downloading
+        case completed(URL)
+        case failed(String)
+    }
+
     @Published private(set) var status: Status = .idle
     @Published private(set) var availableRelease: AppRelease?
+    @Published private(set) var downloadState: DownloadState = .idle
     @Published private(set) var lastChecked: Date?
     @Published var automaticallyChecks: Bool {
         didSet { defaults.set(automaticallyChecks, forKey: "nc.update.automatic") }
@@ -64,16 +72,20 @@ final class AppUpdater: ObservableObject {
 
     private let defaults: UserDefaults
     private let session: URLSession
+    private let downloadDirectory: URL
     private let now: () -> Date
     private var userRequestedResult = false
 
     init(currentVersion: String = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "",
          defaults: UserDefaults = .standard,
          session: URLSession = .shared,
+         downloadDirectory: URL = FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask).first
+            ?? FileManager.default.temporaryDirectory,
          now: @escaping () -> Date = Date.init) {
         self.currentVersion = currentVersion
         self.defaults = defaults
         self.session = session
+        self.downloadDirectory = downloadDirectory
         self.now = now
         automaticallyChecks = defaults.object(forKey: "nc.update.automatic") as? Bool ?? true
         lastChecked = defaults.object(forKey: "nc.update.lastChecked") as? Date
@@ -85,6 +97,7 @@ final class AppUpdater: ObservableObject {
     }
 
     var isChecking: Bool { status == .checking }
+    var isDownloading: Bool { downloadState == .downloading }
 
     var statusMessage: String {
         switch status {
@@ -93,6 +106,19 @@ final class AppUpdater: ObservableObject {
         case .current: return "当前已是最新版本（v\(currentVersion)）。"
         case .available: return "发现新版本 v\(availableRelease?.version ?? "")，建议更新。"
         case .failed(let message): return message
+        }
+    }
+
+    var downloadStatusMessage: String {
+        switch downloadState {
+        case .idle:
+            return ""
+        case .downloading:
+            return "正在下载 v\(availableRelease?.version ?? "")，完成后会在 Finder 中显示。"
+        case .completed(let url):
+            return "已下载：\(url.path)"
+        case .failed(let message):
+            return message
         }
     }
 
@@ -145,6 +171,44 @@ final class AppUpdater: ObservableObject {
         let showResult = userRequestedResult
         userRequestedResult = false
         onCheckCompleted?(showResult)
+    }
+
+    func download() async -> URL? {
+        guard let release = availableRelease else {
+            downloadState = .failed("尚未发现可下载的新版本，请先检查更新。")
+            return nil
+        }
+        guard !isDownloading else { return nil }
+
+        downloadState = .downloading
+        do {
+            var request = URLRequest(url: release.downloadURL, timeoutInterval: 120)
+            request.setValue("NotesCopilot/\(currentVersion)", forHTTPHeaderField: "User-Agent")
+            let (sourceURL, response) = try await session.download(for: request)
+            defer { try? FileManager.default.removeItem(at: sourceURL) }
+
+            guard let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode) else {
+                let code = (response as? HTTPURLResponse)?.statusCode ?? -1
+                throw UpdateError("下载新版本失败（HTTP \(code)），请稍后重试。")
+            }
+
+            try FileManager.default.createDirectory(at: downloadDirectory, withIntermediateDirectories: true)
+            let destination = downloadDirectory
+                .appendingPathComponent("NotesCopilot-\(release.version)-arm64.dmg")
+            if FileManager.default.fileExists(atPath: destination.path) {
+                _ = try FileManager.default.replaceItemAt(destination, withItemAt: sourceURL)
+            } else {
+                try FileManager.default.moveItem(at: sourceURL, to: destination)
+            }
+
+            downloadState = .completed(destination)
+            return destination
+        } catch {
+            let message = (error as? UpdateError)?.message
+                ?? "无法下载新版本，请检查网络后重试。"
+            downloadState = .failed(message)
+            return nil
+        }
     }
 
     func shouldRemind() -> Bool {
