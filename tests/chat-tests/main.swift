@@ -96,9 +96,11 @@ private final class ChatTests {
     }
     func settle() async { try? await Task.sleep(nanoseconds: 100_000_000) }
 
-    func configure(_ suffix: String = "a", profileID: UUID = UUID(), model: String? = nil) {
+    func configure(_ suffix: String = "a", profileID: UUID = UUID(), model: String? = nil,
+                   reasoningEffort: ReasoningEffort? = nil) {
         let profile = ModelProfile(id: profileID, name: "synthetic \(suffix)", baseURL: "https://chat-\(suffix).invalid/v1",
-                                   apiKey: "synthetic-\(suffix)", model: model ?? "model-\(suffix)")
+                                   apiKey: "synthetic-\(suffix)", model: model ?? "model-\(suffix)",
+                                   reasoningEffort: reasoningEffort)
         Config.defaults.setVolatileDomain([
             "nc.profiles": try! JSONEncoder().encode([profile]),
             "nc.activeProfileID": profile.id.uuidString,
@@ -332,6 +334,87 @@ private final class ChatTests {
         await wait("default temperature request finishes") { !engine.busy }
         check(engine.lastError == nil && engine.output == "default temperature result",
               "omitting temperature lets gpt-6.1-terra complete normally")
+    }
+
+    func reasoningEffortDefaultsToOmittedAndUsesRequestSnapshot() async {
+        configure()
+        ChatTestProtocol.reset()
+        let engine = ChatEngine()
+        engine.run(prompt: "default reasoning effort")
+        await wait("default reasoning effort request starts") { ChatTestProtocol.count == 1 }
+        let body = ChatTestProtocol.capturedRequest(0)?.httpBody
+            .flatMap { try? JSONSerialization.jsonObject(with: $0) } as? [String: Any]
+        check(body?["reasoning_effort"] == nil, "default reasoning effort is omitted")
+        configure(reasoningEffort: .high)
+        check(body?["reasoning_effort"] == nil,
+              "changing reasoning effort after scheduling cannot alter the captured request")
+        ChatTestProtocol.respond(0, body: "data: {\"choices\":[{\"delta\":{\"content\":\"default effort result\"}}]}\n\n")
+        await wait("default reasoning effort request finishes") { !engine.busy }
+        check(engine.lastError == nil && engine.output == "default effort result",
+              "omitting reasoning effort keeps ordinary models working")
+    }
+
+    func configuredReasoningEffortIsSentAndBoundToItsProfile() async {
+        configure(reasoningEffort: .high)
+        ChatTestProtocol.reset()
+        let engine = ChatEngine()
+        engine.run(prompt: "high reasoning effort")
+        await wait("high reasoning effort request starts") { ChatTestProtocol.count == 1 }
+        let body = ChatTestProtocol.capturedRequest(0)?.httpBody
+            .flatMap { try? JSONSerialization.jsonObject(with: $0) } as? [String: Any]
+        check(body?["reasoning_effort"] as? String == "high",
+              "configured reasoning effort is sent as reasoning_effort")
+        check(body?["stream_options"] != nil,
+              "reasoning effort preserves usage accounting")
+        configure(reasoningEffort: .low)
+        check(body?["reasoning_effort"] as? String == "high",
+              "reasoning effort uses the request configuration snapshot")
+        ChatTestProtocol.respond(0, body: "data: {\"choices\":[{\"delta\":{\"content\":\"high effort result\"}}]}\n\n")
+        await wait("high reasoning effort request finishes") { !engine.busy }
+        check(engine.lastError == nil && engine.output == "high effort result",
+              "high reasoning effort completes normally")
+    }
+
+    func nonStreamingRequestsUseReasoningEffort() async {
+        configure(reasoningEffort: .medium)
+        ChatTestProtocol.reset()
+        var result: String?
+        let task = Task {
+            do { result = try await AIService.complete(instruction: "reasoning", context: "", configuration: nil) }
+            catch { result = "error: \(error.localizedDescription)" }
+        }
+        await wait("nonstreaming reasoning effort request starts") { ChatTestProtocol.count == 1 }
+        let body = ChatTestProtocol.capturedRequest(0)?.httpBody
+            .flatMap { try? JSONSerialization.jsonObject(with: $0) } as? [String: Any]
+        check(body?["reasoning_effort"] as? String == "medium",
+              "nonstreaming requests use the configured reasoning effort")
+        ChatTestProtocol.respond(0, body: "{\"choices\":[{\"message\":{\"content\":\"medium effort result\"},\"finish_reason\":\"stop\"}]}", includeDone: false)
+        await task.value
+        check(result == "medium effort result",
+              "nonstreaming reasoning effort request completes")
+    }
+
+    func changingReasoningEffortStartsANewConversation() async {
+        let profileID = UUID()
+        configure(profileID: profileID, reasoningEffort: .low)
+        ChatTestProtocol.reset()
+        let engine = ChatEngine()
+        engine.run(prompt: "low effort conversation")
+        await wait("low effort conversation starts") { ChatTestProtocol.count == 1 }
+        ChatTestProtocol.respond(0, body: "data: {\"choices\":[{\"delta\":{\"content\":\"low effort answer\"}}]}\n\n")
+        await wait("low effort conversation finishes") { !engine.busy }
+        configure(profileID: profileID, reasoningEffort: .high)
+        engine.run(prompt: "high effort conversation")
+        await wait("high effort conversation starts") { ChatTestProtocol.count == 2 }
+        let body = ChatTestProtocol.capturedRequest(1)?.httpBody
+            .flatMap { try? JSONSerialization.jsonObject(with: $0) } as? [String: Any]
+        let messages = body?["messages"] as? [[String: Any]]
+        check(body?["reasoning_effort"] as? String == "high" && messages?.count == 2,
+              "changing reasoning effort sends the new effort without old history")
+        check(engine.sessionNotice?.contains("模型配置") == true,
+              "reasoning effort boundary is explained to the user")
+        ChatTestProtocol.respond(1, body: "data: {\"choices\":[{\"delta\":{\"content\":\"high effort answer\"}}]}\n\n")
+        await wait("high effort conversation finishes") { !engine.busy }
     }
 
     func temperatureCompatibilityRetryOmitsParameter() async {
@@ -660,7 +743,7 @@ private final class ChatTests {
         isolated.set(1024, forKey: "nc.maxTokens")
         let fallback = ModelProfile(name: "fallback", baseURL: "https://fallback.invalid/v1", model: "fallback-model")
         let tuned = ModelProfile(name: "tuned", baseURL: "https://tuned.invalid/v1", model: "tuned-model",
-                                 temperature: 0.4, maxTokens: 4096)
+                                 temperature: 0.4, maxTokens: 4096, reasoningEffort: .high)
         guard ProfileStore.save([fallback, tuned]) else {
             check(false, "profile-generation fixture saves isolated profiles")
             return
@@ -669,14 +752,20 @@ private final class ChatTests {
         let tunedConfiguration = try? AIRequestConfiguration.current()
         check(tunedConfiguration?.temperature == 0.4 && tunedConfiguration?.maxTokens == 4096,
               "生效配置的采样温度和输出上限优先于全局默认值")
+        check(tunedConfiguration?.reasoningEffort == .high,
+              "生效配置的推理强度随 Profile 保存")
         ProfileStore.activeID = fallback.id
         let fallbackConfiguration = try? AIRequestConfiguration.current()
         check(fallbackConfiguration?.temperature == 0.2 && fallbackConfiguration?.maxTokens == 1024,
               "未覆盖参数的配置回退到全局默认值")
+        check(fallbackConfiguration?.reasoningEffort == nil,
+              "未设置推理强度时不发送参数")
         let stored = ProfileStore.load()
         check(stored.first { $0.id == tuned.id }?.temperature == 0.4
               && stored.first { $0.id == tuned.id }?.maxTokens == 4096
-              && stored.first { $0.id == fallback.id }?.temperature == nil,
+              && stored.first { $0.id == tuned.id }?.reasoningEffort == .high
+              && stored.first { $0.id == fallback.id }?.temperature == nil
+              && stored.first { $0.id == fallback.id }?.reasoningEffort == nil,
               "Profile 参数持久化且空值保持回退语义")
     }
 
@@ -760,6 +849,10 @@ private final class ChatTests {
         await retryUsesTheOriginalConfiguration()
         await defaultOnlyTemperatureModelsOmitParameter()
         await temperatureCompatibilityRetryOmitsParameter()
+        await reasoningEffortDefaultsToOmittedAndUsesRequestSnapshot()
+        await configuredReasoningEffortIsSentAndBoundToItsProfile()
+        await nonStreamingRequestsUseReasoningEffort()
+        await changingReasoningEffortStartsANewConversation()
         await malformedModelURLIsRecoverable()
         await invalidStreamsCannotPublishCompletedResults()
         await continuationCompletesTheOriginalResponse()

@@ -57,6 +57,23 @@ struct RenderUI {
         UserDefaults.standard.setVolatileDomain(values, forName: UserDefaults.argumentDomain)
         try render(SettingsView(discoverLocalModels: false, notesAccessIssueProvider: { nil }, updater: updater), size: NSSize(width: 940, height: 640), name: "settings-dark", directory: output, dark: true)
 
+        var reasoningProfile = profile
+        reasoningProfile.model = "openai/gpt-6.1-terra"
+        reasoningProfile.reasoningEffort = .high
+        let reasoningValues = values
+        values[ProfileStore.key] = try JSONEncoder().encode([reasoningProfile])
+        defaults.setVolatileDomain(values, forName: UserDefaults.argumentDomain)
+        UserDefaults.standard.setVolatileDomain(values, forName: UserDefaults.argumentDomain)
+        try render(SettingsView(discoverLocalModels: false, notesAccessIssueProvider: { nil },
+                                initialPage: .generation, updater: updater),
+                   size: NSSize(width: 940, height: 640), name: "settings-reasoning-light", directory: output)
+        try render(SettingsView(discoverLocalModels: false, notesAccessIssueProvider: { nil },
+                                initialPage: .generation, updater: updater),
+                   size: NSSize(width: 940, height: 640), name: "settings-reasoning-dark", directory: output, dark: true)
+        values["nc.profiles"] = reasoningValues["nc.profiles"]
+        defaults.setVolatileDomain(values, forName: UserDefaults.argumentDomain)
+        UserDefaults.standard.setVolatileDomain(values, forName: UserDefaults.argumentDomain)
+
         try checkTemplates(output: output, defaults: defaults, values: values, delegate: delegate, updater: updater)
         try checkPromptCategories(output: output)
 
@@ -100,7 +117,7 @@ struct RenderUI {
                    size: NSSize(width: 940, height: 640), name: "settings-model-storage-dark", directory: output, dark: true)
         defaults.setVolatileDomain(storedValues, forName: UserDefaults.argumentDomain)
         UserDefaults.standard.setVolatileDomain(storedValues, forName: UserDefaults.argumentDomain)
-        print("UI smoke: 25 native layouts rendered with isolated data")
+        print("UI smoke: 27 native layouts rendered with isolated data")
     }
 
     @MainActor private static func checkPromptCategories(output: URL) throws {

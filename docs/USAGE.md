@@ -134,8 +134,9 @@ Notes 编辑区和 AI 面板的提示词输入框均支持分类查询：`/templ
 2. 填入 API Key，点「拉取模型列表」选择模型
 3. **本地模型**：启动时自动探测 Ollama (11434)、LM Studio (1234)、llama.cpp (8080)、vLLM (8000)，发现后在设置页亮起
 4. 可保存多份配置，点卡片左侧圆圈切换生效配置
-5. 每份配置可单独设置 **温度**（建议 0–2）和 **输出上限**（建议 256–8192 tokens）。留空时使用全局默认值，实际可用范围以服务商为准
+5. 每份配置可单独设置 **温度**（建议 0–2）、**输出上限**（建议 256–8192 tokens）和 **推理强度**。温度与输出上限留空时使用全局默认值，实际可用范围以服务商为准
 6. 部分模型只接受服务端默认温度（当前识别 `gpt-6.1-terra`）。设置页会显示「Temperature：1.0（模型默认）」并隐藏滑杆；请求会自动省略 `temperature` 参数，避免 HTTP 400。其他模型若服务商返回明确的不支持 `temperature` 错误，流式对话会自动去掉该参数重试一次
+7. **推理强度**在「设置 → 生成参数」选择：默认不发送参数；Minimal／Low／Medium／High 会随请求发送 `reasoning_effort`。档位是否可用由模型和服务商决定；切换档位会开始新会话
 
 ## 模板
 
@@ -169,7 +170,8 @@ Weekly Work Templates
 | `nc.urltitle.enabled` | URL 转标题超链 | true |
 | `nc.model` | 生效模型配置 | - |
 | `nc.sys` | System Prompt | 内置 |
-| `nc.temp` | 生成温度 | 模型默认 |
+| `nc.temp` | 全局生成温度；Profile 可覆盖 | 0.7 |
+| Profile `reasoningEffort` | 推理强度：空、`minimal`、`low`、`medium`、`high`；空值不发送参数 | 空 |
 | `nc.continuous` | 连续对话模式（最近 6 轮） | true |
 | `nc.chat.session` | 最近一次会话恢复记录（不含 API Key） | - |
 | `nc.customAICommands` | 自定义 AI 命令 | - |

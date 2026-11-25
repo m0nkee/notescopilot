@@ -6,7 +6,7 @@
 
 在 Apple Notes 里写作，也能在 Mac 上直接处理选中的文字。
 
-[下载 v2.9.3 · Apple Silicon](https://github.com/m0nkee/notescopilot/releases/download/v2.9.3/NotesCopilot-2.9.3-arm64.dmg) · [发布说明与校验文件](https://github.com/m0nkee/notescopilot/releases/tag/v2.9.3) · [使用手册](docs/USAGE.md)
+[下载 v2.9.4 · Apple Silicon](https://github.com/m0nkee/notescopilot/releases/download/v2.9.4/NotesCopilot-2.9.4-arm64.dmg) · [发布说明与校验文件](https://github.com/m0nkee/notescopilot/releases/tag/v2.9.4) · [使用手册](docs/USAGE.md)
 
 </div>
 
@@ -40,7 +40,7 @@ NotesCopilot 是一个原生 macOS 菜单栏应用。默认在 **Notes 正文**�
 
 ## 安装与配置
 
-1. 下载 DMG，将 `NotesCopilot.app` 拖入「应用程序」后启动。发布包支持 **Apple Silicon、macOS 13 或更新版本**。发布页同时提供 `NotesCopilot-2.9.3-arm64.dmg.sha256`。
+1. 下载 DMG，将 `NotesCopilot.app` 拖入「应用程序」后启动。发布包支持 **Apple Silicon、macOS 13 或更新版本**。发布页同时提供 `NotesCopilot-2.9.4-arm64.dmg.sha256`。
 2. 在设置中选择服务商或本地模型，填写所需凭据并点「保存配置」。支持 DeepSeek、Kimi、通义千问、OpenAI、OpenRouter、硅基流动及自定义 OpenAI 兼容端点，也可发现 Ollama、LM Studio、llama.cpp 和 vLLM 本地端点。
 3. 在「系统设置 → 隐私与安全性 → 辅助功能」允许 NotesCopilot。需要使用 Notes 写回或本地索引时，再开启对应权限。
 
@@ -51,7 +51,7 @@ NotesCopilot 是一个原生 macOS 菜单栏应用。默认在 **Notes 正文**�
 
 ## Notes 和菜单栏里的其他功能
 
-- **AI 面板**支持流式对话、Markdown 预览、原文切换、代码块、表格、清单和富文本写回。每个模型可设置温度和输出上限；`gpt-6.1-terra` 等仅支持默认温度的模型会自动省略 `temperature`；重启会恢复最近会话，停止后未完整输出也会保留。切换笔记来源或模型配置会开始新会话，连续对话最多携带最近六轮。
+- **AI 面板**支持流式对话、Markdown 预览、原文切换、代码块、表格、清单和富文本写回。每个模型可设置温度、输出上限和推理强度；`gpt-6.1-terra` 等仅支持默认温度的模型会自动省略 `temperature`，推理强度默认不发送 `reasoning_effort`；重启会恢复最近会话，停止后未完整输出也会保留。切换笔记来源或模型配置会开始新会话，连续对话最多携带最近六轮。
 - **Notes 斜杠命令**可在正文输入 `/` 呼出。输入 `/ai`、`/markdown`、`/templates` 或 `/tools` 浏览分类，继续输入可筛选，按方向键选择、回车执行。
 - **模板**默认来自 Notes 的「Templates」文件夹，随笔记变动刷新。也可保存本地模板，使用日期、选区、输入询问和 AI 变量。同名时优先使用 Notes 版本。
 - **笔记库**支持本机正文搜索、最近搜索、关键词高亮和 Markdown 预览。**URL 标题超链**可在 Notes 中粘贴网址并输入空格后，自动生成以网页标题为文字的链接。

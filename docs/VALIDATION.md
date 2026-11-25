@@ -1,5 +1,17 @@
 # 本次修复与验证
 
+## v2.9.4（2026-11-25）
+
+| 项目 | 验收结果 |
+| --- | --- |
+| 推理强度 | Profile 可保存空、`minimal`、`low`、`medium`、`high`；空值不发送参数，选择档位后流式与非流式请求均发送 `reasoning_effort` |
+| 请求快照与会话边界 | 请求发起后修改推理强度不影响已捕获请求；同一 Profile 内切换推理强度会开始新会话，不携带旧历史 |
+| 原生界面 | 生成参数页新增推理强度卡片，浅色与深色布局均渲染 |
+| 功能回归 | 非沙箱十套完整回归共 **794 项通过、0 失败、0 跳过**：选区 72、斜杠 100、模板 41、URL 28、写回 136、模板执行 39、聊天 148、资料库 98、产品 65、更新 67 |
+| 启动生命周期 | `scripts/check-startup.sh` 非沙箱执行 **79/79** 通过，包含冷启动、窗口恢复、离屏、系统服务、选区工具与真实原生面板尺寸 |
+| 发布构建 | `NC_BUILD_OUTPUT=build/release/NotesCopilot-2.9.4.app ./build.sh` 构建成功，严格 `codesign --verify`、`plutil`、`bash -n` 与 `git diff --check` 均通过；版本 `2.9.4`，build `15`，arm64，使用稳定 Apple Development 身份签名。按约定跳过 Developer ID 签名与公证 |
+| 发布包 | `scripts/package-dmg.sh` 生成 `NotesCopilot-2.9.4-arm64.dmg` 和同名 `.sha256`；`hdiutil verify` 通过，只读挂载后逐文件比对并核对签名、版本、架构与 `/Applications` 软链接；SHA-256：`903a7cf37e898679650d3271829e752e7d7efe3b7c968628b1347616e5b86539` |
+
 ## v2.9.3（2026-11-25）
 
 | 项目 | 验收结果 |

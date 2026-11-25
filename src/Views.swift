@@ -870,7 +870,7 @@ enum SettingsPage: String, CaseIterable, Identifiable {
     var subtitle: String {
         switch self {
         case .model: return "可保存多份服务商/本地模型配置，点卡片左侧圆圈切换生效"
-        case .generation: return "采样温度与输出长度"
+        case .generation: return "采样温度、推理强度与输出长度"
         case .prompt: return "AI 的角色设定，随每次请求发送"
         case .markdown: return "在 Notes 里键入 # / ## / [] / > / ``` / - / * / 1. + 空格 自动套格式"
         case .templates: return "在提示词输入框键入 / 即可通过斜杠命令插入"
@@ -1660,6 +1660,19 @@ struct SettingsView: View {
 
     private var activeMaxTokens: Int { activeMaxTokensBinding.wrappedValue }
 
+    private var activeReasoningEffortBinding: Binding<String> {
+        Binding(
+            get: {
+                activeProfileIndex.flatMap { profiles[$0].reasoningEffort?.rawValue } ?? ""
+            },
+            set: { value in
+                if let index = activeProfileIndex {
+                    profiles[index].reasoningEffort = ReasoningEffort.parse(value)
+                }
+            }
+        )
+    }
+
     private var activeModelSupportsTemperature: Bool {
         let model = activeProfileIndex.map { profiles[$0].model } ?? ""
         return AIRequestConfiguration.temperatureIsSupported(for: model)
@@ -1691,6 +1704,29 @@ struct SettingsView: View {
             card("text.quote", "最大输出 tokens") {
                 Stepper("\(activeMaxTokens)", value: activeMaxTokensBinding, in: 512...32768, step: 512)
                     .font(.system(size: 12, weight: .medium))
+            }
+            card("brain.head.profile", "推理强度", note: "控制推理模型投入的思考程度") {
+                VStack(alignment: .leading, spacing: 6) {
+                    HStack {
+                        Text("Reasoning Effort：\(activeReasoningEffortBinding.wrappedValue.isEmpty ? "默认" : activeReasoningEffortBinding.wrappedValue)")
+                            .font(.system(size: 12, weight: .medium))
+                        Spacer()
+                        Text(activeReasoningEffortBinding.wrappedValue.isEmpty ? "不发送参数" : "reasoning_effort")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
+                    Picker("推理强度", selection: activeReasoningEffortBinding) {
+                        Text("默认").tag("")
+                        ForEach(ReasoningEffort.allCases) { effort in
+                            Text(effort.label).tag(effort.rawValue)
+                        }
+                    }
+                    .pickerStyle(.menu)
+                    .disabled(activeProfileIndex == nil)
+                    Text("默认不发送 reasoning_effort；选择 Minimal／Low／Medium／High 后随请求发送。是否支持及可用档位以模型和服务商为准。")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
             }
         }
     }

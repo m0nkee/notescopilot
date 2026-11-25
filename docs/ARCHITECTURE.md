@@ -101,7 +101,7 @@ Notes 模板以 `TopotextDoc` 第一行作为模板名，去掉该行和紧随�
 
 ## 数据与会话边界
 
-API Key 按用户指定恢复为随 Profile 保存在本机偏好设置；应用不再读写系统钥匙串，因此不会触发钥匙串授权弹窗。旧版单配置会迁移为 Profile。每次请求冻结端点、凭据、模型和参数。`AIRequestConfiguration.temperature` 为可选值：`gpt-6.1-terra` 这类仅支持默认温度的模型会置为 `nil` 并从 JSON 请求体中省略；配置身份用 `default` 区分，避免模型切换后误续旧会话。更换笔记来源或模型配置会开始新会话，连续对话仅发送最近六轮。SSE 必须提供正常完成信号；截断、错误和空输出不会发布完成确认。
+API Key 按用户指定恢复为随 Profile 保存在本机偏好设置；应用不再读写系统钥匙串，因此不会触发钥匙串授权弹窗。旧版单配置会迁移为 Profile。每次请求冻结端点、凭据、模型和参数。`AIRequestConfiguration.temperature` 为可选值：`gpt-6.1-terra` 这类仅支持默认温度的模型会置为 `nil` 并从 JSON 请求体中省略；配置身份用 `default` 区分，避免模型切换后误续旧会话。`reasoningEffort` 同样为可选值，空值不发送 `reasoning_effort`，选择 Minimal／Low／Medium／High 后写入 Chat Completions 请求体并进入配置身份。更换笔记来源或模型配置会开始新会话，连续对话仅发送最近六轮。SSE 必须提供正常完成信号；截断、错误和空输出不会发布完成确认。
 
 流式请求的兼容重试按“先原请求，再按错误降级”执行：HTTP 400 且错误指向 `stream_options` 时去掉 usage 选项重试；HTTP 400 且错误指向 `temperature` 不支持时省略温度重试。每种兼容问题最多移除一次，两类错误可串联处理；重试复用原配置快照和请求 ID，重置流结果但保留续写前缀，失败仍走原错误路径。非流式请求对已知默认温度模型同样省略该参数。
 

@@ -6,6 +6,26 @@ import AppKit
 
 // MARK: - 模型配置 Profile（可保存多份，点选其一作为生效配置）
 
+enum ReasoningEffort: String, Codable, CaseIterable, Identifiable, Sendable {
+    case minimal, low, medium, high
+
+    var id: String { rawValue }
+    var label: String {
+        switch self {
+        case .minimal: return "Minimal"
+        case .low: return "Low"
+        case .medium: return "Medium"
+        case .high: return "High"
+        }
+    }
+
+    static func parse(_ raw: String?) -> ReasoningEffort? {
+        guard let normalized = raw?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
+              !normalized.isEmpty else { return nil }
+        return ReasoningEffort(rawValue: normalized)
+    }
+}
+
 struct ModelProfile: Codable, Identifiable, Equatable {
     var id: UUID = UUID()
     var name: String = ""
@@ -15,11 +35,14 @@ struct ModelProfile: Codable, Identifiable, Equatable {
     /// nil 表示沿用全局默认值，便于旧配置无感升级。
     var temperature: Double?
     var maxTokens: Int?
+    /// nil 表示不发送 reasoning_effort，由服务商使用模型默认推理强度。
+    var reasoningEffort: ReasoningEffort?
 
     init(id: UUID = UUID(), name: String = "", baseURL: String = "", apiKey: String = "", model: String = "",
-         temperature: Double? = nil, maxTokens: Int? = nil) {
+         temperature: Double? = nil, maxTokens: Int? = nil, reasoningEffort: ReasoningEffort? = nil) {
         self.id = id; self.name = name; self.baseURL = baseURL; self.apiKey = apiKey; self.model = model
         self.temperature = temperature; self.maxTokens = maxTokens
+        self.reasoningEffort = reasoningEffort
     }
 }
 
@@ -162,6 +185,7 @@ struct AIRequestConfiguration: Sendable {
     let systemPrompt: String
     let temperature: Double?
     let maxTokens: Int
+    let reasoningEffort: ReasoningEffort?
     let profileIdentity: String
 
     /// 一些模型只接受服务端默认采样温度（例如 gpt-6.1-terra）。
@@ -181,7 +205,7 @@ struct AIRequestConfiguration: Sendable {
     func omittingTemperature() -> AIRequestConfiguration {
         AIRequestConfiguration(baseURL: baseURL, apiKey: apiKey, model: model,
                                systemPrompt: systemPrompt, temperature: nil, maxTokens: maxTokens,
-                               profileIdentity: profileIdentity)
+                               reasoningEffort: reasoningEffort, profileIdentity: profileIdentity)
     }
 
     static func current() throws -> AIRequestConfiguration {
@@ -196,11 +220,13 @@ struct AIRequestConfiguration: Sendable {
         }
         let temperature = Self.temperatureIsSupported(for: model) ? Config.temperature : nil
         let temperatureIdentity = temperature.map { "\($0)" } ?? "default"
+        let reasoningEffort = ReasoningEffort.parse(profile?.reasoningEffort?.rawValue)
         return AIRequestConfiguration(baseURL: base, apiKey: profile?.apiKey ?? "", model: model,
                                       systemPrompt: Config.systemPrompt, temperature: temperature,
-                                      maxTokens: Config.maxTokens,
+                                      maxTokens: Config.maxTokens, reasoningEffort: reasoningEffort,
                                       profileIdentity: (profile?.id.uuidString ?? "") + "|" + base + "|" + model
-                                          + "|t\(temperatureIdentity)|m\(Config.maxTokens)")
+                                          + "|t\(temperatureIdentity)|m\(Config.maxTokens)"
+                                          + "|r\(reasoningEffort?.rawValue ?? "default")")
     }
 }
 
@@ -261,6 +287,9 @@ enum AIService {
             "max_tokens": configuration.maxTokens,
         ]
         if let temperature = configuration.temperature { body["temperature"] = temperature }
+        if let reasoningEffort = configuration.reasoningEffort {
+            body["reasoning_effort"] = reasoningEffort.rawValue
+        }
         req.httpBody = try JSONSerialization.data(withJSONObject: body)
         let (data, resp) = try await URLSession.shared.data(for: req)
         try Task.checkCancellation()
@@ -750,6 +779,9 @@ final class ChatEngine: ObservableObject {
             "max_tokens": configuration.maxTokens,
         ]
         if let temperature = configuration.temperature { body["temperature"] = temperature }
+        if let reasoningEffort = configuration.reasoningEffort {
+            body["reasoning_effort"] = reasoningEffort.rawValue
+        }
         if includeUsage { body["stream_options"] = ["include_usage": true] }
 
         guard let url = URL(string: configuration.baseURL + "/chat/completions") else {
