@@ -150,6 +150,29 @@ struct TopotextDoc: Codable, Equatable {
     var warnings: [String] = []
 }
 
+enum NoteReadWarning: String {
+    case compatibleParsing = "正文使用兼容解析，格式或附件可能不完整。"
+    case recoveredText = "正文格式无法识别，当前为恢复出的文本，可能不完整。"
+    case incompleteStyles = "正文样式范围不完整，已保留全部纯文本。"
+    case missingAttachments = "附件、图片或表格未导出，请在备忘录中查看原件。"
+    case summaryOnly = "无法读取完整正文（可能为加密笔记或不支持的数据格式），当前仅显示摘要。"
+
+    var label: String {
+        switch self {
+        case .compatibleParsing:
+            return L10n.text("The note was read in compatibility mode. Formatting or attachments may be incomplete.")
+        case .recoveredText:
+            return L10n.text("The note format was unrecognized. Some text was recovered and may be incomplete.")
+        case .incompleteStyles:
+            return L10n.text("Some formatting was incomplete. All plain text was kept.")
+        case .missingAttachments:
+            return L10n.text("Attachments, images, and tables were omitted. Open the original in Notes.")
+        case .summaryOnly:
+            return L10n.text("Only the summary is available. The note may be encrypted or use an unsupported format.")
+        }
+    }
+}
+
 enum NativeNoteHTML {
     private struct Fragment {
         let text: String
@@ -365,14 +388,14 @@ enum TopotextDecoder {
         }
         if var b = best {
             b.isComplete = false
-            b.warnings = ["正文使用兼容解析，格式或附件可能不完整。"]
+                b.warnings = [NoteReadWarning.compatibleParsing.rawValue]
             return b
         }
         // 防回退：纯字符串收割
         var doc = TopotextDoc()
         doc.text = harvest(blob)
         doc.isComplete = false
-        doc.warnings = ["正文格式无法识别，当前为恢复出的文本，可能不完整。"]
+        doc.warnings = [NoteReadWarning.recoveredText.rawValue]
         return doc.text.isEmpty ? nil : doc
     }
 
@@ -466,7 +489,7 @@ enum TopotextDecoder {
         if !validRanges || (!doc.runs.isEmpty && cursor != count) {
             doc.runs = []
             doc.isComplete = false
-            doc.warnings.append("正文样式范围不完整，已保留全部纯文本。")
+            doc.warnings.append(NoteReadWarning.incompleteStyles.rawValue)
         } else {
             // 所有范围基于原始 UTF-16 文本；倒序替换避免较早附件改变后续偏移。
             let expanded = NSMutableString(string: text)
@@ -478,7 +501,7 @@ enum TopotextDecoder {
         }
         if unresolvedAttachment || doc.text.contains("\u{FFFC}") {
             doc.isComplete = false
-            doc.warnings.append("附件、图片或表格未导出，请在备忘录中查看原件。")
+            doc.warnings.append(NoteReadWarning.missingAttachments.rawValue)
         }
         return doc
     }

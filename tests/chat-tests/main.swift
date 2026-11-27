@@ -874,6 +874,8 @@ private final class ChatTests {
     }
 }
 
+UserDefaults.standard.register(defaults: [L10n.preferenceKey: AppLanguage.simplifiedChinese.rawValue])
+
 let chatTestSuite = "nc.chat-tests.session." + UUID().uuidString
 let chatTestDefaults = UserDefaults(suiteName: chatTestSuite)!
 ProfileStore.defaults = chatTestDefaults

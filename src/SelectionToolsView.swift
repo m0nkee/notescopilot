@@ -60,6 +60,7 @@ private final class InstructionField: NSTextField {
 }
 
 private struct SelectionInstructionField: NSViewRepresentable {
+    @ObservedObject private var localization = L10n.shared
     @Binding var text: String
     let submit: () -> Void
 
@@ -67,9 +68,6 @@ private struct SelectionInstructionField: NSViewRepresentable {
 
     func makeNSView(context: Context) -> NSTextField {
         let field = InstructionField()
-        field.placeholderString = "描述想做的修改…"
-        field.setAccessibilityLabel("自定义指令")
-        field.setAccessibilityHelp("按 I 输入指令，按回车执行")
         field.bezelStyle = .roundedBezel
         field.controlSize = .small
         field.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
@@ -86,6 +84,9 @@ private struct SelectionInstructionField: NSViewRepresentable {
 
     func updateNSView(_ field: NSTextField, context: Context) {
         context.coordinator.parent = self
+        field.placeholderString = L10n.text("Describe the change you want…")
+        field.setAccessibilityLabel(L10n.text("Custom Instruction"))
+        field.setAccessibilityHelp(L10n.text("Press I to enter an instruction, then Return to run it"))
         if field.currentEditor() == nil, field.stringValue != text { field.stringValue = text }
     }
 
@@ -106,7 +107,7 @@ private struct SelectionInstructionField: NSViewRepresentable {
 
 /// A nonactivating panel receives its first click directly in this AppKit button.
 final class SelectionLauncherButton: NSButton {
-    static let displayName = "Copilot 写作阅读助手"
+    static var displayName: String { L10n.text("Copilot Writing Tools") }
     static let size = NSSize(width: 184, height: 32)
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
     override var needsPanelToBecomeKey: Bool { false }
@@ -116,8 +117,8 @@ final class SelectionLauncherButton: NSButton {
         let label = Self.displayName
         title = label
         setAccessibilityLabel(label)
-        toolTip = "打开\(label)（M）"
-        setAccessibilityHelp("按 M 打开\(label)")
+        toolTip = L10n.format("Open %@ (M)", label)
+        setAccessibilityHelp(L10n.format("Press M to open %@", label))
         image = NSImage(systemSymbolName: "book", accessibilityDescription: nil)
         symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 14, weight: .medium)
         imagePosition = .imageLeading
@@ -161,6 +162,7 @@ final class SelectionLauncherButton: NSButton {
 }
 
 struct SelectionToolsView: View {
+    @ObservedObject private var localization = L10n.shared
     @ObservedObject var model: SelectionAIPanel
     var pendingSize: CGSize?
 
@@ -173,20 +175,22 @@ struct SelectionToolsView: View {
                 excerpt
                 HStack(spacing: 8) {
                     ProgressView().controlSize(.small)
-                    Text("正在\(model.action?.name ?? "处理")…")
+                    Text(model.action.map { L10n.format("Running %@…", $0.displayName) }
+                         ?? L10n.text("Working…"))
                     Spacer()
-                    Button("取消", action: model.dismiss)
+                    Button(L10n.text("Cancel"), action: model.dismiss)
                 }
             case .review: review
             case .unavailable:
                 feedback
-                Button("重新读取选区", action: model.openTools)
+                Button(L10n.text("Read Selection Again"), action: model.openTools)
             case .launcher: EmptyView()
             }
         }
         .padding(12)
         .frame(width: pendingSize?.width ?? (model.phase == .review ? 420 : 340))
         .frame(minHeight: pendingSize?.height, alignment: .topLeading)
+        .environment(\.locale, localization.locale)
         .controlSize(.small)
         .fixedSize()
         .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 10))
@@ -196,19 +200,21 @@ struct SelectionToolsView: View {
     private var header: some View {
         HStack(spacing: 6) {
             Image(systemName: "book").foregroundStyle(Color.accentColor)
-            Text(model.phase == .review ? (model.action?.name ?? "处理结果") : SelectionLauncherButton.displayName)
+            Text(model.phase == .review ? (model.action?.displayName ?? L10n.text("Result"))
+                  : SelectionLauncherButton.displayName)
                 .font(.headline)
             Spacer()
             if let source = model.sourceName {
-                Text("\(source) · \(model.original.count) 字").lineLimit(1)
+                Text(L10n.format(model.original.count == 1 ? "%@ · %lld character" : "%@ · %lld characters",
+                                 source, Int64(model.original.count))).lineLimit(1)
                     .font(.caption).foregroundStyle(.secondary)
             }
             Button(action: model.dismiss) {
                 Image(systemName: "xmark.circle.fill").foregroundStyle(.secondary)
             }
             .buttonStyle(.plain)
-            .accessibilityLabel("关闭写作阅读助手")
-            .help("关闭写作阅读助手（Esc）")
+            .accessibilityLabel(L10n.text("Close Writing Tools"))
+            .help(L10n.text("Close Writing Tools (Esc)"))
         }
     }
 
@@ -220,25 +226,27 @@ struct SelectionToolsView: View {
                 SelectionInstructionField(text: $model.customInstruction, submit: model.runCustom)
                     .frame(maxWidth: .infinity)
                 Button(action: model.runCustom) { Image(systemName: "arrow.right") }
-                    .accessibilityLabel("执行自定义指令")
+                    .accessibilityLabel(L10n.text("Run Custom Instruction"))
                     .disabled(model.customInstruction.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
             }
             Divider()
             ForEach(SelectionQuickAction.Group.allCases, id: \.self) { group in
                 HStack(spacing: 6) {
-                    Text(group.rawValue).font(.caption).foregroundStyle(.secondary)
+                    Text(group.title).font(.caption).foregroundStyle(.secondary)
                         .frame(width: 32, alignment: .leading)
                     ForEach(selectionQuickActions.filter { $0.group == group }, id: \.name) { action in
                         if let key = action.shortcut {
-                            shortcutButton(action.name, key: key) { model.run(action) }
-                                .help("\(action.instruction == .translate ? WritingInstruction.translationHint : action.name)（\(key.uppercased())）")
+                            shortcutButton(action.displayName, key: key) { model.run(action) }
+                                .help(L10n.format("%@ (%@)",
+                                                  action.instruction == .translate ? WritingInstruction.translationHint : action.displayName,
+                                                  key.uppercased()))
                         }
                     }
                 }
             }
             if !model.formats.isEmpty {
                 Divider()
-                Menu("Notes 格式") {
+                Menu(L10n.text("Notes Formatting")) {
                     ForEach(model.formats, id: \.menuTitle) { item in
                         Button(item.label) { model.applyFormat(item) }
                     }
@@ -246,7 +254,7 @@ struct SelectionToolsView: View {
                 .fixedSize()
             }
             feedback
-            Text("按字母选工具 · 输入时 ↩ 执行，Esc 返回")
+            Text(L10n.text("Choose by letter · Return to run · Esc to go back"))
                 .font(.caption).foregroundStyle(.secondary)
         }
     }
@@ -260,20 +268,20 @@ struct SelectionToolsView: View {
         Group {
             if !model.result.isEmpty {
                 HStack(spacing: 6) {
-                    Picker("查看文本", selection: $model.showingOriginal) {
-                        Text("结果").tag(false)
-                        Text("原文").tag(true)
+                    Picker(L10n.text("View Text"), selection: $model.showingOriginal) {
+                        Text(L10n.text("Result")).tag(false)
+                        Text(L10n.text("Original")).tag(true)
                     }
                     .labelsHidden().pickerStyle(.segmented)
-                    .accessibilityLabel("查看文本")
-                    .accessibilityHint("按 O 切换原文与结果")
+                    .accessibilityLabel(L10n.text("View Text"))
+                    .accessibilityHint(L10n.text("Press O to switch between the original and the result"))
                     keyHint(SelectionReviewKey.original.rawValue)
                 }
-                .help("切换原文与结果（O）")
+                .help(L10n.text("Switch between original and result (O)"))
                 Button {
                     model.showDiff()
                 } label: {
-                    Text("差异")
+                    Text(L10n.text("Show Changes"))
                 }
                 .buttonStyle(.borderless)
                 .disabled(model.writing || model.original.isEmpty || model.result.isEmpty)
@@ -318,35 +326,23 @@ struct SelectionToolsView: View {
                     .scrollContentBackground(.hidden)
                     .background(.background.opacity(0.5), in: RoundedRectangle(cornerRadius: 5))
                     .disabled(model.writing)
-                    .accessibilityLabel("编辑 AI 结果")
+                    .accessibilityLabel(L10n.text("Edit AI Result"))
                     if model.resultEdited {
-                        Text("已手动编辑，写入会使用当前文本")
+                        Text(L10n.text("Your edits will be used when writing back."))
                             .font(.caption2).foregroundStyle(.orange)
                     }
                 }
             }
             feedback
-            HStack {
-                if model.needsConfiguration && model.result.isEmpty {
-                    Button("模型设置…") {
-                        model.hide()
-                        NotificationCenter.default.post(name: .init("nc.openSettings"), object: nil)
-                    }
+            ViewThatFits(in: .horizontal) {
+                HStack {
+                    reviewNavigation
+                    Spacer(minLength: 0)
+                    reviewResultActions
                 }
-                shortcutButton("换个工具", key: SelectionReviewKey.back.rawValue, action: model.chooseAnotherTool)
-                if let action = model.action {
-                    shortcutButton(model.result.isEmpty ? "重试" : "重新生成", key: SelectionReviewKey.generate.rawValue) { model.run(action) }
-                }
-                Spacer()
-                if !model.result.isEmpty {
-                    let preferReplace = model.canWrite && model.action?.group == .edit
-                    shortcutButton(model.showingOriginal ? "复制原文" : "复制结果", key: SelectionReviewKey.copy.rawValue, primary: !preferReplace) { model.copyPreview() }
-                    if model.hasReplacementTarget && !model.staleSelection {
-                        shortcutButton("追加", key: SelectionReviewKey.append.rawValue) { model.prepareWrite(append: true) }
-                            .help("追加到原选区末尾（A）").disabled(!model.canWrite)
-                        shortcutButton("替换选区", key: SelectionReviewKey.replace.rawValue, primary: preferReplace) { model.prepareWrite(append: false) }
-                            .disabled(!model.canWrite)
-                    }
+                VStack(alignment: .leading, spacing: 6) {
+                    reviewNavigation
+                    reviewResultActions.frame(maxWidth: .infinity, alignment: .trailing)
                 }
             }
             .disabled(model.writing)
@@ -354,13 +350,48 @@ struct SelectionToolsView: View {
                 get: { model.pendingWriteAppend != nil },
                 set: { if !$0 { model.cancelWritePreview() } }
             ), titleVisibility: .visible) {
-                Button(model.pendingWriteAppend == true ? "确认追加" : "确认替换", role: .destructive) {
+                let title = model.pendingWriteAppend == true ? L10n.text("Confirm Append") : L10n.text("Confirm Replacement")
+                Button(title, role: .destructive) {
                     model.confirmPendingWrite()
                 }
-                Button("取消", role: .cancel) { model.cancelWritePreview() }
+                Button(L10n.text("Cancel"), role: .cancel) { model.cancelWritePreview() }
             } message: {
                 Text(model.writePreviewText)
             }
+        }
+    }
+
+    private var reviewNavigation: some View {
+        HStack {
+            if model.needsConfiguration && model.result.isEmpty {
+                Button(L10n.text("Model Settings…")) {
+                    model.hide()
+                    NotificationCenter.default.post(name: .init("nc.openSettings"), object: nil)
+                }
+            }
+            shortcutButton(L10n.text("Back to Tools"), key: SelectionReviewKey.back.rawValue, action: model.chooseAnotherTool)
+            if let action = model.action {
+                let title = model.result.isEmpty ? L10n.text("Retry") : L10n.text("Regenerate")
+                shortcutButton(title, key: SelectionReviewKey.generate.rawValue) { model.run(action) }
+            }
+        }
+        .fixedSize(horizontal: true, vertical: false)
+    }
+
+    @ViewBuilder private var reviewResultActions: some View {
+        if !model.result.isEmpty {
+            let preferReplace = model.canWrite && model.action?.group == .edit
+            let copyTitle = model.showingOriginal ? L10n.text("Copy Original") : L10n.text("Copy Result")
+            HStack {
+                shortcutButton(copyTitle, key: SelectionReviewKey.copy.rawValue, primary: !preferReplace) { model.copyPreview() }
+                if model.hasReplacementTarget && !model.staleSelection {
+                    shortcutButton(L10n.text("Append"), key: SelectionReviewKey.append.rawValue) { model.prepareWrite(append: true) }
+                        .help(L10n.text("Append after the original selection (A)")).disabled(!model.canWrite)
+                    shortcutButton(L10n.text("Replace"), key: SelectionReviewKey.replace.rawValue, primary: preferReplace) { model.prepareWrite(append: false) }
+                        .disabled(!model.canWrite)
+                }
+            }
+            .fixedSize(horizontal: true, vertical: false)
         }
     }
 
@@ -375,8 +406,8 @@ struct SelectionToolsView: View {
             HStack(spacing: 4) { Text(verbatim: title); keyHint(key) }
         }
         .accessibilityLabel(Text(verbatim: title))
-        .accessibilityHint(Text("快捷键 \(key.uppercased())"))
-        .help("\(title)（\(key.uppercased())）")
+        .accessibilityHint(Text(L10n.format("Shortcut %@", key.uppercased())))
+        .help(L10n.format("%@ (%@)", title, key.uppercased()))
         if primary { button.buttonStyle(.borderedProminent) } else { button }
     }
 

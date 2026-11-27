@@ -103,10 +103,10 @@ enum SlashGroup: CaseIterable {
 
     var title: String {
         switch self {
-        case .ai: return "AI 优化"
-        case .markdown: return "Markdown 格式"
-        case .template: return "模板"
-        case .tool: return "工具"
+        case .ai: return L10n.text("AI Writing")
+        case .markdown: return L10n.text("Markdown Formatting")
+        case .template: return L10n.text("Templates")
+        case .tool: return L10n.text("Tools")
         }
     }
 
@@ -199,8 +199,25 @@ struct SlashCommand: Identifiable {
     let name: String      // 不带斜杠的命令名
     /// 英文命令别名；菜单筛选和 AX 正文执行也支持直接匹配中文 name。
     let alias: String
-    let detail: String
     let action: SlashAction
+    private let titleKey: String?
+    private let localizedDetail: () -> String
+
+    init(name: String, titleKey: String? = nil, alias: String,
+         detail: @autoclosure @escaping () -> String, action: SlashAction) {
+        self.name = name
+        self.titleKey = titleKey
+        self.alias = alias
+        self.localizedDetail = detail
+        self.action = action
+    }
+
+    var displayName: String {
+        guard let titleKey else { return name }
+        return L10n.text(titleKey)
+    }
+
+    var detail: String { localizedDetail() }
 
     /// 所属分组：由 action 推导（.format→Markdown，模板→模板，.run→AI，其余→工具）
     var group: SlashGroup {
@@ -262,47 +279,96 @@ enum SlashQuery {
 
 func buildUncachedSlashCommands() -> [SlashCommand] {
     var cmds: [SlashCommand] = [
-        SlashCommand(name: "续写", alias: "continue", detail: "基于笔记上下文自然续写", action: .run("请基于上文内容自然地续写下去，保持原文的风格与格式。")),
-        SlashCommand(name: "总结", alias: "summarize", detail: "总结笔记上下文的要点", action: .run("请用简洁的要点总结以下内容的核心信息。")),
-        SlashCommand(name: "翻译", alias: "translate", detail: WritingInstruction.translationHint, action: .run(.translate)),
-        SlashCommand(name: "润色", alias: "polish", detail: "让文字更通顺专业", action: .run("请润色以下文字，使其更通顺、专业，保持原意与格式。")),
-        SlashCommand(name: "解释", alias: "explain", detail: "解释关键概念与逻辑", action: .run("请解释以下内容的关键概念与逻辑。")),
-        SlashCommand(name: "扩写", alias: "expand", detail: "补充细节与论据", action: .run("请扩展以下内容，补充细节与论据，保持原有结构。")),
-        SlashCommand(name: "要点", alias: "keypoints", detail: "改写为要点清单", action: .run("请把以下内容改写成结构清晰的要点清单（Markdown 列表）。")),
-        SlashCommand(name: "标题", alias: "titles", detail: "为笔记拟 3 个候选标题", action: .run("请为以下笔记拟 3 个候选标题，每行一个。")),
-        SlashCommand(name: "修拼写", alias: "fixgrammar", detail: "修复拼写与语法（Ask AI）", action: .run("请修复以下文字的拼写与语法错误，只输出修正后的文本，不要解释。")),
-        SlashCommand(name: "格式检查", alias: "format", detail: "检查格式问题并列出修改建议（Ask AI）", action: .run("请检查以下内容的格式问题（标点符号、多余空格、标题层级、列表结构、错别字），逐条列出：问题位置、问题描述、修改建议。不要直接改写原文，只输出问题清单。")),
-        SlashCommand(name: "变短", alias: "shorter", detail: "压缩得更精炼（Ask AI）", action: .run("请把以下内容压缩得更简洁，保留核心信息。")),
-        SlashCommand(name: "变长", alias: "longer", detail: "扩写得更丰富（Ask AI）", action: .run("请把以下内容写得更丰富、有细节，保持原意。")),
+        SlashCommand(name: "续写", titleKey: "Continue Writing", alias: "continue",
+                     detail: L10n.text("Continue from the note context"),
+                     action: .run("请基于上文内容自然地续写下去，保持原文的风格与格式。")),
+        SlashCommand(name: "总结", titleKey: "Summarize", alias: "summarize",
+                     detail: L10n.text("Summarize the note’s key points"),
+                     action: .run("请用简洁的要点总结以下内容的核心信息。")),
+        SlashCommand(name: "翻译", titleKey: "Translate", alias: "translate",
+                     detail: WritingInstruction.translationHint, action: .run(.translate)),
+        SlashCommand(name: "润色", titleKey: "Polish", alias: "polish",
+                     detail: L10n.text("Make the text clearer and more professional"),
+                     action: .run("请润色以下文字，使其更通顺、专业，保持原意与格式。")),
+        SlashCommand(name: "解释", titleKey: "Explain", alias: "explain",
+                     detail: L10n.text("Explain key concepts and reasoning"),
+                     action: .run("请解释以下内容的关键概念与逻辑。")),
+        SlashCommand(name: "扩写", titleKey: "Expand", alias: "expand",
+                     detail: L10n.text("Add detail and supporting arguments"),
+                     action: .run("请扩展以下内容，补充细节与论据，保持原有结构。")),
+        SlashCommand(name: "要点", titleKey: "Key Points", alias: "keypoints",
+                     detail: L10n.text("Rewrite as a list of key points"),
+                     action: .run("请把以下内容改写成结构清晰的要点清单（Markdown 列表）。")),
+        SlashCommand(name: "标题", titleKey: "Suggest Titles", alias: "titles",
+                     detail: L10n.text("Suggest three titles for the note"),
+                     action: .run("请为以下笔记拟 3 个候选标题，每行一个。")),
+        SlashCommand(name: "修拼写", titleKey: "Fix Spelling and Grammar", alias: "fixgrammar",
+                     detail: L10n.text("Correct spelling and grammar with AI"),
+                     action: .run("请修复以下文字的拼写与语法错误，只输出修正后的文本，不要解释。")),
+        SlashCommand(name: "格式检查", titleKey: "Check Formatting", alias: "format",
+                     detail: L10n.text("Find formatting issues and suggest fixes"),
+                     action: .run("请检查以下内容的格式问题（标点符号、多余空格、标题层级、列表结构、错别字），逐条列出：问题位置、问题描述、修改建议。不要直接改写原文，只输出问题清单。")),
+        SlashCommand(name: "变短", titleKey: "Make Shorter", alias: "shorter",
+                     detail: L10n.text("Make the text more concise"),
+                     action: .run("请把以下内容压缩得更简洁，保留核心信息。")),
+        SlashCommand(name: "变长", titleKey: "Make Longer", alias: "longer",
+                     detail: L10n.text("Add more detail to the text"),
+                     action: .run("请把以下内容写得更丰富、有细节，保持原意。")),
         // ---- 格式化命令（官方清单：/title …/table）----
-        SlashCommand(name: "标题样式", alias: "title", detail: "段落 → 标题（/h1 同）", action: .format(.title)),
-        SlashCommand(name: "标题样式2", alias: "h1", detail: "同 /title", action: .format(.title)),
-        SlashCommand(name: "小标题样式", alias: "heading", detail: "段落 → 小标题（/h2 同）", action: .format(.heading)),
-        SlashCommand(name: "小标题样式2", alias: "h2", detail: "同 /heading", action: .format(.heading)),
-        SlashCommand(name: "子标题样式", alias: "subheading", detail: "段落 → 子标题（/h3 同）", action: .format(.subheading)),
-        SlashCommand(name: "子标题样式2", alias: "h3", detail: "同 /subheading", action: .format(.subheading)),
-        SlashCommand(name: "正文样式", alias: "body", detail: "段落 → 正文", action: .format(.body)),
-        SlashCommand(name: "等宽块", alias: "monostyled", detail: "段落 → 等宽（/code 同）", action: .format(.monostyled)),
-        SlashCommand(name: "等宽块2", alias: "code", detail: "同 /monostyled", action: .format(.monostyled)),
-        SlashCommand(name: "检查项", alias: "checklist", detail: "转为检查项列表", action: .format(.checklist)),
-        SlashCommand(name: "项目符号列表", alias: "bulletedlist", detail: "转为项目符号列表", action: .format(.bulletedList)),
-        SlashCommand(name: "虚线列表", alias: "dashedlist", detail: "转为虚线列表", action: .format(.dashedList)),
-        SlashCommand(name: "编号列表", alias: "numberedlist", detail: "转为编号列表", action: .format(.numberedList)),
-        SlashCommand(name: "引用块", alias: "quote", detail: "转为块引用（/blockquote 同）", action: .format(.blockQuote)),
-        SlashCommand(name: "引用块2", alias: "blockquote", detail: "同 /quote", action: .format(.blockQuote)),
-        SlashCommand(name: "表格", alias: "table", detail: "插入表格", action: .format(.table)),
-// 字符样式（Inline Toolbar 证据：bold / italic / underline / strikethrough）
-SlashCommand(name: "加粗", alias: "bold", detail: "加粗选中文本（⌘B）", action: .format(.bold)),
-SlashCommand(name: "斜体", alias: "italic", detail: "选中文本变斜体（⌘I）", action: .format(.italic)),
-SlashCommand(name: "下划线", alias: "underline", detail: "给选中文本加下划线（⌘U）", action: .format(.underline)),
-SlashCommand(name: "删除线", alias: "strikethrough", detail: "给选中文本加删除线", action: .format(.strikethrough)),
-        SlashCommand(name: "自定义", alias: "custom", detail: "填入提示词再编辑", action: .fill("")),
-        SlashCommand(name: "清空上下文", alias: "clear", detail: "清除抓取的笔记选中内容", action: .clearContext),
-        SlashCommand(name: "新会话", alias: "new", detail: "清空对话历史与结果", action: .newSession),
-        SlashCommand(name: "插入笔记", alias: "insert", detail: "把当前结果插入 Notes 光标处", action: .insertOutput),
-        SlashCommand(name: "存为新笔记", alias: "savenote", detail: "把当前结果保存为新笔记", action: .saveAsNote),
-        SlashCommand(name: "停止", alias: "stop", detail: "停止当前生成", action: .stopGeneration),
-        SlashCommand(name: "设置", alias: "set", detail: "打开设置", action: .openSettings),
+        SlashCommand(name: "标题样式", titleKey: "Title Style", alias: "title",
+                     detail: L10n.text("Format the paragraph as a title (/h1)"), action: .format(.title)),
+        SlashCommand(name: "标题样式2", titleKey: "Title Style", alias: "h1",
+                     detail: L10n.text("Same as /title"), action: .format(.title)),
+        SlashCommand(name: "小标题样式", titleKey: "Heading Style", alias: "heading",
+                     detail: L10n.text("Format the paragraph as a heading (/h2)"), action: .format(.heading)),
+        SlashCommand(name: "小标题样式2", titleKey: "Heading Style", alias: "h2",
+                     detail: L10n.text("Same as /heading"), action: .format(.heading)),
+        SlashCommand(name: "子标题样式", titleKey: "Subheading Style", alias: "subheading",
+                     detail: L10n.text("Format the paragraph as a subheading (/h3)"), action: .format(.subheading)),
+        SlashCommand(name: "子标题样式2", titleKey: "Subheading Style", alias: "h3",
+                     detail: L10n.text("Same as /subheading"), action: .format(.subheading)),
+        SlashCommand(name: "正文样式", titleKey: "Body Style", alias: "body",
+                     detail: L10n.text("Format the paragraph as body text"), action: .format(.body)),
+        SlashCommand(name: "等宽块", titleKey: "Monospaced Block", alias: "monostyled",
+                     detail: L10n.text("Format the paragraph as monospaced text (/code)"), action: .format(.monostyled)),
+        SlashCommand(name: "等宽块2", titleKey: "Monospaced Block", alias: "code",
+                     detail: L10n.text("Same as /monostyled"), action: .format(.monostyled)),
+        SlashCommand(name: "检查项", titleKey: "Checklist", alias: "checklist",
+                     detail: L10n.text("Convert to a checklist"), action: .format(.checklist)),
+        SlashCommand(name: "项目符号列表", titleKey: "Bulleted List", alias: "bulletedlist",
+                     detail: L10n.text("Convert to a bulleted list"), action: .format(.bulletedList)),
+        SlashCommand(name: "虚线列表", titleKey: "Dashed List", alias: "dashedlist",
+                     detail: L10n.text("Convert to a dashed list"), action: .format(.dashedList)),
+        SlashCommand(name: "编号列表", titleKey: "Numbered List", alias: "numberedlist",
+                     detail: L10n.text("Convert to a numbered list"), action: .format(.numberedList)),
+        SlashCommand(name: "引用块", titleKey: "Block Quote", alias: "quote",
+                     detail: L10n.text("Convert to a block quote (/blockquote)"), action: .format(.blockQuote)),
+        SlashCommand(name: "引用块2", titleKey: "Block Quote", alias: "blockquote",
+                     detail: L10n.text("Same as /quote"), action: .format(.blockQuote)),
+        SlashCommand(name: "表格", titleKey: "Table", alias: "table",
+                     detail: L10n.text("Insert a table"), action: .format(.table)),
+        SlashCommand(name: "加粗", titleKey: "Bold", alias: "bold",
+                     detail: L10n.text("Bold the selected text (⌘B)"), action: .format(.bold)),
+        SlashCommand(name: "斜体", titleKey: "Italic", alias: "italic",
+                     detail: L10n.text("Italicize the selected text (⌘I)"), action: .format(.italic)),
+        SlashCommand(name: "下划线", titleKey: "Underline", alias: "underline",
+                     detail: L10n.text("Underline the selected text (⌘U)"), action: .format(.underline)),
+        SlashCommand(name: "删除线", titleKey: "Strikethrough", alias: "strikethrough",
+                     detail: L10n.text("Strike through the selected text"), action: .format(.strikethrough)),
+        SlashCommand(name: "自定义", titleKey: "Custom Prompt", alias: "custom",
+                     detail: L10n.text("Enter a prompt to edit"), action: .fill("")),
+        SlashCommand(name: "清空上下文", titleKey: "Clear Context", alias: "clear",
+                     detail: L10n.text("Clear the captured note selection"), action: .clearContext),
+        SlashCommand(name: "新会话", titleKey: "New Chat", alias: "new",
+                     detail: L10n.text("Clear the chat history and result"), action: .newSession),
+        SlashCommand(name: "插入笔记", titleKey: "Insert into Note", alias: "insert",
+                     detail: L10n.text("Insert the current result at the Notes cursor"), action: .insertOutput),
+        SlashCommand(name: "存为新笔记", titleKey: "Save as New Note", alias: "savenote",
+                     detail: L10n.text("Save the current result as a new note"), action: .saveAsNote),
+        SlashCommand(name: "停止", titleKey: "Stop", alias: "stop",
+                     detail: L10n.text("Stop generating the current result"), action: .stopGeneration),
+        SlashCommand(name: "设置", titleKey: "Settings", alias: "set",
+                     detail: L10n.text("Open Settings"), action: .openSettings),
     ]
     // 用户自定义 AI 命令：与内置 /polish 等同级，可直接输入中文名或英文别名。
     let allCustomCommands = CustomAICommandStore.commands
@@ -314,23 +380,30 @@ SlashCommand(name: "删除线", alias: "strikethrough", detail: "给选中文本
               !cmds.contains(where: { $0.name.caseInsensitiveCompare(name) == .orderedSame
                                       || $0.alias.caseInsensitiveCompare(name.lowercased().alnum()) == .orderedSame })
         else { continue }
-        cmds.append(SlashCommand(name: name,
-                                  alias: name.lowercased().alnum(),
-                                  detail: "自定义 AI · \(prompt.replacingOccurrences(of: "\n", with: " ").prefix(48))",
-                                  action: .run(.text(prompt))))
+        let preview = String(prompt.replacingOccurrences(of: "\n", with: " ").prefix(48))
+        cmds.append(SlashCommand(name: name, alias: name.lowercased().alnum(),
+                                 detail: L10n.format("Custom AI · %@", preview),
+                                 action: .run(.text(prompt))))
     }
     // 用户模板（ProNotes：模板经斜杠命令插入；NotesCopilot：变量引擎展开后插入）
     for t in TemplateStore.availableTemplates {
         let safe = t.commandName
         guard !safe.isEmpty else { continue }
-        let vars = TemplateEngine.specs(in: t.content)
-        let varSummary = vars.isEmpty ? "" : " · " + vars.map { "\($0.kind.badge)" }.joined(separator: "/")
-        cmds.append(SlashCommand(name: safe,
-                                  alias: safe.lowercased().alnum(),
-                                  detail: "\(t.isFromNotes ? "Notes 模板" : (t.isBuiltin ? "内置模板" : "插入模板"))\(varSummary)\(t.isBuiltin ? "" : "：\(t.content.replacingOccurrences(of: "\n", with: " ").prefix(24))" )",
-                                  action: .insertTemplate(t)))
+        let variables = TemplateEngine.specs(in: t.content)
+        let preview = String(t.content.replacingOccurrences(of: "\n", with: " ").prefix(24))
+        cmds.append(SlashCommand(name: safe, alias: safe.lowercased().alnum(),
+                                 detail: slashTemplateDetail(t, variables: variables, preview: preview),
+                                 action: .insertTemplate(t)))
     }
     return cmds
+}
+
+private func slashTemplateDetail(_ template: TemplateNote, variables: [TemplateVarSpec], preview: String) -> String {
+    let title = template.isFromNotes ? L10n.text("Notes Template")
+        : template.isBuiltin ? L10n.text("Built-in Template")
+        : L10n.text("Insert Template")
+    let summary = variables.isEmpty ? "" : " · " + variables.map(\.kind.badge).joined(separator: "/")
+    return title + summary + (template.isBuiltin ? "" : L10n.format(": %@", preview))
 }
 
 func buildSlashCommands() -> [SlashCommand] { SlashCommandCache.commands() }
@@ -385,6 +458,25 @@ enum KeywordStore {
 
 final class KeywordListener {
     static let shared = KeywordListener()
+    enum Status {
+        case disabled, running, waitingForAccessibility, unavailable
+
+        var message: String {
+            switch self {
+            case .disabled:
+                return L10n.text("Keyboard navigation and keyword expansion are off.")
+            case .running:
+                return L10n.text("Keyboard navigation and keyword expansion are active.")
+            case .waitingForAccessibility:
+                return L10n.text(
+                    "Allow NotesCopilot in System Settings › Privacy & Security › Accessibility to enable keyboard navigation and keyword expansion. The app will retry automatically.")
+            case .unavailable:
+                return L10n.text(
+                    "Keyboard navigation and keyword expansion are temporarily unavailable. The app will retry automatically.")
+            }
+        }
+    }
+
     private let accessibilityTrusted: () -> Bool
     private let tapFactory: (CGEventTapOptions) -> CFMachPort?
 
@@ -435,7 +527,7 @@ final class KeywordListener {
             NCLog.log("startIfNeeded 跳过：选区快捷键、关键词与斜杠均关闭")
             NotificationCenter.default.post(
                 name: .init("nc.kwStatus"),
-                object: "菜单键盘导航与关键词扩展已关闭。")
+                object: Status.disabled)
             return
         }
         // defaultTap 会拦截/修改事件，需要辅助功能；输入监控预检不能阻止此主动 tap。
@@ -467,7 +559,7 @@ final class KeywordListener {
         NCLog.log("菜单键盘导航与关键词监听已启动（主动 tap 已启用）")
         NotificationCenter.default.post(
             name: .init("nc.kwStatus"),
-            object: "菜单键盘导航与关键词监听已启动。")
+            object: Status.running)
     }
 
     private static func createTap(options: CGEventTapOptions) -> CFMachPort? {
@@ -505,7 +597,7 @@ final class KeywordListener {
     private func waitForAccessibility() {
         NotificationCenter.default.post(
             name: .init("nc.kwStatus"),
-            object: "菜单键盘导航与关键词扩展等待「辅助功能」授权：请在「系统设置 › 隐私与安全性 › 辅助功能」中允许 NotesCopilot，授权后自动重试。")
+            object: Status.waitingForAccessibility)
         schedulePermissionRetry()
     }
 
@@ -513,7 +605,7 @@ final class KeywordListener {
         NCLog.log("菜单键盘导航与关键词监听创建或启用失败（当前会话 tap 不可用）")
         NotificationCenter.default.post(
             name: .init("nc.kwStatus"),
-            object: "菜单键盘导航与关键词扩展暂不可用：当前会话无法创建键盘监听，已安排自动重试。")
+            object: Status.unavailable)
         schedulePermissionRetry()
     }
 

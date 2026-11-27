@@ -3,6 +3,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 OUT="$(mktemp -d)"
 trap 'rm -rf "$OUT"' EXIT
+cp -R resources/. "$OUT/"
 MODULE_CACHE="${TMPDIR:-/private/tmp}/notescopilot-swift-module-cache"
 mkdir -p "$MODULE_CACHE"
 SOURCES=()

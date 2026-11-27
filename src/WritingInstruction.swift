@@ -5,7 +5,9 @@ enum WritingInstruction: Equatable, ExpressibleByStringLiteral {
     case text(String)
     case translate
 
-    static let translationHint = "中文译成英文，其他语言译成中文"
+    static var translationHint: String {
+        L10n.text("Translate Chinese into English and other languages into Chinese")
+    }
 
     init(stringLiteral value: String) { self = .text(value) }
 

@@ -5,6 +5,7 @@ import UniformTypeIdentifiers
 // MARK: - 笔记库窗口（对应 ProNotes 的笔记列表 / FTS 搜索 / Hashtag 标签页 / Backlinks 反链 / 复制 Markdown）
 
 struct LibraryView: View {
+    @ObservedObject private var localization = L10n.shared
     @State private var notesList: [NoteSummary] = []
     @State private var foldersList: [(pk: Int64, name: String)] = []
     @State private var tags: [String] = []
@@ -15,7 +16,7 @@ struct LibraryView: View {
     @State private var selectedNote: NoteSummary?
     @State private var selection = LibrarySelectionState()
     @State private var backlinksList: [NoteSummary] = []
-    @State private var storeError: String?
+    @State private var storeUnavailable = false
     @State private var busy = false
     @State private var sortOrder: SearchSort = .updatedDescending
     @State private var selectedFolder: Int64?
@@ -28,6 +29,14 @@ struct LibraryView: View {
         selectedNote != nil && selectedNote?.pk == selection.selectedID
             && selection.content != nil && !selection.isLoading
     }
+    private var storeError: String? {
+        guard storeUnavailable else { return nil }
+        let delegate = NSApp.delegate as? AppDelegate
+        if delegate?.notesStoreLoading == true {
+            return L10n.text("Connecting to the notes library and building the search index…")
+        }
+        return delegate?.notesStoreError ?? L10n.text("Could not read the notes library. Grant Full Disk Access and reconnect.")
+    }
 
     var body: some View {
         HStack(spacing: 0) {
@@ -38,22 +47,23 @@ struct LibraryView: View {
             detail
         }
         .frame(minWidth: 880, minHeight: 560)
+        .environment(\.locale, localization.locale)
         .toolbar {
             ToolbarItem {
                 Button {
                     reload()
-                } label: { Label("刷新", systemImage: "arrow.clockwise") }
+                } label: { Label(L10n.text("Refresh"), systemImage: "arrow.clockwise") }
             }
             ToolbarItem {
                 Button {
                     copyMarkdown()
-                } label: { Label("复制 Markdown", systemImage: "doc.on.doc") }
+                } label: { Label(L10n.text("Copy Markdown"), systemImage: "doc.on.doc") }
                 .disabled(!canUseContent)
             }
             ToolbarItem {
                 Button {
                     exportMarkdown()
-                } label: { Label("导出 .md 文件", systemImage: "square.and.arrow.up") }
+                } label: { Label(L10n.text("Export .md File"), systemImage: "square.and.arrow.up") }
                 .disabled(!canUseContent)
             }
         }
@@ -71,8 +81,8 @@ struct LibraryView: View {
         .onReceive(NotificationCenter.default.publisher(for: .init("nc.storeDidReindex"))) { _ in
             reload()
         }
-        .alert("导出失败", isPresented: Binding(get: { exportError != nil }, set: { if !$0 { exportError = nil } })) {
-            Button("好", role: .cancel) { exportError = nil }
+        .alert(L10n.text("Export Failed"), isPresented: Binding(get: { exportError != nil }, set: { if !$0 { exportError = nil } })) {
+            Button(L10n.text("OK"), role: .cancel) { exportError = nil }
         } message: { Text(exportError ?? "") }
     }
 
@@ -80,7 +90,7 @@ struct LibraryView: View {
 
     private var sidebar: some View {
         VStack(alignment: .leading, spacing: 4) {
-            Label("文件夹", systemImage: "folder")
+            Label(L10n.text("Folders"), systemImage: "folder")
                 .font(.caption.bold()).foregroundStyle(.secondary)
                 .padding(.horizontal, 10).padding(.top, 8)
             Button {
@@ -88,7 +98,7 @@ struct LibraryView: View {
                 selectedFolder = nil; selectedTag = nil
                 reload()
             } label: {
-                Label("全部笔记", systemImage: "tray.full").frame(maxWidth: .infinity, alignment: .leading)
+                Label(L10n.text("All Notes"), systemImage: "tray.full").frame(maxWidth: .infinity, alignment: .leading)
             }
             .buttonStyle(.borderless).padding(.horizontal, 6)
             ScrollView {
@@ -108,13 +118,13 @@ struct LibraryView: View {
                 .padding(.horizontal, 6)
             }
             Divider().padding(.vertical, 4)
-            Label("Hashtag 标签", systemImage: "number")
+            Label(L10n.text("Tags"), systemImage: "number")
                 .font(.caption.bold()).foregroundStyle(.secondary)
                 .padding(.horizontal, 10)
             ScrollView {
                 VStack(alignment: .leading, spacing: 2) {
                     if tags.isEmpty {
-                        Text("暂无标签").font(.caption2).foregroundColor(.secondary)
+                        Text(L10n.text("No tags")).font(.caption2).foregroundColor(.secondary)
                             .padding(.horizontal, 10)
                     }
                     ForEach(tags, id: \.self) { t in
@@ -140,54 +150,7 @@ struct LibraryView: View {
 
     private var noteList: some View {
         VStack(spacing: 0) {
-            HStack {
-                Image(systemName: "magnifyingglass").foregroundColor(.secondary)
-                TextField("搜索标题和正文", text: $searchText)
-                    .textFieldStyle(.roundedBorder)
-                    .onSubmit { rememberSearch(); reload() }
-                if !searchText.isEmpty {
-                    Button {
-                        searchText = ""
-                        reload()
-                    } label: {
-                        Image(systemName: "xmark.circle.fill").foregroundColor(.secondary)
-                    }
-                    .buttonStyle(.plain)
-                    .help("清空搜索")
-                }
-                Button("搜") { rememberSearch(); reload() }
-                    .disabled(searchText.trimmingCharacters(in: .whitespaces).isEmpty)
-                if !recentSearches.isEmpty {
-                    Menu {
-                        ForEach(recentSearches, id: \.self) { query in
-                            Button(query) {
-                                searchText = query
-                                rememberSearch(query)
-                                reload()
-                            }
-                        }
-                        Button("清空最近搜索") {
-                            recentSearches = []
-                            UserDefaults.standard.set([String](), forKey: "nc.library.recentSearches")
-                        }
-                    } label: {
-                        Label("最近", systemImage: "clock.arrow.circlepath")
-                    }
-                    .fixedSize()
-                }
-                // 排序菜单（证据：updatedDescending / updatedAscending / createdDescending / createdAscending）
-                Menu {
-                    ForEach(SearchSort.allCases, id: \.self) { s in
-                        Button(s.label) { sortOrder = s; reload() }
-                    }
-                } label: {
-                    Label(sortOrder.label, systemImage: "arrow.up.arrow.down")
-                        .labelStyle(.titleAndIcon).controlSize(.small)
-                }
-                .fixedSize()
-                if busy { ProgressView().controlSize(.small) }
-            }
-            .padding(8)
+            searchControls
             Divider()
             List(selection: Binding<Int64?>(get: { selection.selectedID }, set: { id in
                 select(id.flatMap { value in notesList.first { $0.pk == value } })
@@ -203,7 +166,7 @@ struct LibraryView: View {
                 if !busy && notesList.isEmpty && storeError == nil {
                     VStack(spacing: 8) {
                         Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
-                        Text("没有符合条件的笔记").font(.caption).foregroundStyle(.secondary)
+                        Text(L10n.text("No matching notes")).font(.caption).foregroundStyle(.secondary)
                     }
                 }
             }
@@ -211,22 +174,77 @@ struct LibraryView: View {
                 VStack(alignment: .leading, spacing: 8) {
                     Text(err).font(.caption).foregroundColor(.orange)
                     if (NSApp.delegate as? AppDelegate)?.notesStoreLoading != true {
-                        Button("打开完全磁盘访问设置") {
+                        Button(L10n.text("Open Full Disk Access Settings")) {
                             if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles") {
                                 NSWorkspace.shared.open(url)
                             }
                         }
-                        Button("重新连接笔记库") {
+                        Button(L10n.text("Reconnect Notes Library")) {
                             NSApp.sendAction(#selector(AppDelegate.retryNotesStore), to: nil, from: nil)
                         }
                     }
                 }.padding(8)
             } else {
-                Text(busy ? "正在读取笔记…" : "\(notesList.count) 条笔记")
+                Text(busy ? L10n.text("Reading notes…") : noteCount)
                     .font(.caption2).foregroundColor(.secondary).padding(4)
             }
         }
         .frame(width: 280)
+    }
+
+    private var searchControls: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Image(systemName: "magnifyingglass").foregroundColor(.secondary)
+                TextField(L10n.text("Search notes"), text: $searchText)
+                    .textFieldStyle(.roundedBorder)
+                    .accessibilityLabel(L10n.text("Search note titles and contents"))
+                    .onSubmit { rememberSearch(); reload() }
+                if !searchText.isEmpty {
+                    Button {
+                        searchText = ""
+                        reload()
+                    } label: {
+                        Image(systemName: "xmark.circle.fill").foregroundColor(.secondary)
+                    }
+                    .buttonStyle(.plain)
+                    .help(L10n.text("Clear Search"))
+                }
+                Button(L10n.text("Search")) { rememberSearch(); reload() }
+                    .disabled(searchText.trimmingCharacters(in: .whitespaces).isEmpty)
+                if busy { ProgressView().controlSize(.small) }
+            }
+            HStack {
+                if !recentSearches.isEmpty {
+                    Menu {
+                        ForEach(recentSearches, id: \.self) { query in
+                            Button(query) {
+                                searchText = query
+                                rememberSearch(query)
+                                reload()
+                            }
+                        }
+                        Button(L10n.text("Clear Recent Searches")) {
+                            recentSearches = []
+                            UserDefaults.standard.set([String](), forKey: "nc.library.recentSearches")
+                        }
+                    } label: {
+                        Label(L10n.text("Recent"), systemImage: "clock.arrow.circlepath")
+                    }
+                    .fixedSize()
+                }
+                Menu {
+                    ForEach(SearchSort.allCases, id: \.self) { sort in
+                        Button(sort.label) { sortOrder = sort; reload() }
+                    }
+                } label: {
+                    Label(sortOrder.label, systemImage: "arrow.up.arrow.down").labelStyle(.titleAndIcon)
+                }
+                .fixedSize()
+            }
+            .controlSize(.small)
+        }
+        .padding(8)
     }
 
     // MARK: 右栏：正文 + 反链
@@ -236,8 +254,8 @@ struct LibraryView: View {
             if let note = selectedNote {
                 HStack {
                     VStack(alignment: .leading, spacing: 2) {
-                        Text(note.title).font(.title3.bold()).lineLimit(2)
-                        Text([note.folder, note.modified.map { Self.df.string(from: $0) } ?? ""]
+                        Text(note.displayTitle).font(.title3.bold()).lineLimit(2)
+                        Text([note.folder, note.modified.map { dateFormat.format($0) } ?? ""]
                             .filter { !$0.isEmpty }.joined(separator: " · "))
                             .font(.caption).foregroundColor(.secondary)
                     }
@@ -249,13 +267,13 @@ struct LibraryView: View {
                             NSApp.sendAction(#selector(AppDelegate.openPanelWithNote(_:)), to: nil,
                                              from: NoteAIContext(note: note, content: content))
                         } label: {
-                            Label("问 AI", systemImage: "sparkles")
+                            Label(L10n.text("Ask AI"), systemImage: "sparkles")
                         }
                         .disabled(!canUseContent || selection.content?.isComplete != true)
                         Button {
                             copyMarkdown()
                         } label: {
-                            Label("复制 MD", systemImage: "doc.on.doc")
+                            Label(L10n.text("Copy MD"), systemImage: "doc.on.doc")
                         }
                         .disabled(!canUseContent)
                         // 复制 deeplink（对应 ProNotes 的 CopyDeeplinkButton / copySelectedNoteLink）
@@ -264,7 +282,7 @@ struct LibraryView: View {
                             pb.clearContents()
                             pb.setString(NotesBridge.deeplink(forNoteID: note.uuid), forType: .string)
                         } label: {
-                            Label("复制链接", systemImage: "link")
+                            Label(L10n.text("Copy Link"), systemImage: "link")
                         }
                     }
                     .controlSize(.small)
@@ -272,16 +290,16 @@ struct LibraryView: View {
                 .padding(12)
                 Divider()
                 if selection.isLoading {
-                    ProgressView("正在读取正文…").padding(12)
+                    ProgressView(L10n.text("Reading note…")).padding(12)
                 }
                 if let warning = selection.content?.warning {
                     Label(warning, systemImage: "exclamationmark.triangle")
                         .font(.caption).foregroundStyle(.orange).padding(12)
                 }
                 HStack {
-                    Picker("正文格式", selection: $showMarkdownPreview) {
+                    Picker(L10n.text("Format"), selection: $showMarkdownPreview) {
                         Text("Markdown").tag(false)
-                        Text("预览").tag(true)
+                        Text(L10n.text("Preview")).tag(true)
                     }
                     .pickerStyle(.segmented)
                     .frame(width: 180)
@@ -304,12 +322,12 @@ struct LibraryView: View {
                 if !backlinksList.isEmpty {
                     Divider()
                     VStack(alignment: .leading, spacing: 4) {
-                        Label("Backlinks 反链（\(backlinksList.count)）", systemImage: "link")
+                        Label(L10n.format("Backlinks (%lld)", Int64(backlinksList.count)), systemImage: "link")
                             .font(.caption.bold()).foregroundStyle(.secondary)
                         ScrollView(.horizontal, showsIndicators: false) {
                             HStack {
                                 ForEach(backlinksList) { b in
-                                    Button(b.title.isEmpty ? "无标题" : b.title) {
+                                    Button(b.displayTitle) {
                                         select(b)
                                     }
                                     .buttonStyle(.bordered)
@@ -325,7 +343,7 @@ struct LibraryView: View {
                 VStack(spacing: 8) {
                     Image(systemName: "sidebar.squares.right")
                         .font(.system(size: 36)).foregroundColor(.secondary)
-                    Text("选择笔记查看正文")
+                    Text(L10n.text("Select a note to view its contents"))
                         .foregroundColor(.secondary)
                 }
                 Spacer()
@@ -336,12 +354,13 @@ struct LibraryView: View {
 
     // MARK: 逻辑
 
-    private static let df: DateFormatter = {
-        let f = DateFormatter()
-        f.dateStyle = .medium
-        f.timeStyle = .short
-        return f
-    }()
+    private var dateFormat: Date.FormatStyle {
+        Date.FormatStyle(date: .abbreviated, time: .shortened, locale: localization.locale)
+    }
+
+    private var noteCount: String {
+        L10n.format(notesList.count == 1 ? "%lld note" : "%lld notes", Int64(notesList.count))
+    }
 
     private var store: NotesStore? {
         (NSApp.delegate as? AppDelegate)?.notesStore
@@ -360,7 +379,7 @@ struct LibraryView: View {
         let requestID = UUID()
         listRequestID = requestID
         busy = true
-        storeError = nil
+        storeUnavailable = false
         // 后台线程读库，主线程更新
         let storeRef = store
         let query = LibraryQuery(searchText: searchText, folderPK: selectedFolder,
@@ -369,9 +388,7 @@ struct LibraryView: View {
             guard let storeRef else {
                 DispatchQueue.main.async {
                     guard listRequestID == requestID else { return }
-                    let delegate = NSApp.delegate as? AppDelegate
-                    storeError = delegate?.notesStoreLoading == true ? "正在连接笔记库并建立全文索引…"
-                        : (delegate?.notesStoreError ?? "无法读取笔记库。请授权完全磁盘访问后重新连接。")
+                    storeUnavailable = true
                     busy = false
                 }
                 return
@@ -433,7 +450,7 @@ struct NoteRow: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 2) {
-            Self.highlighted(note.title, query: query).font(.callout.weight(.medium)).lineLimit(1)
+            Self.highlighted(note.displayTitle, query: query).font(.callout.weight(.medium)).lineLimit(1)
             Self.highlighted(note.snippet.replacingOccurrences(of: "\u{FFFC}", with: ""), query: query)
                 .font(.caption).foregroundColor(.secondary).lineLimit(1)
         }

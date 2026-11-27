@@ -85,14 +85,14 @@ final class AppUpdater: ObservableObject {
     static let checkInterval: TimeInterval = 24 * 60 * 60
 
     enum Status: Equatable {
-        case idle, checking, current, available, failed(String)
+        case idle, checking, current, available, failed(UpdateError)
     }
 
     enum DownloadState: Equatable {
         case idle
         case downloading(Double?)
         case completed(URL)
-        case failed(String)
+        case failed(UpdateError)
         case cancelled
     }
 
@@ -142,11 +142,12 @@ final class AppUpdater: ObservableObject {
 
     var statusMessage: String {
         switch status {
-        case .idle: return "尚未检查更新。"
-        case .checking: return "正在检查更新…"
-        case .current: return "当前已是最新版本（v\(currentVersion)）。"
-        case .available: return "发现新版本 v\(availableRelease?.version ?? "")，建议更新。"
-        case .failed(let message): return message
+        case .idle: return L10n.text("No update check yet.")
+        case .checking: return L10n.text("Checking for updates…")
+        case .current: return L10n.format("You're up to date (v%@).", currentVersion)
+        case .available:
+            return L10n.format("An update is available (v%@).", availableRelease?.version ?? "")
+        case .failed(let error): return error.message
         }
     }
 
@@ -156,14 +157,15 @@ final class AppUpdater: ObservableObject {
             return ""
         case .downloading(let progress):
             let percent = progress.map { Int((max(0, min(1, $0)) * 100).rounded()) }
-            let progressText = percent.map { "（\($0)%）" } ?? ""
-            return "正在下载 v\(availableRelease?.version ?? "")\(progressText)，完成后会在 Finder 中显示。"
+            let progressText = percent.map { L10n.format(" (%lld%%)", $0) } ?? ""
+            return L10n.format("Downloading v%@%@. The download will appear in Finder when complete.",
+                               availableRelease?.version ?? "", progressText)
         case .completed(let url):
-            return "已下载：\(url.path)"
-        case .failed(let message):
-            return message
+            return L10n.format("Downloaded: %@", url.path)
+        case .failed(let error):
+            return error.message
         case .cancelled:
-            return "已取消下载，可稍后重新下载。"
+            return L10n.text("Download canceled. You can try again later.")
         }
     }
 
@@ -182,7 +184,7 @@ final class AppUpdater: ObservableObject {
         defaults.set(now(), forKey: "nc.update.lastAttempt")
         do {
             guard let local = ReleaseVersion(currentVersion) else {
-                throw UpdateError("无法读取当前版本，请前往发布页查看更新。")
+                throw UpdateError.unknownVersion
             }
             var request = URLRequest(url: Self.endpoint, cachePolicy: .reloadIgnoringLocalCacheData,
                                      timeoutInterval: 20)
@@ -191,18 +193,18 @@ final class AppUpdater: ObservableObject {
             request.setValue("NotesCopilot/\(currentVersion)", forHTTPHeaderField: "User-Agent")
             let (data, response) = try await session.data(for: request)
             guard let http = response as? HTTPURLResponse else {
-                throw UpdateError("更新服务响应无效，请稍后重试。")
+                throw UpdateError.invalidResponse
             }
             guard http.statusCode == 200 else {
                 switch http.statusCode {
-                case 403, 429: throw UpdateError("更新服务暂时限制请求，请稍后重试或前往发布页。")
-                case 404: throw UpdateError("暂未找到可用发布版本，请稍后重试或前往发布页。")
-                default: throw UpdateError("检查更新失败（HTTP \(http.statusCode)），请稍后重试。")
+                case 403, 429: throw UpdateError.rateLimited
+                case 404: throw UpdateError.noRelease
+                default: throw UpdateError.checkHTTP(http.statusCode)
                 }
             }
             let release = try JSONDecoder().decode(GitHubRelease.self, from: data)
             guard !release.draft, !release.prerelease, let remote = ReleaseVersion(release.tag_name) else {
-                throw UpdateError("更新服务未返回有效的正式版本，请前往发布页查看。")
+                throw UpdateError.invalidRelease
             }
             let version = String(release.tag_name.dropFirst(release.tag_name.hasPrefix("v") ? 1 : 0))
             let fileName = "NotesCopilot-\(version)-arm64.dmg"
@@ -226,8 +228,7 @@ final class AppUpdater: ObservableObject {
             defaults.set(lastChecked, forKey: "nc.update.lastChecked")
             status = availableRelease == nil ? .current : .available
         } catch {
-            let message = (error as? UpdateError)?.message ?? "无法检查更新，请检查网络后重试，或前往发布页查看。"
-            status = .failed(message)
+            status = .failed(error as? UpdateError ?? .checkConnection)
         }
         let showResult = userRequestedResult
         userRequestedResult = false
@@ -241,7 +242,7 @@ final class AppUpdater: ObservableObject {
 
     func download() async -> URL? {
         guard let release = availableRelease else {
-            downloadState = .failed("尚未发现可下载的新版本，请先检查更新。")
+            downloadState = .failed(.noDownload)
             return nil
         }
         guard !isDownloading else { return nil }
@@ -252,7 +253,7 @@ final class AppUpdater: ObservableObject {
             .appendingPathComponent(".\(release.fileName)-\(UUID().uuidString).part")
         do {
             guard let expectedDigest = try await fetchExpectedChecksum(for: release) else {
-                throw UpdateError("发布包缺少 SHA-256 校验信息，已停止下载。请前往发布页确认。")
+                throw UpdateError.missingChecksum
             }
             try FileManager.default.createDirectory(at: downloadDirectory, withIntermediateDirectories: true)
             FileManager.default.createFile(atPath: temporaryURL.path, contents: nil)
@@ -262,7 +263,7 @@ final class AppUpdater: ObservableObject {
             let (bytes, response) = try await session.bytes(for: request)
             guard let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode) else {
                 let code = (response as? HTTPURLResponse)?.statusCode ?? -1
-                throw UpdateError("下载新版本失败（HTTP \(code)），请稍后重试。")
+                throw UpdateError.downloadHTTP(code)
             }
 
             let handle = try FileHandle(forWritingTo: temporaryURL)
@@ -299,7 +300,7 @@ final class AppUpdater: ObservableObject {
             let actualDigest = SHA256.hash(data: try Data(contentsOf: temporaryURL))
                 .map { String(format: "%02x", $0) }.joined()
             guard actualDigest.caseInsensitiveCompare(expectedDigest) == .orderedSame else {
-                throw UpdateError("下载文件校验失败，已删除不完整的 DMG。请重试或前往发布页。")
+                throw UpdateError.checksumMismatch
             }
 
             let destination = downloadDirectory.appendingPathComponent(release.fileName)
@@ -314,9 +315,7 @@ final class AppUpdater: ObservableObject {
             if error is CancellationError || downloadCancellationRequested {
                 downloadState = .cancelled
             } else {
-                let message = (error as? UpdateError)?.message
-                    ?? "无法下载新版本，请检查网络后重试。"
-                downloadState = .failed(message)
+                downloadState = .failed(error as? UpdateError ?? .downloadConnection)
             }
             return nil
         }
@@ -383,8 +382,38 @@ final class AppUpdater: ObservableObject {
         let assets: [ReleaseAsset]?
     }
 
-    private struct UpdateError: Error {
-        let message: String
-        init(_ message: String) { self.message = message }
+    enum UpdateError: Error, Equatable {
+        case unknownVersion, invalidResponse, rateLimited, noRelease, invalidRelease, checkConnection
+        case noDownload, missingChecksum, checksumMismatch, downloadConnection
+        case checkHTTP(Int), downloadHTTP(Int)
+
+        var message: String {
+            switch self {
+            case .unknownVersion:
+                return L10n.text("Couldn't read the installed version. Check the releases page for updates.")
+            case .invalidResponse:
+                return L10n.text("The update service returned an invalid response. Try again later.")
+            case .rateLimited:
+                return L10n.text("The update service is rate limiting requests. Try again later or visit the releases page.")
+            case .noRelease:
+                return L10n.text("No release is available. Try again later or visit the releases page.")
+            case .invalidRelease:
+                return L10n.text("The update service returned no valid stable release. Visit the releases page.")
+            case .checkConnection:
+                return L10n.text("Couldn't check for updates. Check your connection and try again, or visit the releases page.")
+            case .noDownload:
+                return L10n.text("No update is ready to download. Check for updates first.")
+            case .missingChecksum:
+                return L10n.text("The download was stopped because the release is missing a SHA-256 checksum. Check the releases page.")
+            case .checksumMismatch:
+                return L10n.text("The download failed verification and the incomplete DMG was deleted. Try again or visit the releases page.")
+            case .downloadConnection:
+                return L10n.text("Couldn't download the update. Check your connection and try again.")
+            case .checkHTTP(let code):
+                return L10n.format("Couldn't check for updates (HTTP %lld). Try again later.", code)
+            case .downloadHTTP(let code):
+                return L10n.format("Couldn't download the update (HTTP %lld). Try again later.", code)
+            }
+        }
     }
 }

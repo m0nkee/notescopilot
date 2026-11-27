@@ -434,7 +434,7 @@ var state = LibrarySelectionState()
 let requestA = state.begin(noteID: 1)!
 check("开始加载立即清除旧正文并进入loading", state.isLoading && state.content == nil)
 let requestB = state.begin(noteID: 2)!
-let content = NoteContent(markdown: "B", plainText: "B", warning: nil, isComplete: true)
+let content = NoteContent(markdown: "B", plainText: "B", isComplete: true)
 check("旧请求不能覆盖新笔记", !state.complete(content, noteID: 1, requestID: requestA) && state.content == nil)
 check("新请求可以提交正文", state.complete(content, noteID: 2, requestID: requestB)
       && state.content?.markdown == "B" && !state.isLoading)

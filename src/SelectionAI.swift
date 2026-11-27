@@ -5,21 +5,34 @@ import SwiftUI
 // MARK: 快捷动作定义
 
 struct SelectionQuickAction: Equatable {
-    enum Group: String, CaseIterable { case edit = "编辑", read = "阅读" }
+    enum Group: CaseIterable {
+        case edit, read
+
+        var title: String {
+            switch self {
+            case .edit: return L10n.text("Edit")
+            case .read: return L10n.text("Read")
+            }
+        }
+    }
+
     let name: String
+    let titleKey: String
     let group: Group
     let shortcut: String?
     let instruction: WritingInstruction
+
+    var displayName: String { L10n.text(titleKey) }
 }
 
 /// 快捷加工清单：指令要求「只输出加工后的文本」，保证替换动作可直接落笔
 let selectionQuickActions: [SelectionQuickAction] = [
-    .init(name: "校对", group: .edit, shortcut: "p", instruction: "请只修正错别字、语法和标点，保留原意、段落与语气。输出完整校对稿，无需改动时返回原文。"),
-    .init(name: "润色", group: .edit, shortcut: "r", instruction: "请润色以下文字，使其更通顺、专业，保持原意与格式。只输出润色后的文本，不要解释。"),
-    .init(name: "精简", group: .edit, shortcut: "c", instruction: "请把以下内容压缩得更简洁，保留核心信息。只输出精简后的文本。"),
-    .init(name: "总结", group: .read, shortcut: "s", instruction: "请用简洁的要点总结以下内容的核心信息。只输出总结内容。"),
-    .init(name: "翻译", group: .read, shortcut: "t", instruction: .translate),
-    .init(name: "解释", group: .read, shortcut: "e", instruction: "请简要解释以下内容的关键概念与逻辑。"),
+    .init(name: "校对", titleKey: "Proofread", group: .edit, shortcut: "p", instruction: "请只修正错别字、语法和标点，保留原意、段落与语气。输出完整校对稿，无需改动时返回原文。"),
+    .init(name: "润色", titleKey: "Polish", group: .edit, shortcut: "r", instruction: "请润色以下文字，使其更通顺、专业，保持原意与格式。只输出润色后的文本，不要解释。"),
+    .init(name: "精简", titleKey: "Shorten", group: .edit, shortcut: "c", instruction: "请把以下内容压缩得更简洁，保留核心信息。只输出精简后的文本。"),
+    .init(name: "总结", titleKey: "Summarize", group: .read, shortcut: "s", instruction: "请用简洁的要点总结以下内容的核心信息。只输出总结内容。"),
+    .init(name: "翻译", titleKey: "Translate", group: .read, shortcut: "t", instruction: .translate),
+    .init(name: "解释", titleKey: "Explain", group: .read, shortcut: "e", instruction: "请简要解释以下内容的关键概念与逻辑。"),
 ]
 
 enum SelectionReviewKey: String {
@@ -362,7 +375,7 @@ final class SelectionAIRequest {
                 let text = try await operation(instruction, selection.text)
                 guard let self, !Task.isCancelled, self.requestID == id else { return }
                 guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-                    throw APIError(status: -2, message: "模型返回了空文本，请重试。")
+                    throw APIError(status: -2, message: L10n.text("The model returned no text. Try again."))
                 }
                 self.resultText = text
                 self.generatedText = text
@@ -461,8 +474,8 @@ final class SelectionAIPanel: NSObject, ObservableObject {
     var sourceName: String? {
         switch request.selection {
         case .notes: return "Notes"
-        case .input(let field): return field.host.application.localizedName ?? "输入框"
-        case .service: return "服务选区"
+        case .input(let field): return field.host.application.localizedName ?? L10n.text("Text Field")
+        case .service: return L10n.text("Services Selection")
         case nil: return nil
         }
     }
@@ -530,7 +543,7 @@ final class SelectionAIPanel: NSObject, ObservableObject {
         case .notes:
             guard let snapshot = notes.readSelectionSnapshot(allowInactiveNotes: true),
                   anchor.matches(snapshot.element, snapshot.range) else {
-                status = notes.accessIssue?.message ?? "无法确认这处选区，请回到 Notes 正文重新选择。"
+                status = notes.accessIssue?.message ?? L10n.text("Couldn’t verify this selection. Select the text again in Notes.")
                 present(.unavailable, focus: true)
                 return
             }
@@ -538,14 +551,14 @@ final class SelectionAIPanel: NSObject, ObservableObject {
         case .input:
             guard SelectionScope.allowsGlobalSelection(in: defaults) else { hide(); return }
             guard let field = InputFieldBridge.openSelection(anchor, excerpt: launcherExcerpt) else {
-                status = "无法读取原选区，请回到原应用重新选择文字。"
+                status = L10n.text("Couldn’t read the selection. Select the text again in the original app.")
                 present(.unavailable, focus: true)
                 return
             }
             selection = .input(field)
         }
         guard !selection.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            status = "选区中只有空白，请选择要处理的文字。"
+            status = L10n.text("The selection is blank. Select the text you want to work with.")
             present(.unavailable, focus: true)
             return
         }
@@ -562,7 +575,7 @@ final class SelectionAIPanel: NSObject, ObservableObject {
                                    error: AutoreleasingUnsafeMutablePointer<NSString?>?) {
         guard let text = pasteboard.string(forType: .string),
               !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            error?.pointee = "请先选择要处理的文字。"
+            error?.pointee = L10n.text("Select the text you want to work with first.") as NSString
             return
         }
         error?.pointee = nil
@@ -664,7 +677,7 @@ final class SelectionAIPanel: NSObject, ObservableObject {
 
     private func markStale() {
         staleSelection = true
-        status = "原选区已变化，仍可复制结果。"
+        status = L10n.text("The original selection changed. You can still copy the result.")
     }
 
     func run(_ action: SelectionQuickAction) {
@@ -681,7 +694,7 @@ final class SelectionAIPanel: NSObject, ObservableObject {
     func runCustom() {
         let instruction = customInstruction.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !instruction.isEmpty else { return }
-        run(.init(name: "自定义", group: .edit, shortcut: nil, instruction: .text(instruction)))
+        run(.init(name: "自定义", titleKey: "Custom Prompt", group: .edit, shortcut: nil, instruction: .text(instruction)))
     }
 
     private func performToolKey(_ key: String) -> Bool {
@@ -726,7 +739,9 @@ final class SelectionAIPanel: NSObject, ObservableObject {
     private func requestDidChange() {
         guard !request.busy, request.selection != nil else { return }
         if isInputSession && !SelectionScope.allowsGlobalSelection(in: defaults) { hide(); return }
-        status = request.lastError.map { result.isEmpty ? $0 : "已保留上次结果。 " + $0 } ?? ""
+        status = request.lastError.map {
+            result.isEmpty ? $0 : L10n.format("The previous result is still available. %@", $0)
+        } ?? ""
         if hasReplacementTarget && !result.isEmpty && request.lastError == nil {
             switch request.selection {
             case .notes(let target): staleSelection = notes.readNotesSnapshot().map(target.matches) != true
@@ -740,7 +755,9 @@ final class SelectionAIPanel: NSObject, ObservableObject {
 
     func updateResult(_ text: String) {
         request.editResult(text)
-        if request.resultEdited { status = "结果已手动编辑；写入会使用当前编辑内容。" }
+        if request.resultEdited {
+            status = L10n.text("Your edits will be used when writing the result.")
+        }
         present(.review)
     }
 
@@ -766,19 +783,25 @@ final class SelectionAIPanel: NSObject, ObservableObject {
     }
 
     var writePreviewTitle: String {
-        pendingWriteAppend == true ? "追加到原选区末尾" : "替换原选区"
+        pendingWriteAppend == true
+            ? L10n.text("Append to the Original Selection")
+            : L10n.text("Replace the Original Selection")
     }
 
     var writePreviewText: String {
         guard let append = pendingWriteAppend else { return "" }
-        return append ? result : "原文：\n\(original)\n\n替换为：\n\(result)"
+        return append ? result : L10n.format("Original:\n%@\n\nReplacement:\n%@", original, result)
     }
 
     func copyPreview(to pb: NSPasteboard = .general) {
         let text = showingOriginal ? original : result
         guard phase == .review, !writing, !text.isEmpty else { return }
         pb.clearContents()
-        status = pb.setString(text, forType: .string) ? (showingOriginal ? "已复制原文" : "已复制结果") : "复制失败，请重试。"
+        if pb.setString(text, forType: .string) {
+            status = showingOriginal ? L10n.text("Original copied") : L10n.text("Result copied")
+        } else {
+            status = L10n.text("Couldn’t copy. Try again.")
+        }
         present(.review)
     }
 
@@ -798,7 +821,7 @@ final class SelectionAIPanel: NSObject, ObservableObject {
                 self.writing = false
                 guard let error else { self.hide(); return }
                 self.staleSelection = true
-                self.status = error + " 仍可复制结果。"
+                self.status = L10n.format("%@ You can still copy the result.", error)
                 self.present(.review)
             }
             return
@@ -815,7 +838,7 @@ final class SelectionAIPanel: NSObject, ObservableObject {
             if let snapshot = self.request.snapshot, self.notes.readNotesSnapshot().map(snapshot.matches) != true {
                 self.markStale()
             } else {
-                self.status = error + " 可重试写入或复制结果。"
+                self.status = L10n.format("%@ Try writing again or copy the result.", error)
             }
             self.present(.review)
         }
@@ -856,7 +879,6 @@ final class SelectionAIPanel: NSObject, ObservableObject {
         } else {
             window = SelectionKeyPanel(contentRect: .zero, styleMask: [.borderless, .nonactivatingPanel],
                                        backing: .buffered, defer: false)
-            window.title = SelectionLauncherButton.displayName
             window.backgroundColor = .clear
             window.isOpaque = false
             window.hasShadow = true
@@ -869,6 +891,7 @@ final class SelectionAIPanel: NSObject, ObservableObject {
             panel = window
         }
 
+        window.title = SelectionLauncherButton.displayName
         window.acceptsKeyboard = phase != .launcher
         let content: NSView
         let size: NSSize

@@ -6,7 +6,7 @@
 
 在 Apple Notes 里写作，也能在 Mac 上直接处理选中的文字。
 
-[下载 v2.9.4 · Apple Silicon](https://github.com/m0nkee/notescopilot/releases/download/v2.9.4/NotesCopilot-2.9.4-arm64.dmg) · [发布说明与校验文件](https://github.com/m0nkee/notescopilot/releases/tag/v2.9.4) · [使用手册](docs/USAGE.md)
+[下载 v2.10.0 · Apple Silicon](https://github.com/m0nkee/notescopilot/releases/download/v2.10.0/NotesCopilot-2.10.0-arm64.dmg) · [发布说明与校验文件](https://github.com/m0nkee/notescopilot/releases/tag/v2.10.0) · [使用手册](docs/USAGE.md)
 
 </div>
 
@@ -40,7 +40,9 @@ NotesCopilot 是一个原生 macOS 菜单栏应用。默认在 **Notes 正文**�
 
 ## 安装与配置
 
-1. 下载 DMG，将 `NotesCopilot.app` 拖入「应用程序」后启动。发布包支持 **Apple Silicon、macOS 13 或更新版本**。发布页同时提供 `NotesCopilot-2.9.4-arm64.dmg.sha256`。
+在「设置 → 通用与诊断 → 界面语言」可选择跟随系统、简体中文或 English。应用内界面即时切换，选择会保存在本机。macOS 的系统权限提示和「服务」菜单使用 macOS 选定的语言。
+
+1. 下载 DMG，将 `NotesCopilot.app` 拖入「应用程序」后启动。发布包支持 **Apple Silicon、macOS 13 或更新版本**。发布页同时提供 `NotesCopilot-2.10.0-arm64.dmg.sha256`。
 2. 在设置中选择服务商或本地模型，填写所需凭据并点「保存配置」。支持 DeepSeek、Kimi、通义千问、OpenAI、OpenRouter、硅基流动及自定义 OpenAI 兼容端点，也可发现 Ollama、LM Studio、llama.cpp 和 vLLM 本地端点。
 3. 在「系统设置 → 隐私与安全性 → 辅助功能」允许 NotesCopilot。需要使用 Notes 写回或本地索引时，再开启对应权限。
 

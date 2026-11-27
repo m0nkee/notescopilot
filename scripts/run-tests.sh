@@ -17,13 +17,14 @@ COMMON_SOURCES=(src/WritingInstruction.swift src/InputFieldSelection.swift src/N
 
 # Test a single source snapshot, even when an editor is saving files during a run.
 cp -R src tests "$OUT/"
+cp -R resources/. "$OUT/"
 cd "$OUT"
 
 run_suite() {
   local name="$1"; shift
   echo "==> $name"
-  swiftc -O -sdk "$SDK" -target "$TARGET" -module-cache-path "$MODULE_CACHE" -o "$OUT/$name" "$@" 2>&1 | tee "$OUT/$name-compile.log"
-  "$OUT/$name" | tee "$OUT/$name-test.log"
+  swiftc -O -sdk "$SDK" -target "$TARGET" -module-cache-path "$MODULE_CACHE" -o "$OUT/$name" src/Localization.swift "$@" 2>&1 | tee "$OUT/$name-compile.log"
+  "$OUT/$name" -nc.interface.language zh-Hans | tee "$OUT/$name-test.log"
 }
 
 SUITES=(selai-tests slashgroup-tests template-tests urltitle-tests writeback-tests template-runner-tests chat-tests library-tests product-tests update-tests)

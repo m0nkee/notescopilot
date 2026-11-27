@@ -148,7 +148,12 @@ do {
     check(NotesFormatButton.items(presenting: ["不存在的项"]).isEmpty, "未知标题被过滤")
     check(NotesFormatButton.items(presenting: []).isEmpty, "空枚举 → 无按钮")
     check(NotesFormatButton.items(presenting: all).count == 13, "全量枚举 → 13 个按钮")
-    // 短标签映射
+    let defaults = UserDefaults.standard
+    let previous = defaults.volatileDomain(forName: UserDefaults.argumentDomain)
+    defer { defaults.setVolatileDomain(previous, forName: UserDefaults.argumentDomain) }
+    var preferences = previous
+    preferences[L10n.preferenceKey] = AppLanguage.simplifiedChinese.rawValue
+    defaults.setVolatileDomain(preferences, forName: UserDefaults.argumentDomain)
     let byMenu = Dictionary(uniqueKeysWithValues: NotesFormatButton.items(presenting: all).map { ($0.menuTitle, $0.label) })
     check(byMenu["等宽样式"] == "等宽", "等宽样式 → 等宽")
     check(byMenu["项目符号列表"] == "圆点列表", "项目符号列表 → 圆点列表")
@@ -157,6 +162,13 @@ do {
     check(byMenu["斜体"] == "斜体" && byMenu["下划线"] == "下划线" && byMenu["删除线"] == "删除线", "字体样式标签直出")
     check(byMenu["显示颜色"] == "颜色", "显示颜色 → 颜色")
 
+    preferences[L10n.preferenceKey] = AppLanguage.english.rawValue
+    defaults.setVolatileDomain(preferences, forName: UserDefaults.argumentDomain)
+    let englishFormat = NotesFormatButton.items(presenting: ["标题", "正文"])
+    check(englishFormat.map(\.menuTitle) == ["标题", "正文"] && englishFormat.map(\.label) == ["Title", "Body"],
+          "英文界面可匹配中文 Notes 样式并提供英文标签")
+    check(selectionQuickActions.map(\.displayName) == ["Proofread", "Polish", "Shorten", "Summarize", "Translate", "Explain"],
+          "选区快捷动作随界面语言切换")
 }
 
 // 总开关对键盘与 AX 通道一致生效；格式菜单标题统一中英文别名。

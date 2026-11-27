@@ -20,11 +20,11 @@ struct TemplateVarSpec: Equatable {
 
         var badge: String {
             switch self {
-            case .date: return "日期"
-            case .time: return "时间"
-            case .selection: return "选中"
-            case .clipboard: return "剪贴板"
-            case .ask: return "输入"
+            case .date: return L10n.text("Date")
+            case .time: return L10n.text("Time")
+            case .selection: return L10n.text("Selection")
+            case .clipboard: return L10n.text("Clipboard")
+            case .ask: return L10n.text("Input")
             case .ai: return "AI"
             }
         }
@@ -440,7 +440,8 @@ enum TemplateRunner {
                     if error is CancellationError || (error as? URLError)?.code == .cancelled {
                         throw CancellationError()
                     }
-                    let message = "模板 {{ai:\(instruction.prefix(20))}}… 请求失败：\(error.localizedDescription)"
+                    let message = L10n.format("Template {{ai:%@}}… request failed: %@",
+                                              String(instruction.prefix(20)), error.localizedDescription)
                     firstError = firstError ?? message
                 }
             }
@@ -464,12 +465,12 @@ enum TemplateRunner {
     /// 弹窗输入（NSAlert + accessory TextField，回车确认 / Esc 取消）
     private static func askUser(question: String) -> String? {
         let alert = NSAlert()
-        alert.messageText = "模板需要输入"
+        alert.messageText = L10n.text("Template Input Required")
         alert.informativeText = question
-        alert.addButton(withTitle: "确定")
-        alert.addButton(withTitle: "取消")
+        alert.addButton(withTitle: L10n.text("OK"))
+        alert.addButton(withTitle: L10n.text("Cancel"))
         let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 280, height: 24))
-        field.placeholderString = "输入后回车"
+        field.placeholderString = L10n.text("Enter an answer, then press Return")
         alert.accessoryView = field
         alert.window.initialFirstResponder = field
         let resp = alert.runModal()
@@ -490,7 +491,7 @@ enum TemplateRunner {
                            onError: ((String) -> Void)? = nil) -> Task<Void, Never>? {
         let report: (String) -> Void = onError ?? { NCLog.log("模板执行警告：\($0)") }
         guard let target = target ?? bridge.readTextSnapshot() else {
-            report("无法定位 Notes 原光标，已取消模板写入。")
+            report(L10n.text("Template insertion was canceled because the original cursor in Notes couldn't be found."))
             return nil
         }
         return start(template, selection: selection, clipboard: clipboard, ask: ask, complete: complete,
@@ -513,12 +514,19 @@ enum TemplateRunner {
 struct TemplateCheatRow {
     let syntax: String
     let desc: String
-    static let all: [TemplateCheatRow] = [
-        TemplateCheatRow(syntax: "{{date}} / {{date:格式}}", desc: "日期，默认 yyyy-MM-dd，如 {{date:MMM d}}"),
-        TemplateCheatRow(syntax: "{{time}} / {{time:格式}}", desc: "时间，默认 HH:mm"),
-        TemplateCheatRow(syntax: "{{selection}}", desc: "Notes 选中文本 / 面板笔记上下文"),
-        TemplateCheatRow(syntax: "{{clipboard}}", desc: "剪贴板文本"),
-        TemplateCheatRow(syntax: "{{ask:问题}}", desc: "插入时弹窗询问，填入答案"),
-        TemplateCheatRow(syntax: "{{ai:指令}}", desc: "用当前生效配置请求 AI，动态生成该片段"),
-    ]
+    static var all: [TemplateCheatRow] {
+        [
+            TemplateCheatRow(syntax: L10n.text("{{date}} / {{date:format}}"),
+                             desc: L10n.text("Date in yyyy-MM-dd by default. For example, {{date:MMM d}}.")),
+            TemplateCheatRow(syntax: L10n.text("{{time}} / {{time:format}}"),
+                             desc: L10n.text("Time in HH:mm by default.")),
+            TemplateCheatRow(syntax: "{{selection}}",
+                             desc: L10n.text("Selected text in Notes or note context from the panel.")),
+            TemplateCheatRow(syntax: "{{clipboard}}", desc: L10n.text("Clipboard text.")),
+            TemplateCheatRow(syntax: L10n.text("{{ask:question}}"),
+                             desc: L10n.text("Ask a question before insertion and fill in the answer.")),
+            TemplateCheatRow(syntax: L10n.text("{{ai:instruction}}"),
+                             desc: L10n.text("Generate this part using AI with the active model profile.")),
+        ]
+    }
 }

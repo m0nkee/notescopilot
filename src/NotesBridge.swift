@@ -9,11 +9,11 @@ enum NotesAccessIssue: Equatable {
     var message: String {
         switch self {
         case .accessibilityRequired:
-            return "Notes 访问需要辅助功能权限。请在系统设置的“隐私与安全性 → 辅助功能”中允许 NotesCopilot，然后回到 Notes 正文重试。"
+            return L10n.text("Notes access requires Accessibility permission. Allow NotesCopilot in System Settings → Privacy & Security → Accessibility, then return to the body of the note and try again.")
         case .automationDenied:
-            return "Notes 自动化访问被拒绝。请在系统设置的“隐私与安全性 → 自动化”中允许 NotesCopilot 控制 Notes。"
+            return L10n.text("Automation access to Notes was denied. Allow NotesCopilot to control Notes in System Settings → Privacy & Security → Automation.")
         case .identityUnavailable:
-            return "无法确认当前笔记。请在 Notes 中只选中一条笔记，点击正文后重试。"
+            return L10n.text("Couldn't identify the current note. Select a single note, click its body, and try again.")
         }
     }
 
@@ -246,7 +246,7 @@ final class NotesBridge {
 
     @discardableResult
     func runScript(_ source: String) -> String? {
-        guard let script = NSAppleScript(source: source) else { return "无法创建 AppleScript" }
+        guard let script = NSAppleScript(source: source) else { return L10n.text("Couldn't create the AppleScript.") }
         var err: NSDictionary?
         script.executeAndReturnError(&err)
         if let err, let msg = err[NSAppleScript.errorMessage] as? String { return msg }
@@ -384,11 +384,11 @@ final class NotesBridge {
     func withNotesTargetActive(in snap: SelectionSnapshot,
                                isOperationValid: @escaping () -> Bool = { true },
                                completion: @escaping (String?) -> Void) {
-        guard isOperationValid() else { completion("操作已取消。"); return }
+        guard isOperationValid() else { completion(L10n.text("Operation canceled.")); return }
         let validate = {
-            guard isOperationValid() else { completion("操作已取消。"); return }
+            guard isOperationValid() else { completion(L10n.text("Operation canceled.")); return }
             let current = self.isCurrent(snap)
-            completion(isOperationValid() && current ? nil : "操作已取消或原笔记已变化。")
+            completion(isOperationValid() && current ? nil : L10n.text("The operation was canceled or the original note changed."))
         }
         if let activationScheduler { activationScheduler(validate); return }
         if snapshotReader != nil || Self.isFrontmostNotes() {
@@ -397,10 +397,10 @@ final class NotesBridge {
         }
         guard let current = readNotesSnapshot(), snap.matches(current),
               let notes = NSWorkspace.shared.runningApplications.first(where: { $0.bundleIdentifier == Self.notesBundleID }) else {
-            completion("原笔记、光标或文本已变化，已取消写入。")
+            completion(L10n.text("Writing was canceled because the original note, cursor, or text changed."))
             return
         }
-        guard isOperationValid() else { completion("操作已取消。"); return }
+        guard isOperationValid() else { completion(L10n.text("Operation canceled.")); return }
         notes.activate()
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { validate() }
     }
@@ -418,19 +418,19 @@ final class NotesBridge {
     @discardableResult
     func replaceText(in snap: SelectionSnapshot, range: CFRange, with text: String, html: String? = nil,
                      isOperationValid: () -> Bool = { true }) -> String? {
-        guard isOperationValid() else { return "操作已取消。" }
-        guard isCurrent(snap) else { return "原笔记、光标或文本已变化，已取消写入。" }
+        guard isOperationValid() else { return L10n.text("Operation canceled.") }
+        guard isCurrent(snap) else { return L10n.text("Writing was canceled because the original note, cursor, or text changed.") }
         let size = (snap.documentText as NSString).length
         guard range.location >= 0, range.length >= 0, range.location <= size,
-              range.length <= size - range.location else { return "写入范围无效，已取消写入。" }
-        guard isOperationValid() else { return "操作已取消。" }
+              range.length <= size - range.location else { return L10n.text("Writing was canceled because the target range is invalid.") }
+        guard isOperationValid() else { return L10n.text("Operation canceled.") }
         if let replacementWriter { return replacementWriter(snap, range, text, html) }
-        guard setSelectionRange(snap.element, range) else { return "无法定位原选区，已取消写入。" }
+        guard setSelectionRange(snap.element, range) else { return L10n.text("Writing was canceled because the original selection couldn't be found.") }
         let selected = (snap.documentText as NSString).substring(with: NSRange(location: range.location, length: range.length))
         let target = SelectionSnapshot(element: snap.element, range: range, text: selected, bounds: snap.bounds,
                                        noteID: snap.noteID, documentText: snap.documentText)
-        guard isCurrent(target) else { return "原笔记已变化，已取消写入。" }
-        guard isOperationValid() else { return "操作已取消。" }
+        guard isCurrent(target) else { return L10n.text("Writing was canceled because the original note changed.") }
+        guard isOperationValid() else { return L10n.text("Operation canceled.") }
         if html == nil,
            AXUIElementSetAttributeValue(snap.element, kAXSelectedTextAttribute as CFString, text as CFTypeRef) == .success {
             return nil
@@ -441,7 +441,7 @@ final class NotesBridge {
         }, postPaste: {
             guard isOperationValid(),
                   let notes = NSWorkspace.shared.frontmostApplication, notes.bundleIdentifier == Self.notesBundleID else {
-                return "Notes 不在前台，已取消粘贴。"
+                return L10n.text("Pasting was canceled because Notes isn't the frontmost app.")
             }
             return Self.dispatchPreparedPaste(preservingStyle: html != nil,
                 isOperationValid: { isOperationValid() && self.isCurrent(target) },
@@ -449,10 +449,10 @@ final class NotesBridge {
                 postStandardPaste: {
                     guard let down = CGEvent(keyboardEventSource: nil, virtualKey: 9, keyDown: true),
                           let up = CGEvent(keyboardEventSource: nil, virtualKey: 9, keyDown: false) else {
-                        return "无法发送粘贴操作。"
+                        return L10n.text("Couldn't send the paste command.")
                     }
                     down.flags = .maskCommand; up.flags = .maskCommand
-                    guard isOperationValid() else { return "操作已取消。" }
+                    guard isOperationValid() else { return L10n.text("Operation canceled.") }
                     down.postToPid(notes.processIdentifier); up.postToPid(notes.processIdentifier)
                     return nil
                 })
@@ -465,26 +465,26 @@ final class NotesBridge {
                                       isOperationValid: () -> Bool,
                                       triggerMenu: (String) -> Bool,
                                       postStandardPaste: () -> String?) -> String? {
-        guard isOperationValid() else { return "操作已取消。" }
+        guard isOperationValid() else { return L10n.text("Operation canceled.") }
         guard preservingStyle else { return postStandardPaste() }
         for title in ["Paste and Retain Style", "粘贴并保留样式", "粘贴并保留格式", "貼上並保留樣式"] {
-            guard isOperationValid() else { return "操作已取消。" }
+            guard isOperationValid() else { return L10n.text("Operation canceled.") }
             if triggerMenu(title) { return nil }
         }
-        return "无法执行 Notes 的“粘贴并保留样式”，已取消写入。"
+        return L10n.text("Writing was canceled because Paste and Retain Style couldn't be run in Notes.")
     }
 
     /// 剪贴板读取可能阻塞；所有准备工作之后再校验，失效时不发送按键。
     func validatedPaste(in target: SelectionSnapshot,
                         prepareClipboard: () -> (() -> Void), postPaste: () -> String?,
                         isOperationValid: () -> Bool = { true }) -> String? {
-        guard isOperationValid() else { return "操作已取消。" }
+        guard isOperationValid() else { return L10n.text("Operation canceled.") }
         let restore = prepareClipboard()
         guard isOperationValid(), isCurrent(target), isOperationValid() else {
             restore()
-            return "原笔记、光标或文本已变化，已取消粘贴。"
+            return L10n.text("Pasting was canceled because the original note, cursor, or text changed.")
         }
-        guard isOperationValid() else { restore(); return "操作已取消。" }
+        guard isOperationValid() else { restore(); return L10n.text("Operation canceled.") }
         if let error = postPaste() {
             restore()
             return error
@@ -687,7 +687,7 @@ final class NotesBridge {
                          isOperationValid: @escaping () -> Bool = { true },
                          completion: @escaping (String?) -> Void) {
         guard let target = readNotesSnapshot() else {
-            completion("无法定位 Notes 原光标，请回到笔记正文后重试。")
+            completion(L10n.text("Couldn't find the original cursor in Notes. Return to the note body and try again."))
             return
         }
         writeWhenNotesActive(in: target, text: text, html: html,
@@ -721,7 +721,7 @@ final class NotesBridge {
     func deleteTyped(count: Int) -> String? {
         guard let target = readTextSnapshot(),
               let range = Self.suffixRange(in: target, characterCount: count) else {
-            return "无法定位 Notes 中待删除的文字，已取消。"
+            return L10n.text("The operation was canceled because the text to delete in Notes couldn't be found.")
         }
         return replaceText(in: target, range: range, with: "")
     }
@@ -740,7 +740,7 @@ final class NotesBridge {
     func removeSuffix(in target: SelectionSnapshot, characterCount: Int,
                       completion: @escaping (SelectionSnapshot?, String?) -> Void) {
         guard let range = Self.suffixRange(in: target, characterCount: characterCount) else {
-            completion(nil, "原命令范围无效，已取消执行。")
+            completion(nil, L10n.text("The command was canceled because its range is invalid."))
             return
         }
         let document = (target.documentText as NSString).replacingCharacters(
@@ -755,7 +755,7 @@ final class NotesBridge {
         let deadline = Date().addingTimeInterval(0.8)
         func verify() {
             guard let current = self.readTextSnapshot() else {
-                completion(nil, "Notes 焦点已变化，已取消执行。")
+                completion(nil, L10n.text("The command was canceled because focus in Notes changed."))
                 return
             }
             if expected.matches(current) { completion(current, nil); return }
@@ -764,7 +764,7 @@ final class NotesBridge {
                 && current.documentText == target.documentText
                 && current.range.location == range.location && current.range.length == range.length
             guard awaitingPaste, Date() < deadline else {
-                completion(nil, "命令删除未完成或原笔记已变化，已取消执行。")
+                completion(nil, L10n.text("The command was canceled because its text wasn't fully removed or the original note changed."))
                 return
             }
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.03) { verify() }
@@ -843,13 +843,27 @@ final class NotesBridge {
     /// Notes 支持的段落/字体格式全集（菜单准确标题 + 按钮短标签），按「格式」菜单顺序。
     /// 枚举失败时以此兜底；注意 NotesBridge 会被不含 SelectionAI.swift 的测试套编译，勿引用 UI 类型。
     /// 斜体⌘I 下划线⌘U 删除线(无快捷键)在 字体 子菜单；「显示颜色」⌘⇧C 打开颜色面板选色。
-    static let formatMenuItems: [(menu: String, label: String)] = [
-        ("标题", "标题"), ("小标题", "小标题"), ("副标题", "副标题"), ("正文", "正文"),
-        ("等宽样式", "等宽"),
-        ("斜体", "斜体"), ("下划线", "下划线"), ("删除线", "删除线"), ("显示颜色", "颜色"),
-        ("项目符号列表", "圆点列表"), ("短划线列表", "短划线"), ("编号列表", "编号列表"),
-        ("块引用", "块引用"),
-    ]
+    static var formatMenuItems: [(menu: String, label: String)] {
+        [
+            ("标题", L10n.text("Title")),
+            ("小标题", L10n.text("Heading")),
+            ("副标题", L10n.text("Subheading")),
+            ("正文", L10n.text("Body")),
+            ("等宽样式", L10n.text("Monospaced")),
+            ("斜体", L10n.text("Italic")),
+            ("下划线", L10n.text("Underline")),
+            ("删除线", L10n.text("Strikethrough")),
+            ("显示颜色", L10n.text("Colors")),
+            ("项目符号列表", L10n.text("Bulleted List")),
+            ("短划线列表", L10n.text("Dashed")),
+            ("编号列表", L10n.text("Numbered List")),
+            ("块引用", L10n.text("Block Quote")),
+        ]
+    }
+
+    private static func formatLabel(for menu: String) -> String {
+        formatMenuItems.first(where: { $0.menu == menu })?.label ?? menu
+    }
 
     static func formatMenuTitles(for title: String) -> [String] {
         if title == "显示颜色" { return ["显示颜色", "Show Colors", "Show Colours"] }
@@ -904,14 +918,14 @@ final class NotesBridge {
     @discardableResult
     func applyFormat(_ menuTitle: String) -> String? {
         guard let notes = NSWorkspace.shared.runningApplications.first(where: { $0.bundleIdentifier == Self.notesBundleID }) else {
-            return "未找到正在运行的 Apple Notes"
+            return L10n.text("Apple Notes isn't running.")
         }
         guard NSWorkspace.shared.frontmostApplication?.bundleIdentifier == Self.notesBundleID else {
-            return "Notes 不在前台，无法应用格式"
+            return L10n.text("Couldn't apply formatting because Notes isn't the frontmost app.")
         }
         let axApp = AXUIElementCreateApplication(notes.processIdentifier)
         guard let item = Self.formatMenuTitles(for: menuTitle).compactMap({ Self.findMenuItem(axApp, titled: $0) }).first else {
-            return "菜单项「\(menuTitle)」未找到"
+            return L10n.format("Couldn’t find the “%@” menu item.", Self.formatLabel(for: menuTitle))
         }
         let press = AXUIElementPerformAction(item, kAXPressAction as CFString)
         if press == .success { return nil }
@@ -950,7 +964,7 @@ final class NotesBridge {
     /// 快捷键兜底：AXMenuItemCmdChar + AXMenuItemCmdModifiers（bit0=Shift bit1=Option bit2=Control，Command 恒定）
     private static func pressViaShortcut(_ item: AXUIElement, title: String) -> String? {
         guard let chRef = AXText.attribute(item, "AXMenuItemCmdChar"), let ch = chRef as? String, !ch.isEmpty else {
-            return "「\(title)」无可用快捷键"
+            return L10n.format("There’s no keyboard shortcut for “%@”.", formatLabel(for: title))
         }
         var mods = 0
         if let modRef = AXText.attribute(item, "AXMenuItemCmdModifiers") {
@@ -962,7 +976,7 @@ final class NotesBridge {
         if mods & 4 != 0 { flags.insert(.maskControl) }
         guard let d = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: true),
               let u = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: false) else {
-            return "无法创建键盘事件"
+            return L10n.text("Couldn't create the keyboard event.")
         }
         let chars = Array(ch.utf16)
         d.keyboardSetUnicodeString(stringLength: chars.count, unicodeString: chars)

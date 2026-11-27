@@ -151,7 +151,9 @@ private func notesTemplateTests() throws {
     check(Set(fallbackIDs).count == 2, "非标准及缺失 UUID 的笔记获得不同稳定身份")
     TemplateStore.updateNotesTemplates(first)
     let templateCommands = buildSlashCommands().filter { $0.group == .template }
-    check(templateCommands.count == 5 && templateCommands.contains { $0.name == "Daily-Report" && $0.detail.contains("Notes 模板") },
+    check(templateCommands.count == 5 && templateCommands.contains {
+        $0.name == "Daily-Report" && $0.detail.contains(L10n.text("Notes Template"))
+    },
           "Notes 模板无需导入即进入斜杠命令并显示来源，同名时优先 Notes")
     let typedTemplate = AXSlashWatcher.matchSlashToken("/Daily-Report")
     if case .insertTemplate(let template) = typedTemplate?.action {
@@ -428,10 +430,10 @@ private func keyboardListenerTests() async {
         fixture[SelectionScope.enabledKey] = selection
         defaults.setVolatileDomain(fixture, forName: UserDefaults.argumentDomain)
     }
-    var messages: [String] = []
+    var statuses: [KeywordListener.Status] = []
     let observer = NotificationCenter.default.addObserver(forName: .init("nc.kwStatus"), object: nil, queue: nil) { notification in
-        guard let message = notification.object as? String else { return }
-        MainActor.assumeIsolated { messages.append(message) }
+        guard let status = notification.object as? KeywordListener.Status else { return }
+        MainActor.assumeIsolated { statuses.append(status) }
     }
     defer { NotificationCenter.default.removeObserver(observer) }
 
@@ -448,8 +450,9 @@ private func keyboardListenerTests() async {
     check(attempts == 1 && tapOptions == [CGEventTapOptions.defaultTap.rawValue],
           "辅助功能已授权时主动键盘tap不受输入监控未授权阻断")
     check(!accessible.isRunning, "tap工厂失败不会误报键盘导航或关键词监听已运行")
-    check(messages.last?.contains("键盘") == true && messages.last?.contains("输入监控") == false
-          && messages.last?.contains("Markdown") == false,
+    check(statuses.last == .unavailable
+          && statuses.last?.message.contains(L10n.text("Input Monitoring")) == false
+          && statuses.last?.message.contains("Markdown") == false,
           "tap失败只报告键盘导航与关键词状态而不要求额外输入监控")
     try? await Task.sleep(nanoseconds: 3_300_000_000)
     check(attempts >= 2 && !accessible.isRunning, "创建tap失败后仍按3秒间隔重试且不误报成功")
@@ -465,7 +468,7 @@ private func keyboardListenerTests() async {
     defer { inaccessible.stop() }
     inaccessible.startIfNeeded()
     check(blockedAttempts == 0 && !inaccessible.isRunning, "缺少辅助功能时不会创建可拦截按键的主动tap")
-    check(messages.last?.contains("辅助功能") == true && messages.last?.contains("Markdown") == false,
+    check(statuses.last == .waitingForAccessibility && statuses.last?.message.contains("Markdown") == false,
           "辅助功能缺失给出准确键盘功能授权提示")
     trusted = true
     try? await Task.sleep(nanoseconds: 3_300_000_000)
@@ -475,7 +478,7 @@ private func keyboardListenerTests() async {
     inaccessible.handleTapDisabled()
     inaccessible.startIfNeeded()
     check(blockedAttempts == attemptsBeforeRevocation && !inaccessible.isRunning
-          && messages.last?.contains("辅助功能") == true,
+          && statuses.last == .waitingForAccessibility,
           "权限撤销的禁用回调不盲目重启主动tap而是等待重新授权")
     inaccessible.stop()
 
@@ -488,10 +491,10 @@ private func keyboardListenerTests() async {
     defer { disabled.stop() }
     disabled.startIfNeeded()
     check(disabledAttempts == 0 && !disabled.isRunning, "全部键盘入口关闭时不启动键盘tap")
-    messages.append("菜单键盘导航与关键词监听已启动。")
-    let messageCountBeforeRestart = messages.count
+    statuses.append(.running)
+    let statusCountBeforeRestart = statuses.count
     disabled.restart()
-    check(messages.count == messageCountBeforeRestart + 1 && messages.last == "菜单键盘导航与关键词扩展已关闭。",
+    check(statuses.count == statusCountBeforeRestart + 1 && statuses.last == .disabled,
           "关闭全部键盘功能后restart会发布关闭状态以替换界面缓存的已启动消息")
     features(keywords: false, slash: false, selection: true)
     disabled.startIfNeeded()

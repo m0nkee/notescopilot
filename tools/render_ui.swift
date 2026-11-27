@@ -17,6 +17,7 @@ struct RenderUI {
             "nc.profiles": try JSONEncoder().encode([profile]), "nc.activeProfileID": profile.id.uuidString,
             "nc.templates": try JSONEncoder().encode([TemplateNote]()), "nc.kw.rules": Data(),
             "nc.sys": Config.defaultSystem, "nc.temp": 0.7, "nc.maxTokens": 2048, "nc.continuous": true,
+            L10n.preferenceKey: ProcessInfo.processInfo.environment["NC_UI_LANGUAGE"] ?? AppLanguage.simplifiedChinese.rawValue,
         ]
         defaults.setVolatileDomain(values, forName: UserDefaults.argumentDomain)
         UserDefaults.standard.setVolatileDomain(values, forName: UserDefaults.argumentDomain)

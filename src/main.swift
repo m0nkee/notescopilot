@@ -1,5 +1,6 @@
 import AppKit
 import SwiftUI
+import Combine
 import Carbon
 import Carbon.HIToolbox
 
@@ -20,7 +21,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var libraryWindow: NSWindow?
     /// LiberatorLite：NoteStore 直读（懒加载，无权限时为 nil）
     private(set) var notesStore: NotesStore?
-    private(set) var notesStoreError: String?
+    private var notesStoreFailure: Error?
+    var notesStoreError: String? { notesStoreFailure?.localizedDescription }
     private(set) var notesStoreLoading = false
     private(set) var notesTemplatesLoading = false
     private var templateRefreshID = UUID()
@@ -32,6 +34,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var hotkeyStatus: OSStatus?
     private var updateTimer: Timer?
     private var updateMenuItem: NSMenuItem?
+    private var localizationObserver: AnyCancellable?
     private var regularFeaturesStarted = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -71,6 +74,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // accessory（LSUIElement）应用没有主菜单，⌘V/⌘C 的快捷键等价物会失效，
         // 导致设置窗口的 SecureField 无法粘贴——构建标准 mainMenu 修复
         NSApp.mainMenu = Self.buildMainMenu()
+        localizationObserver = NotificationCenter.default.publisher(for: L10n.didChange, object: L10n.shared)
+            .sink { [weak self] _ in MainActor.assumeIsolated { self?.refreshLocalization() } }
         AppUpdater.shared.onCheckCompleted = { [weak self] userInitiated in
             self?.presentUpdateResult(userInitiated: userInitiated)
         }
@@ -196,32 +201,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         let appItem = NSMenuItem()
         let appMenu = NSMenu()
-        appMenu.addItem(withTitle: "关于 NotesCopilot",
+        appMenu.addItem(withTitle: L10n.text("About NotesCopilot"),
                         action: #selector(NSApplication.orderFrontStandardAboutPanel(_:)), keyEquivalent: "")
-        appMenu.addItem(withTitle: "检查更新…", action: #selector(checkForUpdates), keyEquivalent: "")
+        appMenu.addItem(withTitle: L10n.text("Check for Updates…"), action: #selector(checkForUpdates), keyEquivalent: "")
         appMenu.addItem(.separator())
-        appMenu.addItem(withTitle: "隐藏其他", action: #selector(NSApplication.hideOtherApplications(_:)), keyEquivalent: "h")
+        appMenu.addItem(withTitle: L10n.text("Hide Others"), action: #selector(NSApplication.hideOtherApplications(_:)), keyEquivalent: "h")
         appMenu.addItem(.separator())
-        appMenu.addItem(withTitle: "退出", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+        appMenu.addItem(withTitle: L10n.text("Quit NotesCopilot"), action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         appItem.submenu = appMenu
         main.addItem(appItem)
 
         let editItem = NSMenuItem()
-        let editMenu = NSMenu(title: "编辑")
-        editMenu.addItem(withTitle: "撤销", action: Selector(("undo:")), keyEquivalent: "z")
-        editMenu.addItem(withTitle: "重做", action: Selector(("redo:")), keyEquivalent: "Z")
+        let editMenu = NSMenu(title: L10n.text("Edit"))
+        editMenu.addItem(withTitle: L10n.text("Undo"), action: Selector(("undo:")), keyEquivalent: "z")
+        editMenu.addItem(withTitle: L10n.text("Redo"), action: Selector(("redo:")), keyEquivalent: "Z")
         editMenu.addItem(.separator())
-        editMenu.addItem(withTitle: "剪切", action: #selector(NSText.cut(_:)), keyEquivalent: "x")
-        editMenu.addItem(withTitle: "拷贝", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
-        editMenu.addItem(withTitle: "粘贴", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
-        editMenu.addItem(withTitle: "全选", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
+        editMenu.addItem(withTitle: L10n.text("Cut"), action: #selector(NSText.cut(_:)), keyEquivalent: "x")
+        editMenu.addItem(withTitle: L10n.text("Copy"), action: #selector(NSText.copy(_:)), keyEquivalent: "c")
+        editMenu.addItem(withTitle: L10n.text("Paste"), action: #selector(NSText.paste(_:)), keyEquivalent: "v")
+        editMenu.addItem(withTitle: L10n.text("Select All"), action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
         editItem.submenu = editMenu
         main.addItem(editItem)
 
         let windowItem = NSMenuItem()
-        let windowMenu = NSMenu(title: "窗口")
-        windowMenu.addItem(withTitle: "最小化", action: #selector(NSWindow.performMiniaturize(_:)), keyEquivalent: "m")
-        windowMenu.addItem(withTitle: "缩放", action: #selector(NSWindow.performZoom(_:)), keyEquivalent: "")
+        let windowMenu = NSMenu(title: L10n.text("Window"))
+        windowMenu.addItem(withTitle: L10n.text("Minimize"), action: #selector(NSWindow.performMiniaturize(_:)), keyEquivalent: "m")
+        windowMenu.addItem(withTitle: L10n.text("Zoom"), action: #selector(NSWindow.performZoom(_:)), keyEquivalent: "")
         windowItem.submenu = windowMenu
         main.addItem(windowItem)
 
@@ -239,9 +244,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             image?.size = NSSize(width: 18, height: 18)
             button.image = image
             if image == nil { button.title = "NC" }
-            button.toolTip = "NotesCopilot · ⇧⌘Space 打开面板"
         }
         statusItem.isVisible = true
+        buildStatusMenu()
+    }
+
+    private func refreshLocalization() {
+        NSApp.mainMenu = Self.buildMainMenu()
+        buildStatusMenu()
+        refreshUpdateMenu()
+        settingsWindow?.title = L10n.text("NotesCopilot Settings")
+        libraryWindow?.title = L10n.text("Note Library · NotesCopilot")
+    }
+
+    private func buildStatusMenu() {
+        statusItem.button?.toolTip = L10n.text("NotesCopilot · ⇧⌘Space to open the panel")
         let menu = NSMenu()
         menu.delegate = self
         func add(_ title: String, _ action: Selector, _ keyEquivalent: String = "", target: AnyObject? = nil) {
@@ -251,24 +268,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return
         }
         // 监听状态行（菜单展开时实时刷新，见 menuNeedsUpdate）
-        let statusLine = NSMenuItem(title: "键盘监听：检查中…", action: nil, keyEquivalent: "")
+        let statusLine = NSMenuItem(title: L10n.text("Keyboard listener: Checking…"), action: nil, keyEquivalent: "")
         statusLine.isEnabled = false
         menu.addItem(statusLine)
-        add("权限自检（写入日志）", #selector(selfCheck), target: self)
+        add(L10n.text("Check Permissions and Log"), #selector(selfCheck), target: self)
         menu.addItem(.separator())
-        add("打开面板（全局快捷键 ⇧⌘Space）", #selector(showPanel), target: self)
-        add("笔记库…", #selector(showLibrary), "l", target: self)
-        add("设置…", #selector(showSettings), ",", target: self)
-        add("检查更新…", #selector(checkForUpdates), target: self)
-        let updateItem = NSMenuItem(title: "有新版本可下载", action: #selector(openUpdateDownload), keyEquivalent: "")
+        add(L10n.text("Open Panel (⇧⌘Space)"), #selector(showPanel), target: self)
+        add(L10n.text("Note Library…"), #selector(showLibrary), "l", target: self)
+        add(L10n.text("Settings…"), #selector(showSettings), ",", target: self)
+        add(L10n.text("Check for Updates…"), #selector(checkForUpdates), target: self)
+        let updateItem = NSMenuItem(title: L10n.text("Update Available"), action: #selector(openUpdateDownload), keyEquivalent: "")
         updateItem.target = self
         updateItem.isHidden = true
         menu.addItem(updateItem)
         updateMenuItem = updateItem
         menu.addItem(.separator())
-        add("打开辅助功能设置", #selector(openAXSettings), target: self)
+        add(L10n.text("Open Accessibility Settings"), #selector(openAXSettings), target: self)
         menu.addItem(.separator())
-        add("退出", #selector(NSApplication.terminate(_:)), "q", target: nil)
+        add(L10n.text("Quit NotesCopilot"), #selector(NSApplication.terminate(_:)), "q", target: nil)
         statusItem.menu = menu
     }
 
@@ -281,17 +298,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let slashOn = UserDefaults.standard.object(forKey: "nc.slash.global") == nil
             ? true : UserDefaults.standard.bool(forKey: "nc.slash.global")
         if !slashOn {
-            first.title = "斜杠命令：○ 已关闭（Markdown 与 URL 独立运行）"
+            first.title = L10n.text("Slash commands: ○ Off. Markdown shortcuts and links still work.")
         } else if !NotesBridge.shared.isTrusted {
-            first.title = "Notes 扩展：○ 等待辅助功能授权"
+            first.title = L10n.text("Notes integration: ○ Waiting for Accessibility access")
         } else if NotesBridge.shared.accessIssue == .automationDenied {
-            first.title = "Notes 扩展：○ 需要允许自动化控制 Notes"
+            first.title = L10n.text("Notes integration: ○ Grant Automation access to control Notes")
         } else if cgRunning {
-            first.title = "键盘监听：● 运行中（斜杠命令可用）"
+            first.title = L10n.text("Keyboard listener: ● Running. Slash commands are available.")
         } else if axRunning {
-            first.title = "斜杠命令：● AX 通道可用，键盘导航未启动"
+            first.title = L10n.text("Slash commands: ● Available via Accessibility. Keyboard navigation is inactive.")
         } else {
-            first.title = "键盘监听：○ 未启动，请检查辅助功能授权"
+            first.title = L10n.text("Keyboard listener: ○ Inactive. Check Accessibility access.")
         }
     }
 
@@ -315,8 +332,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let release = AppUpdater.shared.availableRelease
         updateMenuItem?.isHidden = release == nil
         updateMenuItem?.title = AppUpdater.shared.isDownloading
-            ? "取消下载 v\(release?.version ?? "")…"
-            : "下载新版本 v\(release?.version ?? "")…"
+            ? L10n.format("Cancel Download v%@…", release?.version ?? "")
+            : L10n.format("Download Update v%@…", release?.version ?? "")
     }
 
     private func presentUpdateResult(userInitiated: Bool) {
@@ -325,22 +342,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard userInitiated || updater.shouldRemind() else { return }
         let alert = NSAlert()
         if updater.status == .available, let release = updater.availableRelease {
-            alert.messageText = "NotesCopilot 有新版本 v\(release.version)"
-            var informativeText = "当前版本：v\(updater.currentVersion)\n建议更新以获取最新功能和修复。\n点击「直接下载」后，DMG 会先校验 SHA-256，再下载到「下载」文件夹并在 Finder 中显示。安装时拖入「Applications」替换旧版本。\n若 macOS 提示无法验证应用，先点「完成」，再到「系统设置 → 隐私与安全性」点「仍要打开」。"
+            alert.messageText = L10n.format("NotesCopilot v%@ Is Available", release.version)
+            var informativeText = L10n.format(
+                "Current version: v%@\nDownload the update for the latest features and fixes. NotesCopilot verifies the DMG with SHA-256, saves it in Downloads, and reveals it in Finder. Drag the app into Applications to replace the previous version.\nIf macOS cannot verify the app, click Done, then Open Anyway in System Settings → Privacy & Security.",
+                updater.currentVersion)
             if let notes = release.alertNotes {
-                informativeText += "\n\n发布说明：\n\(notes)"
+                informativeText += L10n.format("\n\nRelease Notes\n%@", notes)
             }
             alert.informativeText = informativeText
-            alert.addButton(withTitle: "直接下载")
-            alert.addButton(withTitle: "稍后提醒")
+            alert.addButton(withTitle: L10n.text("Download"))
+            alert.addButton(withTitle: L10n.text("Remind Later"))
             updater.markReminded()
             NSApp.activate(ignoringOtherApps: true)
             if alert.runModal() == .alertFirstButtonReturn { openUpdateDownload() }
         } else {
-            alert.messageText = updater.status == .current ? "已是最新版本" : "检查更新失败"
+            alert.messageText = updater.status == .current ? L10n.text("You're Up to Date") : L10n.text("Update Check Failed")
             alert.informativeText = updater.statusMessage
-            alert.addButton(withTitle: "好")
-            if updater.status != .current { alert.addButton(withTitle: "打开发布页") }
+            alert.addButton(withTitle: L10n.text("OK"))
+            if updater.status != .current { alert.addButton(withTitle: L10n.text("Open Releases")) }
             NSApp.activate(ignoringOtherApps: true)
             if alert.runModal() == .alertSecondButtonReturn { NSWorkspace.shared.open(AppUpdater.releasesURL) }
         }
@@ -352,16 +371,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let listen = CGPreflightListenEventAccess()
         NCLog.log("权限自检：辅助功能 = \(ax)，输入监控 = \(listen)，二进制 = \(Bundle.main.bundleURL.path)")
         let alert = NSAlert()
-        alert.messageText = "权限状态"
-        alert.informativeText = """
-        辅助功能（AX 通道依赖）：\(ax ? "✅ 已授权" : "❌ 未授权——这是斜杠命令不生效的最可能原因")
-        键盘导航与关键词扩展：\(KeywordListener.shared.isRunning ? "✅ 监听已启动" : "监听未启动，可用鼠标点击命令")
-        输入监控（当前键盘导航无需额外开启）：\(listen ? "✅ 已授权" : "未授权")
-        Notes 访问：\(NotesBridge.shared.refreshAccessIssue()?.message ?? "未记录访问错误；请在 Notes 正文尝试命令或选区加工。")
-
-        二进制路径：\(Bundle.main.bundleURL.path)
-        日志：~/Library/Logs/NotesCopilot-debug.log
-        """
+        alert.messageText = L10n.text("Permissions")
+        let accessibilityStatus = ax ? L10n.text("✅ Granted")
+            : L10n.text("❌ Grant access to use slash commands.")
+        let keyboardStatus = KeywordListener.shared.isRunning ? L10n.text("✅ Listening")
+            : L10n.text("Inactive. You can still click commands.")
+        let monitoringStatus = listen ? L10n.text("✅ Granted") : L10n.text("Not granted")
+        let notesStatus = NotesBridge.shared.refreshAccessIssue()?.message ?? L10n.text(
+            "No access errors recorded. Try a slash command or selection tool in Notes.")
+        alert.informativeText = L10n.format(
+            "Accessibility: %@\nKeyboard navigation and keyword expansion: %@\nInput Monitoring (optional): %@\nNotes access: %@\n\nApp path: %@\nLog: ~/Library/Logs/NotesCopilot-debug.log",
+            accessibilityStatus, keyboardStatus, monitoringStatus, notesStatus, Bundle.main.bundleURL.path)
+        alert.addButton(withTitle: L10n.text("OK"))
         alert.runModal()
     }
 
@@ -424,7 +445,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 940, height: 640),
                              styleMask: [.titled, .closable, .miniaturizable, .resizable],
                              backing: .buffered, defer: false)
-            w.title = "NotesCopilot 设置"
+            w.title = L10n.text("NotesCopilot Settings")
             w.isReleasedWhenClosed = false
             w.contentView = NSHostingView(rootView: SettingsView(discoverLocalModels: startBackgroundServices))
             w.center()
@@ -454,7 +475,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 960, height: 620),
                              styleMask: [.titled, .closable, .miniaturizable, .resizable],
                              backing: .buffered, defer: false)
-            w.title = "笔记库 · NotesCopilot"
+            w.title = L10n.text("Note Library · NotesCopilot")
             w.isReleasedWhenClosed = false
             w.contentView = NSHostingView(rootView: LibraryView())
             w.center()
@@ -466,7 +487,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc func retryNotesStore() {
         guard startBackgroundServices, notesStore == nil, !notesStoreLoading else { return }
         notesStoreLoading = true
-        notesStoreError = nil
+        notesStoreFailure = nil
         NotificationCenter.default.post(name: .init("nc.storeAvailable"), object: nil)
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             let result = Result { try NotesStore() }
@@ -476,12 +497,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 switch result {
                 case .success(let store):
                     self.notesStore = store
-                    self.notesStoreError = nil
+                    self.notesStoreFailure = nil
                     self.storeWatcher = StoreWatcher(store: store)
                     self.storeWatcher?.start()
                     self.refreshNotesTemplates()
                 case .failure(let error):
-                    self.notesStoreError = error.localizedDescription
+                    self.notesStoreFailure = error
                 }
                 NotificationCenter.default.post(name: .init("nc.storeAvailable"), object: nil)
             }

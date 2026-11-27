@@ -12,10 +12,10 @@ enum ReasoningEffort: String, Codable, CaseIterable, Identifiable, Sendable {
     var id: String { rawValue }
     var label: String {
         switch self {
-        case .minimal: return "Minimal"
-        case .low: return "Low"
-        case .medium: return "Medium"
-        case .high: return "High"
+        case .minimal: return L10n.text("Minimal")
+        case .low: return L10n.text("Low")
+        case .medium: return L10n.text("Medium")
+        case .high: return L10n.text("High")
         }
     }
 
@@ -73,7 +73,7 @@ enum ProfileStore {
                 }
                 return list
             } catch {
-                report(APIError(status: -1, message: "模型配置无法读取，请检查本机配置备份"))
+                report(APIError(status: -1, message: L10n.text("Couldn't read the model profiles. Check your local settings backup.")))
                 return []
             }
         }
@@ -91,7 +91,7 @@ enum ProfileStore {
     @discardableResult
     static func save(_ list: [ModelProfile]) -> Bool {
         guard Set(list.map(\.id)).count == list.count else {
-            report(APIError(status: -1, message: "模型配置存在重复标识，请重新建立重复的配置"))
+            report(APIError(status: -1, message: L10n.text("Some model profiles have duplicate IDs. Recreate the duplicate profiles.")))
             return false
         }
         do {
@@ -102,7 +102,7 @@ enum ProfileStore {
             NotificationCenter.default.post(name: changedNotification, object: nil)
             return true
         } catch {
-            report(APIError(status: -1, message: "模型配置无法保存：\(error.localizedDescription)"))
+            report(APIError(status: -1, message: L10n.format("Couldn't save the model profiles: %@", error.localizedDescription)))
             return false
         }
     }
@@ -174,7 +174,7 @@ enum Config {
 struct APIError: LocalizedError {
     let status: Int
     let message: String
-    var errorDescription: String? { status < 0 ? message : "HTTP \(status)：\(message)" }
+    var errorDescription: String? { status < 0 ? message : L10n.format("HTTP %lld: %@", status, message) }
 }
 
 /// 一轮请求使用同一份值，避免调度、切换配置及重试时混用服务商凭据。
@@ -213,10 +213,10 @@ struct AIRequestConfiguration: Sendable {
         guard let base = Config.apiBase(profile?.baseURL ?? ""),
               let url = URL(string: base), let host = url.host, !host.isEmpty,
               url.scheme == "https" || url.scheme == "http" else {
-            throw APIError(status: -1, message: "Base URL 为空或无效，请检查设置")
+            throw APIError(status: -1, message: L10n.text("The Base URL is missing or invalid. Check Settings."))
         }
         guard let model = profile?.model.trimmingCharacters(in: .whitespacesAndNewlines), !model.isEmpty else {
-            throw APIError(status: -1, message: "尚未配置模型名，请先打开设置")
+            throw APIError(status: -1, message: L10n.text("No model name is configured. Open Settings to add one."))
         }
         let temperature = Self.temperatureIsSupported(for: model) ? Config.temperature : nil
         let temperatureIdentity = temperature.map { "\($0)" } ?? "default"
@@ -237,7 +237,7 @@ enum AIService {
         guard let url = URL(string: base + "/models"),
               let host = url.host, !host.isEmpty,
               url.scheme == "https" || url.scheme == "http" else {
-            throw APIError(status: -1, message: "Base URL 无效，请填写完整的 HTTP/HTTPS 服务地址")
+            throw APIError(status: -1, message: L10n.text("The Base URL is invalid. Enter a full HTTP or HTTPS service address."))
         }
         var req = URLRequest(url: url)
         if !key.isEmpty { req.setValue("Bearer " + key, forHTTPHeaderField: "Authorization") }
@@ -249,7 +249,7 @@ enum AIService {
         }
         guard let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
               let arr = obj["data"] as? [[String: Any]] else {
-            throw APIError(status: -2, message: "模型列表响应格式无效，请检查服务地址与 API 兼容性")
+            throw APIError(status: -2, message: L10n.text("The model list response is invalid. Check the service address and API compatibility."))
         }
         return arr.compactMap { $0["id"] as? String }.sorted()
     }
@@ -269,7 +269,7 @@ enum AIService {
             user = "【\(contextKind.rawValue)】\n\(content)\n\n【任务】\n\(instruction)"
         }
         guard let url = URL(string: configuration.baseURL + "/chat/completions") else {
-            throw APIError(status: -1, message: "Base URL 无效")
+            throw APIError(status: -1, message: L10n.text("The Base URL is invalid."))
         }
         var req = URLRequest(url: url)
         req.httpMethod = "POST"
@@ -301,10 +301,10 @@ enum AIService {
               let choices = obj["choices"] as? [[String: Any]],
               let msg = choices.first?["message"] as? [String: Any],
               let text = msg["content"] as? String, !text.isEmpty else {
-            throw APIError(status: -2, message: "响应格式无法解析或内容为空")
+            throw APIError(status: -2, message: L10n.text("The response is empty or could not be read."))
         }
         if let reason = choices.first?["finish_reason"] as? String, reason != "stop" {
-            let message = reason == "length" ? "已达到输出长度限制，回答尚未完成，请调高输出 tokens 后重试" : "回答未正常完成（\(reason)），请重试"
+            let message = reason == "length" ? L10n.text("The response reached the output limit. Increase the output token limit and try again.") : L10n.format("The response ended early (%@). Try again.", reason)
             throw APIError(status: -3, message: message)
         }
         return text
@@ -458,8 +458,10 @@ final class ChatEngine: ObservableObject {
     /// 覆盖等待 Notes 激活及模板等副作用；停止或开始新工作后，旧代操作必须失效。
     @Published private(set) var operationGeneration = UUID()
 
-    @Published private(set) var responseStatus = ""
-    @Published private(set) var sessionNotice: String?
+    @Published private var responseState: ResponseState?
+    @Published private var sessionChange: SessionChange?
+    var responseStatus: String { responseState?.label ?? "" }
+    var sessionNotice: String? { sessionChange?.label }
     @Published private(set) var canRetry = false
     @Published private(set) var canContinue = false
 
@@ -478,6 +480,63 @@ final class ChatEngine: ObservableObject {
     private var lastRequest: LastRequest?
     private var task: Task<Void, Never>?
     private var currentRequestID: UUID?
+
+    var contextSourceLabel: String {
+        switch contextSource {
+        case "选中文本": return L10n.text("Selected Text")
+        case "光标段落": return L10n.text("Paragraph at Cursor")
+        case "手动输入": return L10n.text("Manual Input")
+        default:
+            let libraryPrefix = "笔记库 · "
+            if contextSource.hasPrefix(libraryPrefix) {
+                let title = String(contextSource.dropFirst(libraryPrefix.count))
+                return L10n.format("Notes Library · %@", title)
+            }
+            return contextSource
+        }
+    }
+
+    static func historyDisplayContent(_ message: [String: Any]) -> String {
+        let content = message["content"] as? String ?? ""
+        let suffix = " 张图片]"
+        guard message["role"] as? String == "user", content.hasSuffix(suffix),
+              let marker = content.range(of: "\n[本轮附带 ", options: .backwards),
+              let count = Int(content[marker.upperBound...].dropLast(suffix.count)), count > 0 else {
+            return content
+        }
+        let note = count == 1
+            ? L10n.text("\n[1 image attached]")
+            : L10n.format("\n[%lld images attached]", count)
+        return String(content[..<marker.lowerBound]) + note
+    }
+
+    private enum ResponseState {
+        case stopped, restored, invalidConfiguration, generating, continuing, completed, failed, incomplete
+
+        var label: String {
+            switch self {
+            case .stopped: return L10n.text("Stopped with an incomplete result")
+            case .restored: return L10n.text("Previous conversation restored")
+            case .invalidConfiguration: return L10n.text("Model configuration unavailable")
+            case .generating: return L10n.text("Generating…")
+            case .continuing: return L10n.text("Continuing…")
+            case .completed: return L10n.text("Complete")
+            case .failed: return L10n.text("Generation failed. You can retry.")
+            case .incomplete: return L10n.text("Response incomplete. The partial result was kept.")
+            }
+        }
+    }
+
+    private enum SessionChange {
+        case note, profile
+
+        var label: String {
+            switch self {
+            case .note: return L10n.text("The source note changed. A new conversation was started.")
+            case .profile: return L10n.text("The model profile changed. A new conversation was started.")
+            }
+        }
+    }
 
     /// 每轮响应独立累积；Published 属性只负责显示，不能作为旧任务的结算来源。
     private struct StreamResult {
@@ -500,7 +559,7 @@ final class ChatEngine: ObservableObject {
         autoInsertNext = false
         dismissReview()
         if wasBusy {
-            responseStatus = "已停止，结果尚未完成"
+            responseState = .stopped
             canRetry = lastRequest != nil
             canContinue = lastRequest != nil && !output.isEmpty
         }
@@ -548,7 +607,7 @@ final class ChatEngine: ObservableObject {
         completionTokens = record.completionTokens
         totalPromptTokens = record.totalPromptTokens
         totalCompletionTokens = record.totalCompletionTokens
-        responseStatus = "已恢复上次会话"
+        responseState = .restored
     }
 
     /// 新会话保留当前笔记上下文；换来源时由 setContext 自动调用。
@@ -561,8 +620,8 @@ final class ChatEngine: ObservableObject {
         lastRequest = nil
         canRetry = false
         canContinue = false
-        responseStatus = ""
-        sessionNotice = nil
+        responseState = nil
+        sessionChange = nil
         promptTokens = 0
         completionTokens = 0
         tokensEstimated = false
@@ -579,7 +638,7 @@ final class ChatEngine: ObservableObject {
             let hadConversation = !history.isEmpty || busy || !output.isEmpty
             beginSession(clearSubmittedPrompt: false)
             images = []
-            if hadConversation { sessionNotice = "笔记来源已变化，已开始新会话" }
+            if hadConversation { sessionChange = .note }
         }
         noteContext = text
         contextSource = source
@@ -592,17 +651,17 @@ final class ChatEngine: ObservableObject {
         contextSource = ""
         contextNoteID = nil
         sessionProfileIdentity = nil
-        sessionNotice = nil
+        sessionChange = nil
         images = []
     }
 
     @discardableResult
     func addImage(_ image: NSImage) -> Bool {
         guard images.count < ImageAttachment.maximumCount else {
-            lastError = "每次最多附带 \(ImageAttachment.maximumCount) 张图片"; return false
+            lastError = L10n.format("You can attach up to %lld images per request.", ImageAttachment.maximumCount); return false
         }
         guard let attachment = ImageAttachment.make(image) else {
-            lastError = "图片无法读取或压缩后仍超过 10 MB，请换用较小图片"; return false
+            lastError = L10n.text("The image couldn't be read or is still over 10 MB after compression. Try a smaller image."); return false
         }
         images.append(attachment)
         return true
@@ -615,7 +674,7 @@ final class ChatEngine: ObservableObject {
         guard !busy, let previous = lastRequest else { return }
         do {
             guard try AIRequestConfiguration.current().profileIdentity == previous.profileIdentity else {
-                lastError = "模型配置已变化，请在当前配置下重新生成"; return
+                lastError = L10n.text("The model profile has changed. Generate again with the current profile."); return
             }
         } catch { lastError = error.localizedDescription; return }
         let prefix = continuing ? output : ""
@@ -659,21 +718,21 @@ final class ChatEngine: ObservableObject {
         stop()
         let configuration: AIRequestConfiguration
         do { configuration = try AIRequestConfiguration.current() }
-        catch { lastError = error.localizedDescription; responseStatus = "配置不可用"; return }
+        catch { lastError = error.localizedDescription; responseState = .invalidConfiguration; return }
         guard images.count <= ImageAttachment.maximumCount else {
-            lastError = "每次最多附带 \(ImageAttachment.maximumCount) 张图片"; return
+            lastError = L10n.format("You can attach up to %lld images per request.", ImageAttachment.maximumCount); return
         }
         if let previous = sessionProfileIdentity, previous != configuration.profileIdentity {
             history = []
             totalPromptTokens = 0
             totalCompletionTokens = 0
-            sessionNotice = "模型配置已切换，已开始新会话"
+            sessionChange = .profile
         }
         sessionProfileIdentity = configuration.profileIdentity
         output = continuationPrefix
         lastError = nil
         busy = true
-        responseStatus = continuationPrefix.isEmpty ? "生成中…" : "续写中…"
+        responseState = continuationPrefix.isEmpty ? .generating : .continuing
         canRetry = false
         canContinue = false
         promptTokens = 0
@@ -711,14 +770,14 @@ final class ChatEngine: ObservableObject {
                 completed = true
             } catch {
                 guard self.currentRequestID == requestID, !Task.isCancelled else { return }
-                if !(error is CancellationError) { self.lastError = "请求失败：" + error.localizedDescription }
+                if !(error is CancellationError) { self.lastError = L10n.format("Request failed: %@", error.localizedDescription) }
             }
             guard self.currentRequestID == requestID, !Task.isCancelled else { return }
             self.busy = false
             self.task = nil
             self.currentRequestID = nil
             self.output = result.output
-            self.responseStatus = completed ? "已完成" : (result.output.isEmpty ? "生成失败，可重试" : "响应未完成，已保留部分结果")
+            self.responseState = completed ? .completed : (result.output.isEmpty ? .failed : .incomplete)
             self.canRetry = !completed
             self.canContinue = !completed && !result.output.isEmpty
             if result.sawContent {
@@ -785,7 +844,7 @@ final class ChatEngine: ObservableObject {
         if includeUsage { body["stream_options"] = ["include_usage": true] }
 
         guard let url = URL(string: configuration.baseURL + "/chat/completions") else {
-            throw APIError(status: -1, message: "Base URL 无效")
+            throw APIError(status: -1, message: L10n.text("The Base URL is invalid."))
         }
         var req = URLRequest(url: url)
         req.httpMethod = "POST"
@@ -818,9 +877,9 @@ final class ChatEngine: ObservableObject {
             tokensEstimated = false
             if result.sawDone { break }
         }
-        guard result.sawContent else { throw APIError(status: -2, message: "服务未返回有效内容，请检查模型与端点后重试") }
+        guard result.sawContent else { throw APIError(status: -2, message: L10n.text("The service returned no usable content. Check the model and endpoint, then try again.")) }
         guard result.sawDone || result.finishReason == "stop" else {
-            throw APIError(status: -3, message: "响应在完成标记前结束，已保留部分结果，可重试或续写")
+            throw APIError(status: -3, message: L10n.text("The stream ended before the completion marker. The partial result was kept. You can retry or continue it."))
         }
     }
 
@@ -832,7 +891,7 @@ final class ChatEngine: ObservableObject {
         guard !payload.isEmpty else { return }
         guard let data = payload.data(using: .utf8),
               let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
-            throw APIError(status: -2, message: "流式响应格式无法解析，已保留部分结果，请重试")
+            throw APIError(status: -2, message: L10n.text("Couldn't read the streamed response. The partial result was kept. Try again."))
         }
         if let error = obj["error"], !(error is NSNull) {
             throw APIError(status: -2, message: AIService.extractMessage(String(payload)))
@@ -850,9 +909,9 @@ final class ChatEngine: ObservableObject {
             result.finishReason = reason
             switch reason {
             case "stop": break
-            case "length": throw APIError(status: -3, message: "已达到输出长度限制，回答尚未完成，可续写或调高输出 tokens 后重试")
-            case "content_filter": throw APIError(status: -3, message: "服务商的内容过滤中止了回答，已保留返回内容")
-            default: throw APIError(status: -3, message: "回答未正常完成（\(reason)），请调整模型或重试")
+            case "length": throw APIError(status: -3, message: L10n.text("The response reached the output limit. Continue it, or increase the output token limit and try again."))
+            case "content_filter": throw APIError(status: -3, message: L10n.text("The provider's content filter stopped the response. The partial result was kept."))
+            default: throw APIError(status: -3, message: L10n.format("The response ended early (%@). Adjust the model or try again.", reason))
             }
         }
     }

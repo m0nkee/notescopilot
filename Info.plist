@@ -10,14 +10,16 @@
 	<string>NotesCopilot</string>
 	<key>CFBundleDisplayName</key>
 	<string>NotesCopilot</string>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>en</string>
 	<key>CFBundleIconFile</key>
 	<string>AppIcon</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
-	<string>2.9.4</string>
+	<string>2.10.0</string>
 	<key>CFBundleVersion</key>
-	<string>15</string>
+	<string>16</string>
 	<key>LSMinimumSystemVersion</key>
 	<string>13.0</string>
 	<key>LSUIElement</key>
@@ -43,6 +45,6 @@
 	<key>NSHighResolutionCapable</key>
 	<true/>
 	<key>NSAppleEventsUsageDescription</key>
-	<string>NotesCopilot 需要读取 Apple Notes 当前笔记的标识，确认选区和 AI 写回目标，并通过脚本创建新笔记。</string>
+	<string>NotesCopilot needs the ID of the current Apple Notes note to verify the selection and where to insert AI results. It also uses Apple events to create new notes.</string>
 </dict>
 </plist>

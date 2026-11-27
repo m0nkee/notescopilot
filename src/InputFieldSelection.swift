@@ -437,7 +437,7 @@ enum InputFieldBridge {
     }
 
     static func write(_ original: InputFieldSelection, text: String, append: Bool, isValid: () -> Bool) async -> String? {
-        let stale = "原应用、输入框或选区已变化。"
+        let stale = L10n.text("The original app, text field, or selection changed.")
         let app = original.host.application
         guard isValid(), let value = original.fieldValue, case .characters(let selected) = original.anchor.extent,
               isCurrent(original) else { return stale }
@@ -488,18 +488,22 @@ enum InputFieldBridge {
         defer { if let restore { restore(); pasteInProgress = false } }
         let paste = needsPaste(element)
         if paste {
-            guard !pasteInProgress, let item = pasteItem(in: app) else { return "该应用的粘贴命令不可用。" }
+            guard !pasteInProgress, let item = pasteItem(in: app) else {
+                return L10n.text("Paste is unavailable in this app.")
+            }
             guard ready(at: selected) else { return stale }
             pasteInProgress = true
             let board = NSPasteboard.general
             restore = NotesBridge.shared.preparePasteboard(text: text, html: nil, pasteboard: board)
             let version = board.changeCount
             guard await prepareInsertion(), board.changeCount == version, board.string(forType: .string) == text else { return stale }
-            guard AXUIElementPerformAction(item, kAXPressAction as CFString) == .success else { return "原应用未接受粘贴。" }
+            guard AXUIElementPerformAction(item, kAXPressAction as CFString) == .success else {
+                return L10n.text("The original app didn’t accept the paste.")
+            }
         } else {
             guard await prepareInsertion() else { return stale }
             guard AXUIElementSetAttributeValue(element, kAXSelectedTextAttribute as CFString, text as CFString) == .success else {
-                return "该输入框未接受替换。"
+                return L10n.text("The text field didn’t accept the replacement.")
             }
         }
         for attempt in 0..<20 {
@@ -510,6 +514,6 @@ enum InputFieldBridge {
             guard attempt < 19 else { break }
             try? await Task.sleep(nanoseconds: 30_000_000)
         }
-        return "无法确认输入框中的最终文字，请查看原文。"
+        return L10n.text("Couldn’t verify the final text. Check the original field.")
     }
 }

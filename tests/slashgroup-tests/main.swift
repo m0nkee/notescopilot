@@ -52,6 +52,28 @@ do {
           "自定义命令不覆盖内置命令")
 }
 
+do {
+    let defaults = UserDefaults.standard
+    let previous = defaults.volatileDomain(forName: UserDefaults.argumentDomain)
+    defer { defaults.setVolatileDomain(previous, forName: UserDefaults.argumentDomain) }
+    var preferences = previous
+    let command = buildSlashCommands().first { $0.alias == "polish" }
+
+    preferences[L10n.preferenceKey] = AppLanguage.english.rawValue
+    defaults.setVolatileDomain(preferences, forName: UserDefaults.argumentDomain)
+    check(command?.displayName == "Polish" && command?.detail == "Make the text clearer and more professional",
+          "缓存命令可显示英文标题和说明")
+    check(AXSlashWatcher.matchSlashToken("/polish")?.id == command?.id
+          && AXSlashWatcher.matchSlashToken("/润色")?.id == command?.id,
+          "英文界面下沿用英文别名和中文命令名")
+
+    preferences[L10n.preferenceKey] = AppLanguage.simplifiedChinese.rawValue
+    defaults.setVolatileDomain(preferences, forName: UserDefaults.argumentDomain)
+    check(command?.displayName == "润色" && command?.detail == "让文字更通顺专业"
+          && AXSlashWatcher.matchSlashToken("/polish")?.id == command?.id,
+          "切回中文即时更新原有命令清单且保留英文别名")
+}
+
 // ---- 1. group 由 action 推导 ----
 do {
     let cmds = buildSlashCommands()

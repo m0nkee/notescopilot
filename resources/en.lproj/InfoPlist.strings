@@ -1,0 +1,1 @@
+"NSAppleEventsUsageDescription" = "NotesCopilot needs the ID of the current Apple Notes note to verify the selection and where to insert AI results. It also uses Apple events to create new notes.";

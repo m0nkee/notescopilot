@@ -18,14 +18,29 @@ struct NoteSummary: Identifiable, Hashable, Sendable {
     var modified: Date?
     var created: Date?
     var folder: String
+    var isUntitled = false
     var id: Int64 { pk }
+    var displayTitle: String { isUntitled || title.isEmpty ? L10n.text("Untitled") : title }
 }
 
 struct NoteContent: Sendable {
     let markdown: String
     let plainText: String
-    let warning: String?
+    private let warnings: [String]
     let isComplete: Bool
+
+    var warning: String? {
+        guard !warnings.isEmpty else { return nil }
+        return warnings.map { NoteReadWarning(rawValue: $0)?.label ?? $0 }
+            .joined(separator: L10n.text(" "))
+    }
+
+    init(markdown: String, plainText: String, warnings: [String] = [], isComplete: Bool) {
+        self.markdown = markdown
+        self.plainText = plainText
+        self.warnings = warnings
+        self.isComplete = isComplete
+    }
 }
 
 struct NoteAIContext: Sendable {
@@ -80,10 +95,10 @@ enum SearchSort: String, CaseIterable {
 
     var label: String {
         switch self {
-        case .updatedDescending: return "修改时间 ↓"
-        case .updatedAscending: return "修改时间 ↑"
-        case .createdDescending: return "创建时间 ↓"
-        case .createdAscending: return "创建时间 ↑"
+        case .updatedDescending: return L10n.text("Modified ↓")
+        case .updatedAscending: return L10n.text("Modified ↑")
+        case .createdDescending: return L10n.text("Created ↓")
+        case .createdAscending: return L10n.text("Created ↑")
         }
     }
 
@@ -104,8 +119,8 @@ enum StoreError: LocalizedError {
     case corrupted(String)
     var errorDescription: String? {
         switch self {
-        case .permissionDenied(let p): return "无法读取 \(p)——需要在「系统设置 › 隐私与安全性 › 完全磁盘访问权限」中授权 NotesCopilot。"
-        case .corrupted(let m): return "数据库异常：\(m)"
+        case .permissionDenied(let p): return L10n.format("Couldn’t read %@. Allow NotesCopilot in System Settings → Privacy & Security → Full Disk Access.", p)
+        case .corrupted(let m): return L10n.format("Database error: %@", m)
         }
     }
 }
@@ -168,7 +183,7 @@ final class NotesStore: @unchecked Sendable {
         let registryColumns = tableColumns("Z_PRIMARYKEY") ?? []
         guard let entityNameCol = ["Z_NAME", "ZNAME"].first(where: { registryColumns.contains($0) }),
               let rows = query("SELECT Z_ENT, \(entityNameCol) FROM Z_PRIMARYKEY") else {
-            throw StoreError.corrupted("无法读取 Notes 实体映射表 Z_PRIMARYKEY")
+            throw StoreError.corrupted(L10n.text("Couldn't read the Notes entity map Z_PRIMARYKEY."))
         }
         for r in rows {
             let ent = (r[0] as? Int64) ?? -1
@@ -180,7 +195,7 @@ final class NotesStore: @unchecked Sendable {
         }
         // 列名自适应（不同 macOS 版本列名有差异）
         guard let cols = tableColumns("ZICCLOUDSYNCINGOBJECT"), !cols.isEmpty else {
-            throw StoreError.corrupted("未找到 ZICCLOUDSYNCINGOBJECT 表")
+            throw StoreError.corrupted(L10n.text("The ZICCLOUDSYNCINGOBJECT table is missing."))
         }
         if !cols.contains(noteTitleCol) { noteTitleCol = cols.first { $0.hasPrefix("ZTITLE") } ?? "ZTITLE1" }
         noteCreatedCol = cols.contains("ZCREATIONDATE1") ? "ZCREATIONDATE1"
@@ -271,7 +286,7 @@ final class NotesStore: @unchecked Sendable {
         return (query(sql, [folderEnt]) ?? []).compactMap { r in
             guard let pk = r[0] as? Int64, let name = r[1] as? String else { return nil }
             let t = (r[2] as? Int64) ?? 0
-            return (pk, t == 0 ? name : (name.isEmpty ? "智能文件夹" : name))
+            return (pk, t == 0 ? name : (name.isEmpty ? L10n.text("Smart Folder") : name))
         }
     }
 
@@ -289,13 +304,15 @@ final class NotesStore: @unchecked Sendable {
         if ts2 > 0 {
             created = Date(timeIntervalSinceReferenceDate: ts2)
         }
+        let title = row[2] as? String
         return NoteSummary(pk: pk,
                            uuid: (row[1] as? String) ?? "",
-                           title: (row[2] as? String) ?? "无标题",
+                           title: title ?? "无标题",
                            snippet: (row[3] as? String) ?? "",
                            modified: date,
                            created: created,
-                           folder: (row[5] as? String) ?? "")
+                           folder: (row[5] as? String) ?? "",
+                           isUntitled: title == nil)
     }
 
     // MARK: 话题标签（证据：行内附件 UTI + ZTOKENCONTENTIDENTIFIER COLLATE NOCASE + JOIN ZNOTE1）
@@ -385,14 +402,12 @@ final class NotesStore: @unchecked Sendable {
 
     func content(for note: NoteSummary) -> NoteContent {
         if let doc = document(for: note.pk) {
-            let warning = doc.warnings.isEmpty ? nil : doc.warnings.joined(separator: "；")
             let markdown = MarkdownConverter.convert(note: note, doc: doc)
             return NoteContent(markdown: markdown, plainText: doc.text,
-                               warning: warning, isComplete: doc.isComplete)
+                               warnings: doc.warnings, isComplete: doc.isComplete)
         }
-        let warning = "无法读取完整正文（可能为加密笔记或不支持的数据格式），当前仅显示摘要。"
         return NoteContent(markdown: MarkdownConverter.convert(note: note, doc: nil),
-                           plainText: note.snippet, warning: warning, isComplete: false)
+                           plainText: note.snippet, warnings: [NoteReadWarning.summaryOnly.rawValue], isComplete: false)
     }
 
     // MARK: 全文检索（复刻 Liberator.sqlite 的 FTS documents 表 + remove_diacritics=2）
@@ -400,13 +415,13 @@ final class NotesStore: @unchecked Sendable {
     private func buildFTS() throws {
         var mem: OpaquePointer?
         guard sqlite3_open(":memory:", &mem) == SQLITE_OK, let mem else {
-            throw StoreError.corrupted("无法创建内存索引")
+            throw StoreError.corrupted(L10n.text("Couldn't create the in-memory index."))
         }
         fts = mem
         // Keep a plain, folded-text index as well: unicode61 cannot find CJK
         // substrings, and older system SQLite builds may not provide FTS5.
         guard sqlite3_exec(fts, "CREATE TABLE search_documents (id INTEGER PRIMARY KEY, text TEXT NOT NULL)", nil, nil, nil) == SQLITE_OK else {
-            throw StoreError.corrupted("无法创建搜索索引")
+            throw StoreError.corrupted(L10n.text("Couldn't create the search index."))
         }
         hasFTS = enableFTS && sqlite3_exec(fts, "CREATE VIRTUAL TABLE documents USING fts5(title, snippet, body, tokenize='unicode61 remove_diacritics 2')", nil, nil, nil) == SQLITE_OK
         if enableFTS && !hasFTS {

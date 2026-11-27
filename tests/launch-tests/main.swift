@@ -442,6 +442,14 @@ struct LaunchTests {
             print("UNAVAILABLE  No WindowServer screen connection; lifecycle assertions were not run.")
             exit(77)
         }
+        L10n.shared.select(.simplifiedChinese)
+        check(AppLanguage.system.resolved(preferredLanguages: ["ja-JP", "zh-TW"]) == .simplifiedChinese
+              && AppLanguage.system.resolved(preferredLanguages: ["ja-JP"]) == .english
+              && AppLanguage.english.resolved(preferredLanguages: ["zh-CN"]) == .english,
+              "follow system selects the first supported language and falls back to English")
+        check(UserDefaults.standard.string(forKey: L10n.preferenceKey) == AppLanguage.simplifiedChinese.rawValue
+              && L10n(defaults: .standard).language == .simplifiedChinese,
+              "the explicit language preference is saved and restored")
         let leftArea = NSRect(x: 0, y: 1085, width: 771, height: 32)
         let rightArea = NSRect(x: 956, y: 1085, width: 772, height: 32)
         check(AppDelegate.statusFrameOverlapsNotch(NSRect(x: 859, y: 1084, width: 38, height: 33), leftArea: leftArea, rightArea: rightArea),
@@ -523,6 +531,23 @@ struct LaunchTests {
             check(configured.engine.output == "Synthetic preserved result" && configured.engine.noteContext == "Synthetic preserved context",
                   "opening settings preserves current result and context")
 
+            let openSettings = app.windows.first { $0.title == "NotesCopilot 设置" && $0.isVisible }
+            L10n.shared.select(.english)
+            settle()
+            check(openSettings?.title == "NotesCopilot Settings" && hasWindow("NotesCopilot Settings")
+                  && app.mainMenu?.items.dropFirst().first?.submenu?.title == "Edit" && SettingsPage.general.title == "General & Diagnostics",
+                  "switching to English refreshes the existing settings window and application menu")
+            configured.showLibrary()
+            settle()
+            let openLibrary = app.windows.first { $0.title == "Note Library · NotesCopilot" && $0.isVisible }
+            L10n.shared.select(.simplifiedChinese)
+            settle()
+            check(openLibrary?.title == "笔记库 · NotesCopilot" && openSettings?.title == "NotesCopilot 设置"
+                  && app.mainMenu?.items.dropFirst().first?.submenu?.title == "编辑",
+                  "switching back to Chinese refreshes already-open windows")
+            check(configured.engine.output == "Synthetic preserved result" && configured.engine.noteContext == "Synthetic preserved context",
+                  "changing the interface language preserves chat content")
+
             let unconfigured = try launch(configured: false)
             check(hasWindow("NotesCopilot 设置") && !hasWindow("NotesCopilot"), "unconfigured cold launch displays settings")
             let settings = app.windows.first(where: { $0.title == "NotesCopilot 设置" && $0.isVisible })!
@@ -549,6 +574,7 @@ struct LaunchTests {
             check(false, "launch harness error: \(error.localizedDescription)")
         }
         closeWindows()
+        UserDefaults.standard.removeObject(forKey: L10n.preferenceKey)
         print("NOTE  选区检查使用合成文稿与确定性的模型响应。")
         print(failed == 0 ? "全部通过：\(passed) 项" : "失败 \(failed) 项 / 共 \(passed + failed) 项")
         exit(failed == 0 ? 0 : 1)

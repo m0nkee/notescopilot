@@ -68,6 +68,7 @@ final class SlashSuggestPanel: NSObject, NSWindowDelegate {
     private weak var keyboardHint: NSTextField?
     private var items: [SlashCommand] = []
     private var rows: [Row] = []
+    private var displayedLocale: Locale?
     /// 当前查询串（如 "/polish"），选中执行时删除它
     private var query = ""
     private var target: NotesBridge.SelectionSnapshot?
@@ -93,6 +94,7 @@ final class SlashSuggestPanel: NSObject, NSWindowDelegate {
         guard let target = NotesBridge.shared.readTextSnapshot() else { hide(); return }
         let queryChanged = query != newQuery
         let sameItems = itemsEqual(newItems)
+        let locale = L10n.shared.locale
         self.target = target
         self.query = newQuery
         // 即使名称没变，也替换 action 快照，避免执行已修改的旧 Notes 模板正文。
@@ -100,7 +102,7 @@ final class SlashSuggestPanel: NSObject, NSWindowDelegate {
         rows = Self.buildRows(items)
         refreshKeyboardHint()
         // 内容未变且面板已在：仅跟随光标移动，避免每 120ms 重绘
-        if !queryChanged, sameItems, let p = panel, p.isVisible {
+        if !queryChanged, sameItems, displayedLocale == locale, let p = panel, p.isVisible {
             relocateIfNeeded(cursorRect)
             return
         }
@@ -118,8 +120,11 @@ final class SlashSuggestPanel: NSObject, NSWindowDelegate {
 
         place(cursorRect: cursorRect, width: w, height: h)
         suppressSelection = true
+        displayedLocale = locale
         tableView?.reloadData()
-        selectedRow = Self.initialCmdRow(for: newQuery, rows: rows)
+        if queryChanged || !sameItems || !panel.isVisible {
+            selectedRow = Self.initialCmdRow(for: newQuery, rows: rows)
+        }
         if let selectedRow {
             tableView?.selectRowIndexes(IndexSet(integer: selectedRow), byExtendingSelection: false)
         } else {
@@ -216,9 +221,9 @@ final class SlashSuggestPanel: NSObject, NSWindowDelegate {
 
     private func itemsEqual(_ newItems: [SlashCommand]) -> Bool {
         guard newItems.count == items.count else { return false }
-        for (a, b) in zip(items, newItems)
-            where a.alias != b.alias || a.name != b.name || a.detail != b.detail || a.group != b.group { return false }
-        return true
+        return zip(items, newItems).allSatisfy { a, b in
+            a.id == b.id || (a.alias == b.alias && a.name == b.name && a.detail == b.detail && a.group == b.group)
+        }
     }
 
     private func buildPanel(width: CGFloat) {
@@ -302,9 +307,9 @@ final class SlashSuggestPanel: NSObject, NSWindowDelegate {
     private func refreshKeyboardHint() {
         keyboardHint?.stringValue = KeywordListener.shared.isRunning
             ? (SlashQuery.isCategory(query) && selectedRow == nil
-                ? "↑↓ 先选择    ⏎ 执行    esc 关闭    点击直接执行"
-                : "↑↓ 选择    ⏎ 执行    esc 关闭    点击直接执行")
-            : "键盘监听未启动 · 可点击命令 · 请检查辅助功能授权"
+                ? L10n.text("↑↓ Select first  ⏎ Run  Esc Close  Click to run")
+                : L10n.text("↑↓ Select  ⏎ Run  Esc Close  Click to run"))
+            : L10n.text("Click a command · Check Accessibility access")
     }
 
     /// Quartz 坐标（左上原点）→ AppKit 坐标（左下原点），并尽量放在光标下方
@@ -429,11 +434,11 @@ extension SlashSuggestPanel: NSTableViewDataSource, NSTableViewDelegate {
         let id = NSUserInterfaceItemIdentifier("cmdCell")
         let v = tableView.makeView(withIdentifier: id, owner: nil) as? NSTableCellView
             ?? makeCell(id: id)
-        v.textField?.stringValue = item.name
+        v.textField?.stringValue = item.displayName
         if let detail = v.viewWithTag(99) as? NSTextField { detail.stringValue = item.detail }
         if let alias = v.viewWithTag(98) as? NSTextField {
             // 中文名模板（alias 为空）显示 /模板名 不可盲打，改显示「模板」标记
-            alias.stringValue = item.alias.isEmpty ? "模板" : "/" + item.alias
+            alias.stringValue = item.alias.isEmpty ? L10n.text("Template") : "/" + item.alias
         }
         return v
     }

@@ -18,6 +18,7 @@ swiftc -O -D NC_APP -sdk "$SDK" -target arm64-apple-macos13 -module-cache-path "
   src/*.swift
 cp Info.plist "$APP/Contents/Info.plist"
 cp "$ICON" "$APP/Contents/Resources/AppIcon.icns"
+cp -R resources/. "$APP/Contents/Resources/"
 # 使用稳定开发身份，避免每次重建的 adhoc 哈希改变系统权限身份。
 # NC_CODESIGN_IDENTITY 可指定证书名称/哈希；设为 - 可离线构建且不触发私钥授权。
 SIGN_IDENTITY="${NC_CODESIGN_IDENTITY:-}"

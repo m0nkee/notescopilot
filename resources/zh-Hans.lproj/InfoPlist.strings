@@ -1,0 +1,1 @@
+"NSAppleEventsUsageDescription" = "NotesCopilot 需要读取 Apple Notes 当前笔记的标识，确认选区和 AI 写回目标，并通过脚本创建新笔记。";

@@ -9,7 +9,8 @@ OUT="$(mktemp -d "${TMPDIR:-/private/tmp}/notescopilot-launch.XXXXXX")"
 trap 'rm -rf "$OUT"' EXIT
 APP="$OUT/NotesCopilotLaunchTests.app"
 MODULE_CACHE="${TMPDIR:-/private/tmp}/notescopilot-swift-module-cache"
-mkdir -p "$APP/Contents/MacOS" "$MODULE_CACHE"
+mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources" "$MODULE_CACHE"
+cp -R resources/. "$APP/Contents/Resources/"
 # Swift still parses top-level expressions in inactive conditional blocks in a
 # non-main source file. Copy the real delegate while omitting its process entry.
 awk '/^\/\/ MARK: - 入口/ { exit } { print }' src/main.swift > "$OUT/AppDelegate.swift"
