@@ -4,6 +4,8 @@
 
 # NotesCopilot
 
+简体中文 · [English](README.en.md)
+
 在 Apple Notes 里写作，也能在 Mac 上直接处理选中的文字。
 
 [下载 v2.10.0 · Apple Silicon](https://github.com/m0nkee/notescopilot/releases/download/v2.10.0/NotesCopilot-2.10.0-arm64.dmg) · [发布说明与校验文件](https://github.com/m0nkee/notescopilot/releases/tag/v2.10.0) · [使用手册](docs/USAGE.md)
