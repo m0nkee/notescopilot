@@ -315,7 +315,10 @@ enum InputFieldBridge {
               front.processIdentifier == host.application.processIdentifier || front.processIdentifier == ProcessInfo.processInfo.processIdentifier,
               let current = anchor(in: host.application), case .input(let currentHost) = current.source,
               CFEqual(host.window, currentHost.window), CFEqual(original.element, current.element),
-              host.editable == currentHost.editable, current.extent.identity == original.extent.identity else { return nil }
+              current.extent.identity == original.extent.identity else { return nil }
+        // A pointer hit can discover the selection before the editor gains focus.
+        // Capture derives permission from the live field; a read-only observation
+        // must not permanently downgrade the same window, element and range.
         return current
     }
 

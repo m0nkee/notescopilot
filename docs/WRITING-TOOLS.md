@@ -46,7 +46,7 @@ Apple 的系统工具可能扩展到完整句子，并利用周围文本理解�
 
 WWDC24 演示中，使用 TextKit 2 的原生文本视图可承载完整行内体验，TextKit 1 显示面板。WKWebView 默认采用受限体验，宿主可以调整配置。WWDC25 进一步展示了自定义编辑器如何把范围、位置和内容更新交给协调器。这些能力依赖编辑器本身的配合。[WWDC24 的文本视图说明](https://developer.apple.com/videos/play/wwdc2024/10168/) · [AppKit Writing Tools](https://developer.apple.com/documentation/appkit/writing-tools) · [WWDC25 自定义编辑器演示](https://developer.apple.com/videos/play/wwdc2025/265/)
 
-系统服务也能声明返回类型，由支持接收结果的宿主读回。提供者回调接收粘贴板、用户数据和错误指针，接口没有可长期持有的原文档范围。需要同步返回结果的服务默认等待 30 秒。本项目的模型请求允许等待 120 秒，随后还要给用户留出审阅时间。因此本次选择只声明输入类型，用户看完再复制。项目继续支持 Apple Silicon 上的 macOS 13 及以上，生成使用项目现有的模型配置，可以在 Apple 智能关闭时使用。[Apple 的服务回调](https://developer.apple.com/library/archive/documentation/Cocoa/Conceptual/SysServices/Articles/providing.html) · [服务输入、返回及超时](https://developer.apple.com/library/archive/documentation/Cocoa/Conceptual/SysServices/Articles/properties.html)
+系统服务也能声明返回类型，由支持接收结果的宿主读回。提供者回调接收粘贴板、用户数据和错误指针，接口没有可长期持有的原文档范围。需要同步返回结果的服务默认等待 30 秒。本项目的模型请求允许等待 120 秒，随后还要给用户留出审阅时间。因此服务只声明输入类型。回调时，若浮钮已定位前台可编辑控件，且实时选区与服务文本逐字匹配，结果面板会沿用该写回目标；无法验证时提供复制。项目继续支持 Apple Silicon 上的 macOS 13 及以上，生成使用项目现有的模型配置，可以在 Apple 智能关闭时使用。[Apple 的服务回调](https://developer.apple.com/library/archive/documentation/Cocoa/Conceptual/SysServices/Articles/providing.html) · [服务输入、返回及超时](https://developer.apple.com/library/archive/documentation/Cocoa/Conceptual/SysServices/Articles/properties.html)
 
 全局模式只检查前台应用。可读选区稳定后显示浮钮并在内存中暂存选中文字，宿主提供选区坐标时贴近选区摆放，无法取坐标时使用鼠标位置。鼠标移向浮钮期间，宿主重绘导致的空选区不会收起浮钮。展开时才读取可编辑字段全文用于本地校验。原选区已消失时仍可用暂存的摘录翻译或总结，结果可以复制。用户点动作时，只把选中文字和指令交给模型。系统服务由菜单或快捷键触发，适用于其他能导出文字的控件。
 

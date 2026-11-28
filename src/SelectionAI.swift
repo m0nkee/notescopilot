@@ -562,6 +562,10 @@ final class SelectionAIPanel: NSObject, ObservableObject {
             present(.unavailable, focus: true)
             return
         }
+        showMenu(for: selection)
+    }
+
+    private func showMenu(for selection: WritingSelection) {
         request.select(selection)
         if case .input = selection { waitingForSourceGesture = true }
         if case .notes = selection { formats = NotesFormatButton.items(presenting: formatTitles()) }
@@ -569,7 +573,7 @@ final class SelectionAIPanel: NSObject, ObservableObject {
         present(.menu, focus: true)
     }
 
-    /// A Services pasteboard carries the input text, without a durable document or range identity.
+    /// A Services request can reuse a verified live launcher. A pasteboard alone has no write target.
     @objc(openSelectionWritingTools:userData:error:)
     func openSelectionWritingTools(_ pasteboard: NSPasteboard, userData: String?,
                                    error: AutoreleasingUnsafeMutablePointer<NSString?>?) {
@@ -579,6 +583,28 @@ final class SelectionAIPanel: NSObject, ObservableObject {
             return
         }
         error?.pointee = nil
+        // Bind only the selection already observed in the frontmost source. Never
+        // search another document for text that happens to match the pasteboard.
+        if phase == .launcher, let anchor, let front = NSWorkspace.shared.frontmostApplication {
+            let target: WritingSelection?
+            switch anchor.source {
+            case .input(let host):
+                if front.processIdentifier == host.application.processIdentifier,
+                   SelectionScope.allowsApplication(front, in: defaults),
+                   let field = InputFieldBridge.capture(anchor), field.fieldValue != nil {
+                    target = .input(field)
+                } else { target = nil }
+            case .notes:
+                if front.bundleIdentifier == NotesBridge.notesBundleID,
+                   let snap = notes.readSelectionSnapshot(), anchor.matches(snap.element, snap.range) {
+                    target = .notes(snap)
+                } else { target = nil }
+            }
+            if let target, target.text.utf16.elementsEqual(text.utf16) {
+                showMenu(for: target)
+                return
+            }
+        }
         resetSession()
         request.select(.service(text))
         placement = Self.screenRect(for: nil)

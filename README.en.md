@@ -8,7 +8,7 @@ English · [简体中文](README.md)
 
 Write in Apple Notes and work with selected text across your Mac.
 
-[Download v2.10.0 for Apple silicon](https://github.com/m0nkee/notescopilot/releases/download/v2.10.0/NotesCopilot-2.10.0-arm64.dmg) · [Release notes and checksum](https://github.com/m0nkee/notescopilot/releases/tag/v2.10.0) · [User guide (Chinese)](docs/USAGE.md)
+[Download v2.10.1 for Apple silicon](https://github.com/m0nkee/notescopilot/releases/download/v2.10.1/NotesCopilot-2.10.1-arm64.dmg) · [Release notes and checksum](https://github.com/m0nkee/notescopilot/releases/tag/v2.10.1) · [User guide (Chinese)](docs/USAGE.md)
 
 </div>
 
@@ -30,7 +30,7 @@ NotesCopilot is a native macOS menu bar app. By default, the floating launcher a
 | Body of an Apple Notes note | Copy the result, replace the selection, append after it, or apply native formatting from **Notes Formatting** |
 | Read-only text, such as web pages or chat replies | Review and copy the result. If a chat page redraws, a translation already in progress stays in the panel |
 | Supported editable fields | Copy the result. Replace or append when NotesCopilot can verify the original window, field contents, and selection |
-| Apps that support text services | Open **Services → Process Selected Text with NotesCopilot** to review and copy the result |
+| Apps that support text services | Open **Services → Process Selected Text with NotesCopilot** to review the result. If the launcher has identified the same editable selection, you can also append or replace it |
 
 Press `M` to open the tools and `T` to translate. When the translation appears, press `C` to copy it or `O` to compare it with the original. If the selection is still writable, press `A` to append or `R` to replace. While typing an instruction, letter keys enter text. Press `Esc` to return to the tools, then press it again to close them.
 
@@ -44,7 +44,7 @@ The project has tested replacing and appending text in Chrome’s address bar, s
 
 Choose **Follow System**, **简体中文**, or **English** under **Settings → General & Diagnostics → Interface Language**. The app interface switches immediately and remembers your choice. macOS permission prompts and the Services menu use the language selected in macOS.
 
-1. Download the DMG, drag `NotesCopilot.app` into Applications, and open it. The release requires **Apple silicon and macOS 13 or later**. The release page also provides `NotesCopilot-2.10.0-arm64.dmg.sha256`.
+1. Download the DMG, drag `NotesCopilot.app` into Applications, and open it. The release requires **Apple silicon and macOS 13 or later**. The release page also provides `NotesCopilot-2.10.1-arm64.dmg.sha256`.
 2. In Settings, choose a provider or local model, enter any required credentials, and click **Save Profiles**. NotesCopilot supports DeepSeek, Kimi, Qwen, OpenAI, OpenRouter, SiliconFlow, and custom OpenAI-compatible endpoints. It can discover local Ollama, LM Studio, llama.cpp, and vLLM endpoints.
 3. Allow NotesCopilot in **System Settings → Privacy & Security → Accessibility**. Enable the corresponding permissions if you plan to write back to Notes or index your notes locally.
 

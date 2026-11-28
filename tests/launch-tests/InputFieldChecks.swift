@@ -4,7 +4,10 @@ import ApplicationServices
 extension LaunchTests {
     static func checkGlobalInputFields() async throws {
         guard let executable = ProcessInfo.processInfo.environment["NC_INPUT_FIELD_FIXTURE"] else { return }
-        guard AXIsProcessTrusted() else {
+        // Only an explicitly interactive run should prompt on the user's desktop.
+        let prompt = ProcessInfo.processInfo.environment["NC_REQUEST_TEST_ACCESSIBILITY"] == "1"
+        let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: prompt]
+        guard AXIsProcessTrustedWithOptions(options as CFDictionary) else {
             check(false, "cross-process input-field tests require Accessibility for the test runner")
             return
         }
@@ -70,6 +73,32 @@ extension LaunchTests {
         watcher.scopeDidChange()
         let action = selectionQuickActions.first { $0.name == "精简" }!
 
+        if let focused = InputFieldBridge.anchor(in: host), case .input(let editor) = focused.source {
+            let initialHit = TextSelectionAnchor(element: focused.element, extent: focused.extent,
+                source: .input(InputFieldHost(application: host, window: editor.window, editable: false)))
+            let captured = InputFieldBridge.openSelection(initialHit, excerpt: InputFieldBridge.launcherExcerpt(initialHit))
+            check(captured?.fieldValue == sample, "opening a pointer-discovered selection recognizes the now-focused editor")
+        } else { check(false, "the fixture exposes its focused editor") }
+        let serviceBoard = NSPasteboard.withUniqueName()
+        defer { serviceBoard.releaseGlobally() }
+        for append in [false, true] {
+            try await send("first")
+            try await waitFor("editable launcher before Services") { panel.phase == .launcher && panel.isInputSession }
+            serviceBoard.clearContents()
+            serviceBoard.setString("目标", forType: .string)
+            panel.openSelectionWritingTools(serviceBoard, userData: nil, error: nil)
+            panel.run(action)
+            await request.task?.value
+            check(panel.canWrite, "Services keeps the verified editable source")
+            panel.prepareWrite(append: append)
+            panel.confirmPendingWrite()
+            try await waitFor("Services writeback") { !panel.writing }
+            try await send("inspect-service-" + String(append))
+            check(state()["first"] == (append ? "开头🙂 目标 / 目标新文字 结尾" : "开头🙂 目标 / 新文字 结尾"),
+                  "Services writes to the selected duplicate and preserves its surroundings")
+            panel.hide()
+            watcher.scopeDidChange()
+        }
         let translate = selectionQuickActions.first { $0.name == "翻译" }!
         try await send("readonly")
         try await waitFor("read-only translation launcher") { panel.isInputSession && panel.phase == .launcher }
