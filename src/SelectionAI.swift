@@ -36,7 +36,7 @@ let selectionQuickActions: [SelectionQuickAction] = [
 ]
 
 enum SelectionReviewKey: String {
-    case original = "o", copy = "c", back = "b", generate = "g", append = "a", replace = "r"
+    case original = "o", copy = "c", back = "b", generate = "g", append = "a", replace = "r", insert = "i", followUp = "f"
 }
 
 enum WritingSelection {
@@ -310,7 +310,16 @@ enum SelectionDiff {
 @MainActor
 final class SelectionAIRequest {
     typealias Completion = (String, String) async throws -> String
-    private let complete: Completion?
+    typealias ConversationCompletion = (String, String, [ChatMessageRecord]) async throws -> String
+
+    private struct Prompt {
+        let instruction: String
+        let history: [ChatMessageRecord]
+    }
+
+    private let complete: ConversationCompletion?
+    private var submittedPrompt: Prompt?
+    private var answeredPrompt: Prompt?
     private var requestID: UUID?
     private var writeOperationID: UUID?
     private(set) var selection: WritingSelection?
@@ -323,7 +332,11 @@ final class SelectionAIRequest {
     private(set) var task: Task<Void, Never>?
     var onChange: (() -> Void)?
 
-    init(complete: Completion? = nil) { self.complete = complete }
+    init(conversationCompletion: ConversationCompletion? = nil) { complete = conversationCompletion }
+
+    convenience init(complete: @escaping Completion) {
+        self.init(conversationCompletion: { instruction, context, _ in try await complete(instruction, context) })
+    }
 
     func select(_ selection: WritingSelection) {
         cancel()
@@ -336,6 +349,8 @@ final class SelectionAIRequest {
         task?.cancel()
         task = nil
         selection = nil
+        submittedPrompt = nil
+        answeredPrompt = nil
         resultText = ""
         generatedText = ""
         lastError = nil
@@ -343,23 +358,40 @@ final class SelectionAIRequest {
         busy = false
     }
 
-    func run(instruction: String) {
+    func run(instruction: String, followUp: Bool = false) {
+        var history: [ChatMessageRecord] = []
+        if followUp, case .instruction = selection, let answeredPrompt {
+            // A follow-up refers to the version the user last saw or edited.
+            history = answeredPrompt.history
+            history.append(ChatMessageRecord(role: "user", content: answeredPrompt.instruction))
+            history.append(ChatMessageRecord(role: "assistant", content: resultText))
+            history = Array(history.suffix(ChatEngine.historyMessageLimit))
+        }
+        submit(Prompt(instruction: instruction, history: history))
+    }
+
+    func regenerate() {
+        if let submittedPrompt { submit(submittedPrompt) }
+    }
+
+    private func submit(_ prompt: Prompt) {
         guard let selection else { return }
+        submittedPrompt = prompt
         writeOperationID = nil
         requestID = nil
         task?.cancel()
         task = nil
         lastError = nil
         needsConfiguration = false
-        let operation: Completion
+        let operation: ConversationCompletion
         do {
             if let complete {
                 operation = complete
             } else {
                 let configuration = try AIRequestConfiguration.current()
-                operation = { instruction, context in
+                operation = { instruction, context, history in
                     try await AIService.complete(instruction: instruction, context: context,
-                                                 contextKind: .selection, configuration: configuration)
+                                                 contextKind: .selection, configuration: configuration, history: history)
                 }
             }
         } catch {
@@ -375,11 +407,12 @@ final class SelectionAIRequest {
         onChange?()
         task = Task { @MainActor [weak self] in
             do {
-                let text = try await operation(instruction, selection.text)
+                let text = try await operation(prompt.instruction, selection.text, prompt.history)
                 guard let self, !Task.isCancelled, self.requestID == id else { return }
                 guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
                     throw APIError(status: -2, message: L10n.text("The model returned no text. Try again."))
                 }
+                self.answeredPrompt = prompt
                 self.resultText = text
                 self.generatedText = text
                 self.busy = false
@@ -444,6 +477,7 @@ final class SelectionAIPanel: NSObject, ObservableObject {
     private var placement = NSRect.zero
     private var returnApplication: NSRunningApplication?
     private var instructionSource: NSRunningApplication?
+    private var insertionTarget: InstructionInsertionTarget?
     private var sessionID = UUID()
     private(set) var action: SelectionQuickAction?
     private(set) var formats: [NotesFormatItem] = []
@@ -453,7 +487,7 @@ final class SelectionAIPanel: NSObject, ObservableObject {
     @Published private(set) var staleSelection = false
     @Published var showingOriginal = false
     @Published var showingDiff = false
-    @Published var pendingWriteAppend: Bool?
+    @Published private(set) var isComposingFollowUp = false
     @Published var customInstruction = ""
 
     init(request: SelectionAIRequest? = nil, notes: NotesBridge = .shared, defaults: UserDefaults = .standard,
@@ -600,6 +634,7 @@ final class SelectionAIPanel: NSObject, ObservableObject {
     func openStandaloneInstruction(returningTo app: NSRunningApplication? = nil) {
         resetSession()
         instructionSource = app
+        insertionTarget = app.flatMap { allowsHost($0) ? InstructionInsertionTarget.capture(in: $0) : nil }
         request.select(.instruction)
         placement = Self.screenRect(for: nil)
         present(.menu, focus: true)
@@ -653,6 +688,7 @@ final class SelectionAIPanel: NSObject, ObservableObject {
         anchor = nil
         returnApplication = nil
         instructionSource = nil
+        insertionTarget = nil
         formats = []
         action = nil
         status = ""
@@ -660,7 +696,7 @@ final class SelectionAIPanel: NSObject, ObservableObject {
         staleSelection = false
         showingOriginal = false
         showingDiff = false
-        pendingWriteAppend = nil
+        isComposingFollowUp = false
         customInstruction = ""
     }
 
@@ -798,7 +834,8 @@ final class SelectionAIPanel: NSObject, ObservableObject {
         showingOriginal = false
         showingDiff = false
         present(.working)
-        request.run(instruction: action.instruction.prompt(for: original))
+        request.run(instruction: action.instruction.prompt(for: original), followUp: isComposingFollowUp)
+        isComposingFollowUp = false
     }
 
     func runCustom() {
@@ -819,8 +856,14 @@ final class SelectionAIPanel: NSObject, ObservableObject {
             switch key {
             case .back: chooseAnotherTool()
             case .generate:
-                guard let action else { return false }
-                run(action)
+                guard action != nil else { return false }
+                regenerate()
+            case .followUp:
+                guard isStandaloneSession, !result.isEmpty else { return false }
+                beginFollowUp()
+            case .insert:
+                guard canInsert else { return false }
+                insertResult()
             case .original, .copy:
                 guard !result.isEmpty else { return false }
                 if key == .original {
@@ -830,7 +873,7 @@ final class SelectionAIPanel: NSObject, ObservableObject {
                 } else { copyPreview() }
             case .append, .replace:
                 guard canWrite else { return false }
-                prepareWrite(append: key == .append)
+                writeResult(append: key == .append)
             }
         default: return false
         }
@@ -844,7 +887,7 @@ final class SelectionAIPanel: NSObject, ObservableObject {
         status = ""
         showingOriginal = false
         showingDiff = false
-        pendingWriteAppend = nil
+        isComposingFollowUp = false
         present(.menu)
     }
 
@@ -881,30 +924,50 @@ final class SelectionAIPanel: NSObject, ObservableObject {
         present(.review)
     }
 
-    func prepareWrite(append: Bool) {
-        guard canWrite else { return }
-        pendingWriteAppend = append
+    func beginFollowUp() {
+        guard phase == .review, isStandaloneSession, !writing, !result.isEmpty else { return }
+        customInstruction = ""
+        status = ""
+        isComposingFollowUp = true
+        present(.menu, focus: true)
     }
 
-    func cancelWritePreview() {
-        pendingWriteAppend = nil
+    func regenerate() {
+        guard phase == .review, !writing, action != nil else { return }
+        guard isSourceAllowed else { hide(); return }
+        status = ""
+        showingOriginal = false
+        showingDiff = false
+        present(.working)
+        request.regenerate()
     }
 
-    func confirmPendingWrite() {
-        guard let append = pendingWriteAppend else { return }
-        pendingWriteAppend = nil
-        writeResult(append: append)
+    var hasInsertionTarget: Bool { isStandaloneSession && insertionTarget != nil }
+    var canInsert: Bool {
+        hasInsertionTarget && phase == .review && !writing && !result.isEmpty && isSourceAllowed
     }
 
-    var writePreviewTitle: String {
-        pendingWriteAppend == true
-            ? L10n.text("Append to the Original Selection")
-            : L10n.text("Replace the Original Selection")
-    }
-
-    var writePreviewText: String {
-        guard let append = pendingWriteAppend else { return "" }
-        return append ? result : L10n.format("Original:\n%@\n\nReplacement:\n%@", original, result)
+    func insertResult() {
+        guard canInsert, let target = insertionTarget else { return }
+        let session = sessionID
+        let text = result
+        writing = true
+        status = ""
+        panel?.orderOut(nil)
+        Task { @MainActor in
+            let error = await target.insert(text) {
+                self.sessionID == session && self.writing && self.isSourceAllowed
+            }
+            guard self.sessionID == session else { return }
+            self.writing = false
+            if let error {
+                self.insertionTarget = nil
+                self.status = L10n.format("%@ You can still copy the result.", error)
+                self.present(.review, focus: true)
+            } else {
+                self.hide()
+            }
+        }
     }
 
     func copyPreview(to pb: NSPasteboard = .general) {
@@ -1007,20 +1070,20 @@ final class SelectionAIPanel: NSObject, ObservableObject {
 
         window.title = SelectionLauncherButton.displayName
         window.acceptsKeyboard = phase != .launcher
+        let screen = NSScreen.screens.first { $0.frame.contains(NSPoint(x: placement.midX, y: placement.midY)) } ?? NSScreen.main
         let content: NSView
         let size: NSSize
         if phase == .launcher {
             content = SelectionLauncherButton(target: self, action: #selector(openTools))
             size = SelectionLauncherButton.size
         } else {
-            let host = NSHostingView(rootView: SelectionToolsView(model: self, pendingSize: pendingSize))
+            let host = NSHostingView(rootView: SelectionToolsView(model: self, pendingSize: pendingSize, maxWidth: screen?.visibleFrame.width ?? 600))
             content = host
             size = host.fittingSize
         }
         window.setContentSize(size)
         window.contentView = content
-        if let screen = NSScreen.screens.first(where: { $0.frame.contains(NSPoint(x: placement.midX, y: placement.midY)) })
-            ?? NSScreen.main {
+        if let screen {
             window.setFrameOrigin(Self.origin(for: size, near: placement, within: screen.visibleFrame))
         }
         if focus {
@@ -1029,7 +1092,7 @@ final class SelectionAIPanel: NSObject, ObservableObject {
                 returnApplication = front
             }
             // Keep the host's field editor and selection active while reviewing external text.
-            if !isInputSession { NSApp.activate(ignoringOtherApps: true) }
+            if !isInputSession && insertionTarget == nil { NSApp.activate(ignoringOtherApps: true) }
             window.makeKeyAndOrderFront(nil)
         } else {
             window.orderFront(nil)

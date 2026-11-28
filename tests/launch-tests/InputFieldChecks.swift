@@ -105,7 +105,14 @@ extension LaunchTests {
             print("NOTE  real double-M test input source: " + inputMode)
 
             func prepareHost(_ command: String) async throws {
+                let restoring = panel.panelIsKey
                 panel.hide()
+                if restoring {
+                    host.activate()
+                    try await waitFor("focus restoration after closing the review") {
+                        !NSApp.isActive && NSWorkspace.shared.frontmostApplication?.processIdentifier == child.processIdentifier
+                    }
+                }
                 try await send(command)
                 try await waitFor("keyboard fixture focus") {
                     NSWorkspace.shared.frontmostApplication?.processIdentifier == child.processIdentifier
@@ -210,21 +217,65 @@ extension LaunchTests {
                   && state()["first"] == sample && state()["shortcutKeys"] == "",
                   "double M opens the selected text menu and consumes only the shortcut in " + inputMode)
 
-            try await prepareHost("shortcutDraft")
-            try await typeHostKeys([m, m], useKeyboardLayout: true)
-            try await waitFor("double-M standalone editor") { panel.panelIsKey && panel.isStandaloneSession }
-            if let window = NSApp.keyWindow as? SelectionKeyPanel,
-               let editor = window.firstResponder as? NSTextView, editor.isEditable {
+            func openStandaloneReview(usingKeyboard: Bool) async throws {
+                try await prepareHost("shortcutDraft")
+                let app = AXUIElementCreateApplication(child.processIdentifier)
+                guard let field = AXText.element(app, kAXFocusedUIElementAttribute) else {
+                    throw NSError(domain: "InputFieldTests", code: 5, userInfo: [NSLocalizedDescriptionKey: "Missing draft text field"])
+                }
+                var caret = CFRange(location: 3, length: 0)
+                guard let value = AXValueCreate(.cfRange, &caret),
+                      AXUIElementSetAttributeValue(field, kAXSelectedTextRangeAttribute as CFString, value) == .success else {
+                    throw NSError(domain: "InputFieldTests", code: 6, userInfo: [NSLocalizedDescriptionKey: "Unable to position the draft caret"])
+                }
+                try await waitFor("draft caret at offset three") {
+                    AXText.range(of: field)?.location == 3 && AXText.range(of: field)?.length == 0
+                }
+                try await waitFor("shortcut eligibility at the captured caret") {
+                    panel.canReceiveHostShortcut(in: host)
+                }
+                if usingKeyboard {
+                    try await typeHostKeys([m, m], useKeyboardLayout: true)
+                } else {
+                    // The keyboard path is exercised above each set of insertion cases.
+                    // Start stale-target cases from the same captured, focused fixture editor.
+                    panel.openStandaloneInstruction(returningTo: host)
+                }
+                try await waitFor("standalone editor to receive focus") { panel.panelIsKey && panel.isStandaloneSession }
+                guard let window = NSApp.keyWindow as? SelectionKeyPanel,
+                      let editor = window.firstResponder as? NSTextView, editor.isEditable else {
+                    throw NSError(domain: "InputFieldTests", code: 7, userInfo: [NSLocalizedDescriptionKey: "Double M did not focus the instruction field"])
+                }
                 editor.insertText("Give me a title", replacementRange: editor.selectedRange())
                 sendToolKey("\r", code: 36)
                 await request.task?.value
-                check(requests.last == "" && instructions.last == "Give me a title" && panel.result == candidate,
-                      "the actual host shortcut submits and generates an independent instruction")
-                try await send("inspect-double-m-standalone")
-                check(state()["first"] == "fixture " && state()["shortcutKeys"] == "" && !panel.hasReplacementTarget,
-                      "standalone double M leaves no trigger text or write target in the host in " + inputMode)
-            } else {
-                check(false, "the actual host shortcut focuses the standalone editor")
+            }
+
+            try await openStandaloneReview(usingKeyboard: true)
+            check(requests.last == "" && instructions.last == "Give me a title" && panel.result == candidate,
+                  "the instruction excludes the surrounding host draft")
+            try await send("inspect-double-m-standalone")
+            check(state()["first"] == "fixture " && state()["shortcutKeys"] == "" && !panel.hasReplacementTarget && panel.canInsert,
+                  "standalone double M captures the caret without typing trigger letters in " + inputMode)
+            await checkResultToolbar(["Edit Instruction", "Regenerate", "Follow Up", "Insert", "Copy Result"],
+                               unavailable: ["Append", "Replace"])
+            sendToolKey("i", code: 34)
+            try await waitFor("standalone insertion") { !panel.writing }
+            try await send("inspect-standalone-insertion")
+            check(state()["first"] == "fix" + candidate + "ture ",
+                  "I inserts the result at the original caret and preserves both sides")
+
+            for movedTarget in ["shortcutDraft", "second"] {
+                try await openStandaloneReview(usingKeyboard: false)
+                check(panel.canInsert, "the captured caret starts eligible before the host changes")
+                try await send("inspect-original-caret-" + movedTarget)
+                // shortcutDraft resets the same text field's caret to the end.
+                try await send(movedTarget)
+                panel.insertResult()
+                try await waitFor("refuse changed insertion target") { !panel.writing }
+                try await send("inspect-refused-insertion-" + movedTarget)
+                check(state()["first"] == "fixture " && state()["second"] == sample && panel.result == candidate,
+                      "insertion into a moved caret or another editor is refused, " + movedTarget)
             }
         }
         prefs.set(SelectionScope.global.rawValue, forKey: SelectionScope.defaultsKey)
@@ -256,8 +307,7 @@ extension LaunchTests {
             await request.task?.value
             check(panel.canWrite, "the verified selection stays writable while the tool owns focus")
             sendToolKey(append ? "a" : "r", code: append ? 0 : 15)
-            check(panel.pendingWriteAppend == append, "the review keyboard shortcut opens write confirmation")
-            panel.confirmPendingWrite()
+            check(panel.writing, "the keyboard shortcut immediately starts the write")
             try await Task.sleep(nanoseconds: 65_000_000)
             try await send("restoreAXFocus")
             try await waitFor("write after focus handoff") { !panel.writing }
@@ -285,8 +335,7 @@ extension LaunchTests {
             panel.run(action)
             await request.task?.value
             check(panel.canWrite, "Services keeps the verified editable source")
-            panel.prepareWrite(append: append)
-            panel.confirmPendingWrite()
+            panel.writeResult(append: append)
             try await waitFor("Services writeback") { !panel.writing }
             try await send("inspect-service-" + String(append))
             check(state()["first"] == (append ? "开头🙂 目标 / 目标新文字 结尾" : "开头🙂 目标 / 新文字 结尾"),
@@ -445,7 +494,7 @@ extension LaunchTests {
             if field != "first" { try await send(field) }
             try await prepareReview()
             try await send("inspect-" + field)
-            check(state()[field] == sample, "the host remains untouched before confirmation, " + field)
+            check(state()[field] == sample, "the host remains untouched before an explicit write action, " + field)
             panel.writeResult(append: false)
             try await waitFor("finish replacement") { !panel.writing }
             try await send("result-" + field)

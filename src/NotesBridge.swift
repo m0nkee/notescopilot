@@ -1,5 +1,6 @@
 import AppKit
 import Accessibility
+import Carbon.HIToolbox
 
 // MARK: - Apple Notes 桥接（复刻 ProNotes 的三通道思路：AX 读取 + AppleScript 写入）
 
@@ -268,6 +269,118 @@ final class NotesBridge {
                 && range.location == other.range.location && range.length == other.range.length
                 && text == other.text && documentText == other.documentText
         }
+    }
+
+    struct InstructionCaret {
+        fileprivate let application: NSRunningApplication
+        fileprivate let window: AXUIElement
+        fileprivate let snapshot: SelectionSnapshot
+    }
+
+    @MainActor
+    func captureInstructionCaret(in app: NSRunningApplication) -> InstructionCaret? {
+        guard app.bundleIdentifier == Self.notesBundleID, isTrusted else { return nil }
+        let application = AXUIElementCreateApplication(app.processIdentifier)
+        AXUIElementSetMessagingTimeout(application, 0.2)
+        guard let window = AXText.element(application, kAXFocusedWindowAttribute),
+              let editor = AXText.element(application, kAXFocusedUIElementAttribute),
+              instructionEditorIsCurrent(editor, in: window, application: application, app: app),
+              let range = AXText.range(of: editor), range.length == 0, range.location >= 0,
+              let snapshot = readTextSnapshot(), CFEqual(snapshot.element, editor),
+              snapshot.range.length == 0, snapshot.range.location == range.location,
+              InstructionInsertionTarget.isCaret(range, in: snapshot.documentText as NSString),
+              instructionEditorIsCurrent(editor, in: window, application: application, app: app) else { return nil }
+        return InstructionCaret(application: app, window: window, snapshot: snapshot)
+    }
+
+    private func instructionEditorIsCurrent(_ editor: AXUIElement, in window: AXUIElement,
+                                            application: AXUIElement, app: NSRunningApplication) -> Bool {
+        guard !app.isTerminated, !IsSecureEventInputEnabled(),
+              NSWorkspace.shared.frontmostApplication?.processIdentifier == app.processIdentifier,
+              let activeWindow = AXText.element(application, kAXFocusedWindowAttribute), CFEqual(activeWindow, window),
+              let activeEditor = AXText.element(application, kAXFocusedUIElementAttribute), CFEqual(activeEditor, editor),
+              let owner = AXText.element(editor, kAXWindowAttribute), CFEqual(owner, window),
+              AXText.attribute(editor, kAXRoleAttribute) as? String == kAXTextAreaRole,
+              AXText.attribute(editor, kAXEnabledAttribute) as? Bool != false,
+              AXText.attribute(editor, "AXEditable") as? Bool != false,
+              (AXText.attribute(editor, kAXSelectedTextRangesAttribute) as? [Any])?.count ?? 0 <= 1,
+              !AXText.isProtected(editor), !AXText.isComposing(editor) else { return false }
+        // Notes can expose an editor that accepts Paste without exposing a value setter.
+        return AXText.isSettable(editor, kAXSelectedTextRangeAttribute)
+    }
+
+    @MainActor
+    func insertInstruction(_ text: String, into target: InstructionCaret,
+                           isValid: @escaping () -> Bool) async -> String? {
+        let stale = L10n.text("Writing was canceled because the original note, cursor, or text changed.")
+        let unverified = L10n.text("Couldn’t verify the final text. Check the original field.")
+        let original = target.snapshot
+        let editor = original.element
+        let app = target.application
+        guard !text.isEmpty, await InstructionInsertionTarget.restoreHost(app, isValid: isValid) else { return stale }
+        let application = AXUIElementCreateApplication(app.processIdentifier)
+        AXUIElementSetMessagingTimeout(application, 0.2)
+
+        // Notes can become frontmost before its editor regains keyboard focus.
+        // Wait for an absent focus only, and never switch windows or editors.
+        for _ in 0..<12 {
+            guard isValid(), !Task.isCancelled, !IsSecureEventInputEnabled(),
+                  NSWorkspace.shared.frontmostApplication?.processIdentifier == app.processIdentifier,
+                  let window = AXText.element(application, kAXFocusedWindowAttribute), CFEqual(window, target.window)
+            else { return stale }
+            var value: CFTypeRef?
+            let focus = AXUIElementCopyAttributeValue(application, kAXFocusedUIElementAttribute as CFString, &value)
+            if focus == .success, let value {
+                guard CFGetTypeID(value) == AXUIElementGetTypeID(), CFEqual(value, editor) else { return stale }
+                break
+            }
+            guard focus == .noValue || (focus == .success && value == nil) else { return stale }
+            try? await Task.sleep(nanoseconds: 25_000_000)
+        }
+
+        func editorIsCurrent() -> Bool {
+            instructionEditorIsCurrent(editor, in: target.window, application: application, app: app)
+        }
+        func isReady() -> Bool {
+            guard !Task.isCancelled, isValid(), editorIsCurrent(), let live = readTextSnapshot(),
+                  original.matches(live), original.documentText.utf16.elementsEqual(live.documentText.utf16) else { return false }
+            // The note identity read may yield to Notes. Check the editor and caret again.
+            guard isValid(), editorIsCurrent(), let caret = AXText.range(of: editor),
+                  caret.location == original.range.location, caret.length == 0,
+                  let value = AXText.attribute(editor, kAXValueAttribute) as? String else { return false }
+            return value.utf16.elementsEqual(original.documentText.utf16)
+        }
+
+        let expected = (original.documentText as NSString).replacingCharacters(
+            in: NSRange(location: original.range.location, length: 0), with: text)
+        func verify() async -> String? {
+            for attempt in 0..<20 {
+                guard isValid(), editorIsCurrent(),
+                      let value = AXText.attribute(editor, kAXValueAttribute) as? String else { return unverified }
+                if value.utf16.elementsEqual(expected.utf16) {
+                    guard let live = readTextSnapshot(), live.noteID == original.noteID,
+                          CFEqual(live.element, editor), editorIsCurrent(),
+                          live.documentText.utf16.elementsEqual(expected.utf16) else { return unverified }
+                    return nil
+                }
+                guard value.utf16.elementsEqual(original.documentText.utf16),
+                      attempt < 19, !Task.isCancelled else { return unverified }
+                try? await Task.sleep(nanoseconds: 30_000_000)
+            }
+            return unverified
+        }
+
+        guard isReady() else { return stale }
+        if AXText.isSettable(editor, kAXSelectedTextAttribute) {
+            guard isReady() else { return stale }
+            let status = AXUIElementSetAttributeValue(editor, kAXSelectedTextAttribute as CFString, text as CFString)
+            if status == .success { return await verify() }
+            // An ambiguous failure might already have modified the editor. Never paste again in that case.
+            guard status == .attributeUnsupported || status == .illegalArgument || status == .notImplemented else {
+                return unverified
+            }
+        }
+        return await InputFieldBridge.pasteText(text, into: app, isReady: isReady, verify: verify)
     }
 
     private func selectedNotesRange() -> (AXUIElement, CFRange)? {

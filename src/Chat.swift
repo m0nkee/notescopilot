@@ -256,10 +256,11 @@ enum AIService {
 
     enum ContextKind: String { case note = "笔记上下文", selection = "选中文本" }
 
-    /// 模板片段与选区工具独立发起单轮补全。选区中的缩进和首尾换行也属于用户的输入。
+    /// 选区中的缩进和首尾换行也属于用户的输入。
     static func complete(instruction: String, context: String,
                          contextKind: ContextKind = .note,
-                         configuration: AIRequestConfiguration? = nil) async throws -> String {
+                         configuration: AIRequestConfiguration? = nil,
+                         history: [ChatMessageRecord] = []) async throws -> String {
         let configuration = try configuration ?? AIRequestConfiguration.current()
         try Task.checkCancellation()
         var user = instruction
@@ -277,12 +278,12 @@ enum AIService {
         let key = configuration.apiKey
         if !key.isEmpty { req.setValue("Bearer " + key, forHTTPHeaderField: "Authorization") }
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        var messages = [["role": "system", "content": configuration.systemPrompt]]
+        messages += history.map { ["role": $0.role, "content": $0.content] }
+        messages.append(["role": "user", "content": user])
         var body: [String: Any] = [
             "model": configuration.model,
-            "messages": [
-                ["role": "system", "content": configuration.systemPrompt],
-                ["role": "user", "content": user],
-            ],
+            "messages": messages,
             "stream": false,
             "max_tokens": configuration.maxTokens,
         ]
@@ -417,6 +418,7 @@ enum ChatSessionStore {
 
 @MainActor
 final class ChatEngine: ObservableObject {
+    nonisolated static let historyMessageLimit = 12
     init() { restoreSession() }
 
     /// 每次提交都发布，包括重复命令；面板草稿只在提交或新会话时同步。
@@ -693,7 +695,7 @@ final class ChatEngine: ObservableObject {
                                           images: [ImageAttachment],
                                           continuous: Bool) -> [[String: Any]] {
         var msgs: [[String: Any]] = [["role": "system", "content": system]]
-        if continuous { msgs += history.suffix(12) }
+        if continuous { msgs += history.suffix(Self.historyMessageLimit) }
         var content: Any = userText
         if !images.isEmpty {
             var parts: [[String: Any]] = [["type": "text", "text": userText]]

@@ -586,6 +586,22 @@ private final class ChatTests {
         check(error?.contains("长度限制") == true, "nonstreaming selection/template calls reject truncated responses")
     }
 
+    func standaloneFollowUpPayload() async {
+        configure()
+        ChatTestProtocol.reset()
+        let history = [ChatMessageRecord(role: "user", content: "First"), ChatMessageRecord(role: "assistant", content: "First answer")]
+        let task = Task { try await AIService.complete(instruction: "Explain it", context: "", contextKind: .selection, history: history) }
+        await wait("standalone follow-up starts") { ChatTestProtocol.count == 1 }
+        let payload = ChatTestProtocol.capturedRequest(0)?.httpBody.flatMap { try? JSONSerialization.jsonObject(with: $0) } as? [String: Any]
+        let messages = payload?["messages"] as? [[String: String]]
+        check(messages?.compactMap { $0["role"] } == ["system", "user", "assistant", "user"]
+              && messages?.dropFirst().compactMap { $0["content"] } == ["First", "First answer", "Explain it"],
+              "the HTTP payload includes prior turns as separate messages before the standalone follow-up")
+        ChatTestProtocol.respond(0, body: #"{"choices":[{"message":{"content":"Second answer"},"finish_reason":"stop"}]}"#, includeDone: false)
+        let output = try? await task.value
+        check(output == "Second answer", "standalone follow-up reads a successful nonstreaming response")
+    }
+
     func profileStorageUsesOriginalPlaintextLogic() {
         let suite = "nc.chat-tests." + UUID().uuidString
         let isolated = UserDefaults(suiteName: suite)!
@@ -860,6 +876,7 @@ private final class ChatTests {
         await conversationBoundariesDiscardOldHistory()
         imagesAreBoundedBeforeSending()
         await nonStreamingTruncationIsAnError()
+        await standaloneFollowUpPayload()
         profileStorageUsesOriginalPlaintextLogic()
         duplicateProfilesAreRejectedWithoutPartialWrites()
         await reviewIdentityIsInvalidatedWhenDismissed()

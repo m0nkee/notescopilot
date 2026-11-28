@@ -1,5 +1,6 @@
 import AppKit
 import ApplicationServices
+import Carbon.HIToolbox
 
 enum SelectionScope: String {
     case notes, global
@@ -242,8 +243,148 @@ struct InputFieldSelection {
     let windowTitle: String?
 }
 
+/// A local snapshot of an editable caret, captured before the instruction panel takes focus.
+@MainActor
+struct InstructionInsertionTarget {
+    private enum Destination {
+        case notes(NotesBridge.InstructionCaret)
+        case input(InputFieldBridge.InstructionCaret)
+    }
+
+    private let destination: Destination
+    private let foreground: SourceForeground
+
+    @MainActor
+    private final class SourceForeground {
+        private let center = NSWorkspace.shared.notificationCenter
+        private var observer: NSObjectProtocol?
+        private(set) var switchedAway = false
+
+        init(application: NSRunningApplication) {
+            let sourcePID = application.processIdentifier
+            let ownPID = ProcessInfo.processInfo.processIdentifier
+            observer = center.addObserver(forName: NSWorkspace.didActivateApplicationNotification,
+                                          object: nil, queue: .main) { [weak self] note in
+                guard let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication else { return }
+                let pid = app.processIdentifier
+                if pid != sourcePID && pid != ownPID {
+                    MainActor.assumeIsolated { self?.switchedAway = true }
+                }
+            }
+        }
+
+        deinit {
+            if let observer { center.removeObserver(observer) }
+        }
+    }
+
+    static func capture(in app: NSRunningApplication) -> Self? {
+        guard !app.isTerminated, !IsSecureEventInputEnabled(),
+              app.processIdentifier != ProcessInfo.processInfo.processIdentifier,
+              NSWorkspace.shared.frontmostApplication?.processIdentifier == app.processIdentifier else { return nil }
+        let foreground = SourceForeground(application: app)
+        let destination: Destination
+        if app.bundleIdentifier == NotesBridge.notesBundleID {
+            guard let caret = NotesBridge.shared.captureInstructionCaret(in: app) else { return nil }
+            destination = .notes(caret)
+        } else {
+            guard let caret = InputFieldBridge.captureInstructionCaret(in: app) else { return nil }
+            destination = .input(caret)
+        }
+        guard !foreground.switchedAway else { return nil }
+        return Self(destination: destination, foreground: foreground)
+    }
+
+    func insert(_ text: String, isValid: @escaping () -> Bool) async -> String? {
+        guard isValid(), !Task.isCancelled else { return L10n.text("Operation canceled.") }
+        guard !text.isEmpty else { return nil }
+        guard !foreground.switchedAway else { return L10n.text("The original app, text field, or selection changed.") }
+        let isCurrent = { !foreground.switchedAway && isValid() }
+        switch destination {
+        case .notes(let caret):
+            return await NotesBridge.shared.insertInstruction(text, into: caret, isValid: isCurrent)
+        case .input(let caret):
+            return await InputFieldBridge.insertInstruction(text, into: caret, isValid: isCurrent)
+        }
+    }
+
+    /// The standalone panel activates NotesCopilot. Only that handoff may
+    /// reactivate the bound app. Never pull focus back from a different app.
+    static func restoreHost(_ app: NSRunningApplication, isValid: () -> Bool) async -> Bool {
+        guard isValid(), !Task.isCancelled, !app.isTerminated, !IsSecureEventInputEnabled(),
+              let front = NSWorkspace.shared.frontmostApplication else { return false }
+        if front.processIdentifier == app.processIdentifier { return true }
+        let ownPID = ProcessInfo.processInfo.processIdentifier
+        guard front.processIdentifier == ownPID, app.activate(options: []) else { return false }
+        for _ in 0..<16 {
+            guard isValid(), !Task.isCancelled, !app.isTerminated, !IsSecureEventInputEnabled(),
+                  let current = NSWorkspace.shared.frontmostApplication else { return false }
+            if current.processIdentifier == app.processIdentifier { return true }
+            guard current.processIdentifier == ownPID else { return false }
+            try? await Task.sleep(nanoseconds: 25_000_000)
+        }
+        return false
+    }
+
+    static func isCaret(_ range: CFRange, in value: NSString) -> Bool {
+        guard range.length == 0, (0...value.length).contains(range.location) else { return false }
+        // AX offsets are UTF-16. A collapsed range may sit between combining
+        // characters but cannot split the two halves of one scalar.
+        return range.location == value.length || !(0xDC00...0xDFFF).contains(value.character(at: range.location))
+    }
+}
+
 @MainActor
 enum InputFieldBridge {
+    struct InstructionFieldSnapshot {
+        let value: String
+        let range: CFRange
+        private let editorIsEmpty: Bool?
+
+        init(value: String, range: CFRange, editorIsEmpty: Bool?) {
+            self.value = value
+            self.range = range
+            self.editorIsEmpty = !value.isEmpty && range.location == 0 && range.length == 0 ? editorIsEmpty : nil
+        }
+
+        var showsPlaceholder: Bool { editorIsEmpty == true }
+
+        func matches(_ current: Self) -> Bool {
+            range.location == current.range.location && range.length == current.range.length
+                && value.utf16.elementsEqual(current.value.utf16)
+                && editorIsEmpty == current.editorIsEmpty
+        }
+
+        func expectedValue(inserting text: String) -> String {
+            if showsPlaceholder { return text }
+            return (value as NSString).replacingCharacters(
+                in: NSRange(location: range.location, length: range.length), with: text)
+        }
+
+        func verifiesInsertion(_ actual: String, expected: String, pasted: Bool,
+                               editorIsEmpty: @autoclosure () -> Bool?) -> Bool {
+            if showsPlaceholder {
+                guard actual.utf16.elementsEqual(expected.utf16) else { return false }
+                // If the result literally equals the placeholder, AXValue cannot
+                // distinguish an unchanged editor from a successful paste.
+                return !actual.utf16.elementsEqual(value.utf16) || editorIsEmpty() == false
+            }
+            let length = expected.utf16.count - value.utf16.count + range.length
+            return InputFieldBridge.matchesWrite(actual, expected: expected,
+                inserted: NSRange(location: range.location, length: length), pasted: pasted)
+        }
+    }
+
+    struct InstructionCaret {
+        let host: InputFieldHost
+        let element: AXUIElement
+        let field: InstructionFieldSnapshot
+        let document: String?
+        let windowTitle: String?
+    }
+
+    private enum CaretFocus: Equatable { case ready, restoring, changed }
+
     private static func selection(in element: AXUIElement) -> SelectionExtent? {
         if let ranges = AXText.attribute(element, kAXSelectedTextRangesAttribute) as? [Any], ranges.count > 1 { return nil }
         let range = AXText.range(of: element)
@@ -269,6 +410,113 @@ enum InputFieldBridge {
         AXText.attribute(element, kAXEnabledAttribute) as? Bool != false &&
             (AXText.isSettable(element, kAXValueAttribute) ||
              (AXText.attribute(element, "AXEditable") as? Bool == true && AXText.isSettable(element, kAXSelectedTextAttribute)))
+    }
+
+    private static func instructionRange(in element: AXUIElement, value: String) -> CFRange? {
+        guard isField(AXText.attribute(element, kAXRoleAttribute) as? String), isWritable(element),
+              AXText.attribute(element, "AXEditable") as? Bool != false,
+              !AXText.isProtected(element), !AXText.isComposing(element),
+              let range = AXText.range(of: element), InstructionInsertionTarget.isCaret(range, in: value as NSString),
+              selection(in: element) == nil,
+              ((AXText.attribute(element, kAXSelectedTextRangesAttribute) as? [Any])?.count ?? 0) <= 1,
+              (AXText.attribute(element, kAXSelectedTextAttribute) as? String)?.isEmpty != false
+        else { return nil }
+        return range
+    }
+
+    nonisolated static func emptyProseMirrorState(
+        role: String?, classes: [String]?, children: @autoclosure () -> [(role: String?, classes: [String]?)]?
+    ) -> Bool? {
+        guard let role else { return nil }
+        guard role == kAXTextAreaRole else { return false }
+        guard let classes else { return nil }
+        guard classes.contains("ProseMirror") else { return false }
+        guard let children = children() else { return nil }
+        guard children.count == 1 else { return false }
+        guard let child = children.first, let childRole = child.role else { return nil }
+        guard childRole == kAXGroupRole else { return false }
+        return child.classes.map { $0.contains("is-empty") && $0.contains("is-editor-empty") }
+    }
+
+    private static func emptyProseMirrorState(in element: AXUIElement) -> Bool? {
+        func directChildren() -> [(role: String?, classes: [String]?)]? {
+            guard let children = AXText.attribute(element, kAXChildrenAttribute) as? [AXUIElement] else { return nil }
+            // Two children already rule out the empty-editor structure.
+            return children.prefix(2).map {
+                (AXText.attribute($0, kAXRoleAttribute) as? String,
+                 AXText.attribute($0, "AXDOMClassList") as? [String])
+            }
+        }
+        return emptyProseMirrorState(role: AXText.attribute(element, kAXRoleAttribute) as? String,
+                                    classes: AXText.attribute(element, "AXDOMClassList") as? [String],
+                                    children: directChildren())
+    }
+
+    private static func instructionField(in element: AXUIElement) -> InstructionFieldSnapshot? {
+        guard !AXText.isProtected(element), !AXText.isComposing(element),
+              let value = AXText.attribute(element, kAXValueAttribute) as? String,
+              let range = instructionRange(in: element, value: value) else { return nil }
+        let editorIsEmpty = range.location == 0 && !value.isEmpty ? emptyProseMirrorState(in: element) : nil
+        return InstructionFieldSnapshot(value: value, range: range, editorIsEmpty: editorIsEmpty)
+    }
+
+    static func captureInstructionCaret(in app: NSRunningApplication) -> InstructionCaret? {
+        guard AXIsProcessTrusted(), !app.isTerminated, !IsSecureEventInputEnabled(),
+              NSWorkspace.shared.frontmostApplication?.processIdentifier == app.processIdentifier else { return nil }
+        let application = AXUIElementCreateApplication(app.processIdentifier)
+        AXUIElementSetMessagingTimeout(application, 0.15)
+        guard let window = AXText.element(application, kAXFocusedWindowAttribute),
+              let element = AXText.element(application, kAXFocusedUIElementAttribute),
+              let field = instructionField(in: element) else { return nil }
+        let caret = InstructionCaret(host: InputFieldHost(application: app, window: window, editable: true),
+                                     element: element, field: field, document: document(of: window),
+                                     windowTitle: AXText.attribute(window, kAXTitleAttribute) as? String)
+        return instructionFocus(caret) == .ready ? caret : nil
+    }
+
+    private static func instructionFocus(_ target: InstructionCaret) -> CaretFocus {
+        let app = target.host.application
+        let element = target.element
+        guard !app.isTerminated, !IsSecureEventInputEnabled(),
+              NSWorkspace.shared.frontmostApplication?.processIdentifier == app.processIdentifier else { return .changed }
+        let application = AXUIElementCreateApplication(app.processIdentifier)
+        AXUIElementSetMessagingTimeout(application, 0.15)
+        guard let window = AXText.element(application, kAXFocusedWindowAttribute), CFEqual(window, target.host.window),
+              document(of: window) == target.document,
+              AXText.attribute(window, kAXTitleAttribute) as? String == target.windowTitle
+        else { return .changed }
+
+        var focused: CFTypeRef?
+        let status = AXUIElementCopyAttributeValue(application, kAXFocusedUIElementAttribute as CFString, &focused)
+        let focus: CaretFocus
+        if status == .success, let focused {
+            guard CFGetTypeID(focused) == AXUIElementGetTypeID(), CFEqual(focused, element) else { return .changed }
+            focus = .ready
+        } else if status == .noValue || (status == .success && focused == nil) {
+            // The same editor may briefly lose reported focus during an
+            // Electron handoff. This state may wait but can never write.
+            focus = .restoring
+        } else {
+            return .changed
+        }
+
+        let owner = AXText.element(element, kAXWindowAttribute)
+        if let owner {
+            guard CFEqual(owner, window) else { return .changed }
+        } else if focus == .restoring {
+            return .changed
+        }
+        guard let field = instructionField(in: element), target.field.matches(field),
+              NSWorkspace.shared.frontmostApplication?.processIdentifier == app.processIdentifier,
+              !IsSecureEventInputEnabled()
+        else { return .changed }
+
+        if focus == .ready {
+            guard let liveWindow = AXText.element(application, kAXFocusedWindowAttribute), CFEqual(liveWindow, window),
+                  let liveEditor = AXText.element(application, kAXFocusedUIElementAttribute), CFEqual(liveEditor, element)
+            else { return .changed }
+        }
+        return focus
     }
 
     static func anchor(in app: NSRunningApplication, allowPointerLookup: Bool = true) -> TextSelectionAnchor? {
@@ -434,6 +682,7 @@ enum InputFieldBridge {
     /// Find the ordinary Copy/Paste menu in the bound application, independently of its language.
     private static func pasteItem(in app: NSRunningApplication) -> AXUIElement? {
         let application = AXUIElementCreateApplication(app.processIdentifier)
+        AXUIElementSetMessagingTimeout(application, 0.15)
         guard let bar = AXText.element(application, kAXMenuBarAttribute),
               let headings = AXText.attribute(bar, kAXChildrenAttribute) as? [AXUIElement] else { return nil }
         func hasShortcut(_ item: AXUIElement, _ key: String) -> Bool {
@@ -452,8 +701,37 @@ enum InputFieldBridge {
 
     private static var pasteInProgress = false
 
+    static func pasteText(_ text: String, into app: NSRunningApplication,
+                          isReady: () -> Bool, verify: () async -> String?) async -> String? {
+        guard !pasteInProgress, let item = pasteItem(in: app) else {
+            return L10n.text("Paste is unavailable in this app.")
+        }
+        let stale = L10n.text("The original app, text field, or selection changed.")
+        guard isReady(), !IsSecureEventInputEnabled() else { return stale }
+        pasteInProgress = true
+        let board = NSPasteboard.general
+        let restore = NotesBridge.shared.preparePasteboard(text: text, html: nil, pasteboard: board)
+        defer {
+            restore()
+            pasteInProgress = false
+        }
+        let version = board.changeCount
+        // Resolving the menu and preparing the clipboard can both block. Validate
+        // the exact saved caret again before dispatching one native Paste command.
+        guard AXText.attribute(item, kAXEnabledAttribute) as? Bool != false else {
+            return L10n.text("Paste is unavailable in this app.")
+        }
+        guard isReady(), !IsSecureEventInputEnabled(),
+              board.changeCount == version, board.string(forType: .string)?.utf16.elementsEqual(text.utf16) == true,
+              board.changeCount == version else { return stale }
+        guard AXUIElementPerformAction(item, kAXPressAction as CFString) == .success else {
+            return L10n.text("The original app didn’t accept the paste.")
+        }
+        return await verify()
+    }
+
     // WebKit can preserve a visible boundary space in contenteditable by making it a NBSP.
-    private static func matchesWrite(_ actual: String, expected: String, inserted: NSRange, pasted: Bool) -> Bool {
+    nonisolated private static func matchesWrite(_ actual: String, expected: String, inserted: NSRange, pasted: Bool) -> Bool {
         if actual.utf16.elementsEqual(expected.utf16) { return true }
         guard pasted, actual.utf16.count == expected.utf16.count else { return false }
         for (index, pair) in zip(actual.utf16, expected.utf16).enumerated() where pair.0 != pair.1 {
@@ -461,6 +739,53 @@ enum InputFieldBridge {
                   pair.0 == 0x00A0, pair.1 == 0x0020 else { return false }
         }
         return true
+    }
+
+    static func insertInstruction(_ text: String, into target: InstructionCaret,
+                                  isValid: () -> Bool) async -> String? {
+        let stale = L10n.text("The original app, text field, or selection changed.")
+        let app = target.host.application
+        guard await InstructionInsertionTarget.restoreHost(app, isValid: isValid) else { return stale }
+        for _ in 0..<16 {
+            guard isValid(), !Task.isCancelled else { return L10n.text("Operation canceled.") }
+            let focus = instructionFocus(target)
+            if focus == .ready { break }
+            guard focus == .restoring else { return stale }
+            try? await Task.sleep(nanoseconds: 25_000_000)
+        }
+
+        let expected = target.field.expectedValue(inserting: text)
+        func ready() -> Bool {
+            isValid() && !Task.isCancelled && instructionFocus(target) == .ready && isValid() && !Task.isCancelled
+        }
+        func verify(pasted: Bool) async -> String? {
+            for attempt in 0..<20 {
+                if let value = AXText.attribute(target.element, kAXValueAttribute) as? String,
+                   target.field.verifiesInsertion(value, expected: expected, pasted: pasted,
+                                                  editorIsEmpty: emptyProseMirrorState(in: target.element)) {
+                    return nil
+                }
+                guard attempt < 19 else { break }
+                try? await Task.sleep(nanoseconds: 30_000_000)
+            }
+            return L10n.text("Couldn’t verify the final text. Check the original field.")
+        }
+
+        // Web editors may acknowledge AX edits without delivering a DOM input
+        // event. Native Paste preserves the editor's input and Undo semantics.
+        if needsPaste(target.element) {
+            return await pasteText(text, into: app, isReady: ready) { await verify(pasted: true) }
+        }
+        guard ready() else { return stale }
+        let status = AXUIElementSetAttributeValue(target.element, kAXSelectedTextAttribute as CFString, text as CFString)
+        switch status {
+        case .success:
+            return await verify(pasted: false)
+        case .attributeUnsupported, .notImplemented, .illegalArgument:
+            return await pasteText(text, into: app, isReady: ready) { await verify(pasted: true) }
+        default:
+            return L10n.text("The text field didn’t accept the replacement.")
+        }
     }
 
     static func write(_ original: InputFieldSelection, text: String, append: Bool, isValid: () -> Bool) async -> String? {

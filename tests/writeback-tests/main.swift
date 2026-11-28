@@ -50,6 +50,66 @@ DispatchQueue.global().asyncAfter(deadline: .now() + 20) {
 }
 
 Task { @MainActor in
+    let placeholder = "Describe what you want to do next, or type a new message."
+    let result = "续写🙂"
+    let start = CFRange(location: 0, length: 0)
+    let group = (role: "AXGroup", classes: ["is-empty", "is-editor-empty"])
+    let editorClasses = ["ProseMirror", "editor"]
+    func emptiness(_ children: [(role: String?, classes: [String]?)]?,
+                   role: String = "AXTextArea", classes: [String] = ["ProseMirror"]) -> Bool? {
+        InputFieldBridge.emptyProseMirrorState(role: role, classes: classes, children: children)
+    }
+    let emptyEditor = InputFieldBridge.InstructionFieldSnapshot(value: placeholder, range: start,
+        editorIsEmpty: emptiness([group], classes: editorClasses))
+    let literalText = InputFieldBridge.InstructionFieldSnapshot(value: placeholder, range: start,
+        editorIsEmpty: emptiness([("AXGroup", [])]))
+    check(emptyEditor.expectedValue(inserting: result) == result,
+          "empty ProseMirror readback expects the result without the AX placeholder")
+    check(literalText.expectedValue(inserting: result) == result + placeholder,
+          "identical user-entered text remains part of the normal insertion")
+    check(!emptyEditor.matches(literalText),
+          "the captured empty editor rejects literal text even when the raw AX value and caret match")
+    let unreadableStructure = InputFieldBridge.InstructionFieldSnapshot(value: placeholder, range: start, editorIsEmpty: nil)
+    check(!emptyEditor.matches(unreadableStructure) && !literalText.matches(unreadableStructure),
+          "an unavailable empty state cannot confirm the original zero-offset target")
+    check(!emptyEditor.matches(.init(value: placeholder + "!", range: start, editorIsEmpty: true)),
+          "an empty editor still requires the original raw AX value")
+    let moved = InputFieldBridge.InstructionFieldSnapshot(value: placeholder, range: CFRange(location: 1, length: 0),
+                                                        editorIsEmpty: true)
+    check(!emptyEditor.matches(moved) && !moved.showsPlaceholder,
+          "an empty editor still rejects a moved caret")
+    let selected = InputFieldBridge.InstructionFieldSnapshot(value: placeholder,
+        range: CFRange(location: 0, length: 1), editorIsEmpty: true)
+    check(!emptyEditor.matches(selected) && !selected.showsPlaceholder,
+          "a nonempty selection cannot be treated as an empty editor caret")
+    check(emptyEditor.matches(.init(value: placeholder, range: start, editorIsEmpty: true)),
+          "focus restoration can reuse the unchanged empty editor snapshot")
+    check(emptiness([group, group]) == false && emptiness([("AXStaticText", group.classes)]) == false,
+          "placeholder detection requires exactly one direct accessibility group")
+    check(emptiness([("AXGroup", ["is-empty", "is-editor-empty-old"])]) == false
+          && emptiness([("AXGroup", ["is-editor-empty"])]) == false,
+          "placeholder detection requires both exact empty classes")
+    check(emptiness([group], role: "AXTextField") == false
+          && emptiness([group], classes: ["OtherProseMirror"]) == false
+          && emptiness(nil) == nil,
+          "unrecognized or unavailable accessibility structure cannot establish emptiness")
+    check(emptyEditor.verifiesInsertion(result, expected: result, pasted: true, editorIsEmpty: false)
+          && !emptyEditor.verifiesInsertion(result + placeholder, expected: result, pasted: true, editorIsEmpty: false),
+          "empty editor verification accepts the pure result rather than the original placeholder suffix")
+    check(!emptyEditor.verifiesInsertion(placeholder, expected: placeholder, pasted: true, editorIsEmpty: true)
+          && !emptyEditor.verifiesInsertion(placeholder, expected: placeholder, pasted: true, editorIsEmpty: nil)
+          && emptyEditor.verifiesInsertion(placeholder, expected: placeholder, pasted: true, editorIsEmpty: false),
+          "inserting text identical to the placeholder requires proof that the empty marker cleared")
+    check(!literalText.verifiesInsertion(result, expected: result + placeholder, pasted: true, editorIsEmpty: false),
+          "dropping identical user-entered text remains a verification failure")
+    let existingDraft = InputFieldBridge.InstructionFieldSnapshot(value: "前😀 后",
+        range: CFRange(location: 3, length: 0), editorIsEmpty: false)
+    let expectedDraft = existingDraft.expectedValue(inserting: result)
+    check(expectedDraft == "前😀续写🙂 后"
+          && existingDraft.verifiesInsertion("前😀续写🙂\u{00A0}后", expected: expectedDraft,
+                                             pasted: true, editorIsEmpty: false),
+          "nonempty editor insertion keeps both UTF-16 sides and WebKit boundary-space verification")
+
     var pasteMenus: [String] = []
     var standardPastes = 0
     let retainedPaste = NotesBridge.dispatchPreparedPaste(preservingStyle: true,
@@ -523,6 +583,48 @@ Task { @MainActor in
     serviceRequest.run(instruction: "总结")
     await serviceRequest.task?.value
     check(serviceRequest.lastError != nil && serviceRequest.resultText == "选区结果", "重新生成返回空白时保留上一份可复制结果")
+
+    var submittedTurns: [[ChatMessageRecord]] = []
+    var answer = "Initial answer"
+    let conversation = SelectionAIRequest(conversationCompletion: { prompt, _, history in
+        submittedTurns.append(history + [ChatMessageRecord(role: "user", content: prompt)])
+        return answer
+    })
+    func message(_ role: String, _ text: String) -> ChatMessageRecord {
+        ChatMessageRecord(role: role, content: text)
+    }
+    conversation.select(.instruction)
+    conversation.run(instruction: "Initial question")
+    await conversation.task?.value
+    conversation.editResult("Edited answer")
+    let initialPair = [message("user", "Initial question"), message("assistant", "Edited answer")]
+    answer = "Second answer"
+    conversation.run(instruction: "Why?", followUp: true)
+    await conversation.task?.value
+    let secondRequest = initialPair + [message("user", "Why?")]
+    check(submittedTurns.last == secondRequest, "follow-up includes the initial question and edited answer in their original roles")
+    answer = "Regenerated answer"
+    conversation.regenerate()
+    await conversation.task?.value
+    check(submittedTurns.last == secondRequest, "regenerating replays the same question and prior turns once")
+    answer = ""
+    conversation.run(instruction: "Give an example", followUp: true)
+    await conversation.task?.value
+    let thirdRequest = secondRequest + [message("assistant", "Regenerated answer"), message("user", "Give an example")]
+    check(submittedTurns.last == thirdRequest && conversation.resultText == "Regenerated answer" && conversation.lastError != nil,
+          "an unsuccessful follow-up keeps the last successful answer and includes earlier turns")
+    answer = "An example"
+    conversation.regenerate()
+    await conversation.task?.value
+    check(submittedTurns.last == thirdRequest && conversation.resultText == answer, "retrying a failed follow-up preserves its original history")
+    conversation.select(.instruction)
+    conversation.run(instruction: "Fresh", followUp: true)
+    await conversation.task?.value
+    check(submittedTurns.last == [message("user", "Fresh")], "a new standalone instruction cannot inherit the previous conversation")
+    conversation.cancel()
+    let countBeforeRetry = submittedTurns.count
+    conversation.regenerate()
+    check(conversation.task == nil && submittedTurns.count == countBeforeRetry, "cancel clears the prompt retained for regeneration")
 
     let repeatGate = CompletionGate()
     let repeatService = SelectionAIRequest(complete: { _, _ in await repeatGate.wait() })

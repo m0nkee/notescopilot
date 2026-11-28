@@ -63,6 +63,7 @@ private struct SelectionInstructionField: NSViewRepresentable {
     @ObservedObject private var localization = L10n.shared
     @Binding var text: String
     let standalone: Bool
+    let followUp: Bool
     let submit: () -> Void
 
     func makeCoordinator() -> Coordinator { Coordinator(self) }
@@ -85,7 +86,7 @@ private struct SelectionInstructionField: NSViewRepresentable {
 
     func updateNSView(_ field: NSTextField, context: Context) {
         context.coordinator.parent = self
-        field.placeholderString = L10n.text(standalone ? "What would you like to do?" : "Describe the change you want…")
+        field.placeholderString = L10n.text(followUp ? "Ask a follow-up…" : standalone ? "What would you like to do?" : "Describe the change you want…")
         field.setAccessibilityLabel(L10n.text("Custom Instruction"))
         field.setAccessibilityHelp(L10n.text(standalone
             ? "Type an instruction and press Return to run it"
@@ -168,6 +169,7 @@ struct SelectionToolsView: View {
     @ObservedObject private var localization = L10n.shared
     @ObservedObject var model: SelectionAIPanel
     var pendingSize: CGSize?
+    var maxWidth: CGFloat = 600
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -191,7 +193,7 @@ struct SelectionToolsView: View {
             }
         }
         .padding(12)
-        .frame(width: pendingSize?.width ?? (model.phase == .review ? 420 : 340))
+        .frame(width: pendingSize?.width ?? (model.phase == .review ? min(600, maxWidth) : min(340, maxWidth)))
         .frame(minHeight: pendingSize?.height, alignment: .topLeading)
         .environment(\.locale, localization.locale)
         .controlSize(.small)
@@ -224,10 +226,14 @@ struct SelectionToolsView: View {
     private var menu: some View {
         Group {
             if !model.isStandaloneSession { excerpt }
+            if model.isComposingFollowUp {
+                Text(verbatim: model.result).font(.callout).foregroundStyle(.secondary)
+                    .lineLimit(3).frame(maxWidth: .infinity, alignment: .leading)
+            }
             HStack(spacing: 6) {
                 if !model.isStandaloneSession { keyHint(SelectionKeyPanel.instructionKey) }
                 SelectionInstructionField(text: $model.customInstruction, standalone: model.isStandaloneSession,
-                                          submit: model.runCustom)
+                                          followUp: model.isComposingFollowUp, submit: model.runCustom)
                     .frame(maxWidth: .infinity)
                 Button(action: model.runCustom) { Image(systemName: "arrow.right") }
                     .accessibilityLabel(L10n.text("Run Custom Instruction"))
@@ -345,34 +351,16 @@ struct SelectionToolsView: View {
             }
             feedback
             ViewThatFits(in: .horizontal) {
-                HStack {
-                    reviewNavigation
-                    Spacer(minLength: 0)
-                    reviewResultActions
-                }
-                VStack(alignment: .leading, spacing: 6) {
-                    reviewNavigation
-                    reviewResultActions.frame(maxWidth: .infinity, alignment: .trailing)
-                }
+                reviewActions(compact: false)
+                reviewActions(compact: true)
             }
+            .frame(maxWidth: .infinity, alignment: .trailing)
             .disabled(model.writing)
-            .confirmationDialog(model.writePreviewTitle, isPresented: Binding(
-                get: { model.pendingWriteAppend != nil },
-                set: { if !$0 { model.cancelWritePreview() } }
-            ), titleVisibility: .visible) {
-                let title = model.pendingWriteAppend == true ? L10n.text("Confirm Append") : L10n.text("Confirm Replacement")
-                Button(title, role: .destructive) {
-                    model.confirmPendingWrite()
-                }
-                Button(L10n.text("Cancel"), role: .cancel) { model.cancelWritePreview() }
-            } message: {
-                Text(model.writePreviewText)
-            }
         }
     }
 
-    private var reviewNavigation: some View {
-        HStack {
+    private func reviewActions(compact: Bool) -> some View {
+        HStack(spacing: 6) {
             if model.needsConfiguration && model.result.isEmpty {
                 Button(L10n.text("Model Settings…")) {
                     model.hide()
@@ -380,29 +368,37 @@ struct SelectionToolsView: View {
                 }
             }
             shortcutButton(L10n.text(model.isStandaloneSession ? "Edit Instruction" : "Back to Tools"),
-                           key: SelectionReviewKey.back.rawValue, action: model.chooseAnotherTool)
-            if let action = model.action {
-                let title = model.result.isEmpty ? L10n.text("Retry") : L10n.text("Regenerate")
-                shortcutButton(title, key: SelectionReviewKey.generate.rawValue) { model.run(action) }
+                           key: SelectionReviewKey.back.rawValue, symbol: compact ? "arrow.uturn.backward" : nil,
+                           action: model.chooseAnotherTool)
+            if model.action != nil {
+                shortcutButton(L10n.text(model.result.isEmpty ? "Retry" : "Regenerate"),
+                               key: SelectionReviewKey.generate.rawValue, symbol: compact ? "arrow.clockwise" : nil,
+                               action: model.regenerate)
             }
-        }
-        .fixedSize(horizontal: true, vertical: false)
-    }
-
-    @ViewBuilder private var reviewResultActions: some View {
-        if !model.result.isEmpty {
-            let preferReplace = model.canWrite && model.action?.group == .edit
-            let copyTitle = model.showingOriginal ? L10n.text("Copy Original") : L10n.text("Copy Result")
-            HStack {
-                shortcutButton(copyTitle, key: SelectionReviewKey.copy.rawValue, primary: !preferReplace) { model.copyPreview() }
-                if model.hasReplacementTarget && !model.staleSelection {
-                    shortcutButton(L10n.text("Append"), key: SelectionReviewKey.append.rawValue) { model.prepareWrite(append: true) }
-                        .help(L10n.text("Append after the original selection (A)")).disabled(!model.canWrite)
-                    shortcutButton(L10n.text("Replace"), key: SelectionReviewKey.replace.rawValue, primary: preferReplace) { model.prepareWrite(append: false) }
+            if !model.result.isEmpty {
+                Spacer(minLength: 4)
+                if model.isStandaloneSession {
+                    shortcutButton(L10n.text("Follow Up"), key: SelectionReviewKey.followUp.rawValue,
+                                   symbol: compact ? "bubble.left" : nil, action: model.beginFollowUp)
+                    if model.hasInsertionTarget {
+                        shortcutButton(L10n.text("Insert"), key: SelectionReviewKey.insert.rawValue, primary: true,
+                                       symbol: compact ? "arrow.down.to.line" : nil, action: model.insertResult)
+                            .disabled(!model.canInsert)
+                    }
+                } else if model.hasReplacementTarget && !model.staleSelection {
+                    shortcutButton(L10n.text("Append"), key: SelectionReviewKey.append.rawValue,
+                                   symbol: compact ? "plus" : nil) { model.writeResult(append: true) }
+                        .disabled(!model.canWrite)
+                    shortcutButton(L10n.text("Replace"), key: SelectionReviewKey.replace.rawValue,
+                                   primary: model.canWrite && model.action?.group == .edit,
+                                   symbol: compact ? "arrow.left.arrow.right" : nil) { model.writeResult(append: false) }
                         .disabled(!model.canWrite)
                 }
+                let copyTitle = model.showingOriginal ? "Copy Original" : "Copy Result"
+                shortcutButton(L10n.text(copyTitle), key: SelectionReviewKey.copy.rawValue,
+                               primary: !(model.canInsert || (model.canWrite && model.action?.group == .edit)),
+                               symbol: compact ? "doc.on.doc" : nil) { model.copyPreview() }
             }
-            .fixedSize(horizontal: true, vertical: false)
         }
     }
 
@@ -411,11 +407,15 @@ struct SelectionToolsView: View {
             .foregroundStyle(.secondary).accessibilityHidden(true)
     }
 
-    @ViewBuilder private func shortcutButton(_ title: String, key: String, primary: Bool = false,
+    @ViewBuilder private func shortcutButton(_ title: String, key: String, primary: Bool = false, symbol: String? = nil,
                                             action: @escaping () -> Void) -> some View {
         let button = Button(action: action) {
-            HStack(spacing: 4) { Text(verbatim: title); keyHint(key) }
+            HStack(spacing: 4) {
+                if let symbol { Image(systemName: symbol) } else { Text(verbatim: title).lineLimit(1) }
+                keyHint(key)
+            }
         }
+        .fixedSize(horizontal: true, vertical: false)
         .accessibilityLabel(Text(verbatim: title))
         .accessibilityHint(Text(L10n.format("Shortcut %@", key.uppercased())))
         .help(L10n.format("%@ (%@)", title, key.uppercased()))

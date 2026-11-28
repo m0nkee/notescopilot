@@ -1,4 +1,5 @@
 import AppKit
+import ApplicationServices
 import Foundation
 
 /// Exercises the real delegate with isolated settings. Optional host processes provide synthetic selections.
@@ -237,7 +238,8 @@ struct LaunchTests {
         tools.run(edit)
         await request.task?.value
         check(inputs == [selected] && tools.result == candidate && tools.canWrite && writes == 0, "generation previews a result without writing")
-        try checkToolWindow("selection-review", width: 420)
+        try checkToolWindow("selection-review")
+        await checkResultToolbar(["Back to Tools", "Regenerate", "Append", "Replace", "Copy Result"])
         tools.showingOriginal = true
         tools.writeResult(append: false)
         tools.copyPreview(to: board)
@@ -272,12 +274,9 @@ struct LaunchTests {
             await request.task?.value
             let before = writes
             sendToolKey(append ? "a" : "r", code: append ? 0 : 15)
-            check(tools.pendingWriteAppend == append && writes == before,
-                  "keyboard append and replace both request an explicit write preview, append=\(append)")
-            tools.confirmPendingWrite()
             let expectedRange = append ? NSRange(location: NSMaxRange(range), length: 0) : range
             check(writes == before + 1 && writtenRange == expectedRange && writtenText == candidate,
-                  "explicit Notes confirmation writes the reviewed draft once to its bound range, append=\(append)")
+                  "the Notes keyboard action writes the reviewed draft once to its bound range, append=\(append)")
         }
     }
 
@@ -299,7 +298,7 @@ struct LaunchTests {
         let request = SelectionAIRequest { prompt, source in
             prompts.append(prompt)
             sources.append(source)
-            return "独立指令结果"
+            return prompts.count == 1 ? "独立指令结果" : "追问结果 \(prompts.count)"
         }
         let panel = SelectionAIPanel(request: request)
         defer { panel.hide() }
@@ -325,11 +324,33 @@ struct LaunchTests {
         await request.task?.value
         check(panel.phase == .review && panel.result == "独立指令结果" && prompts == ["请给我两个标题"] && sources == [""],
               "Return submits a trimmed standalone instruction with no fabricated input")
+        await checkResultToolbar(["Edit Instruction", "Regenerate", "Follow Up", "Copy Result"],
+                           unavailable: ["Insert", "Append", "Replace"])
         sendToolKey("r", code: 15)
         sendToolKey("a", code: 0)
         panel.copyPreview(to: board)
         check(!panel.canWrite && !panel.writing && board.string(forType: .string) == "独立指令结果",
               "standalone results support copy and cannot replace or append to the host")
+        sendToolKey("i", code: 34)
+        check(!panel.canInsert && panel.phase == .review && !panel.writing,
+              "a standalone request without an original caret cannot insert")
+
+        sendToolKey("f", code: 3)
+        settle()
+        guard panel.isComposingFollowUp, let followUp = window.firstResponder as? NSTextView, followUp.isEditable else {
+            check(false, "F opens the focused follow-up editor")
+            return
+        }
+        check(followUp.string.isEmpty, "a follow-up starts with a blank input")
+        followUp.insertText("请缩短第二个标题", replacementRange: followUp.selectedRange())
+        sendToolKey("\r", code: 36)
+        await request.task?.value
+        check(panel.phase == .review && panel.result == "追问结果 2" && prompts == ["请给我两个标题", "请缩短第二个标题"],
+              "Return submits the follow-up as the next user turn")
+        sendToolKey("g", code: 5)
+        await request.task?.value
+        check(panel.phase == .review && panel.result == "追问结果 3" && prompts == ["请给我两个标题", "请缩短第二个标题", "请缩短第二个标题"],
+              "G regenerates the current follow-up")
     }
 
     private static func checkToolShortcuts(excerpt: String) async {
@@ -415,13 +436,68 @@ struct LaunchTests {
         }
     }
 
-    private static func checkToolWindow(_ name: String, width: CGFloat) throws {
+    static func checkResultToolbar(_ keys: [String], unavailable: [String] = []) async {
+        settle()
+        let title = SelectionLauncherButton.displayName
+        // Keep the main run loop responsive while macOS asks this app for its SwiftUI tree.
+        let (buttons, inspection) = await Task.detached { () -> ([String: CGRect], String) in
+            let app = AXUIElementCreateApplication(getpid())
+            var value: CFTypeRef?
+            let status = AXUIElementCopyAttributeValue(app, kAXWindowsAttribute as CFString, &value)
+            guard status == .success, let windows = value as? [AXUIElement],
+                  let window = windows.first(where: { AXText.attribute($0, kAXTitleAttribute) as? String == title }) else {
+                return ([:], "results window unavailable (AX status " + String(status.rawValue) + ")")
+            }
+            var buttons: [String: CGRect] = [:]
+            var visited = Set<AXUIElement>()
+            func inspect(_ item: AXUIElement) {
+                guard visited.insert(item).inserted else { return }
+                if AXText.attribute(item, kAXRoleAttribute) as? String == kAXButtonRole {
+                    let labels = [kAXDescriptionAttribute, kAXTitleAttribute].compactMap { AXText.attribute(item, $0) as? String }
+                    var origin = CGPoint.zero, size = CGSize.zero
+                    if let position = AXText.attribute(item, kAXPositionAttribute), CFGetTypeID(position) == AXValueGetTypeID(),
+                       let dimensions = AXText.attribute(item, kAXSizeAttribute), CFGetTypeID(dimensions) == AXValueGetTypeID(),
+                       AXValueGetValue(position as! AXValue, .cgPoint, &origin),
+                       AXValueGetValue(dimensions as! AXValue, .cgSize, &size) {
+                        for label in labels { buttons[label] = CGRect(origin: origin, size: size) }
+                    } else {
+                        for label in labels { buttons[label] = .zero }
+                    }
+                }
+                for child in AXText.attribute(item, kAXChildrenAttribute) as? [AXUIElement] ?? [] {
+                    inspect(child)
+                }
+            }
+            inspect(window)
+            return (buttons, String(visited.count) + " AX elements")
+        }.value
+
+        let frames = keys.compactMap { buttons[L10n.text($0)] }
+        let rowInOrder = zip(frames, frames.dropFirst()).allSatisfy { left, right in
+            left.maxX <= right.minX + 1 && abs(left.midY - right.midY) <= 2
+        }
+        let layoutMatches = frames.count == keys.count && frames.allSatisfy { !$0.isEmpty } && rowInOrder
+        let omissionsMatch = unavailable.allSatisfy { buttons[L10n.text($0)] == nil }
+        if !layoutMatches || !omissionsMatch {
+            let summary = buttons.keys.sorted().map { key in
+                let label = String(key.filter { !$0.isNewline }.prefix(60))
+                return label + " " + NSStringFromRect(buttons[key]!)
+            }
+            print("NOTE  results panel " + inspection + ", buttons: " + summary.joined(separator: ", "))
+        }
+        check(layoutMatches, "results toolbar displays one row with Copy last: " + keys.joined(separator: ", "))
+        if !unavailable.isEmpty {
+            check(omissionsMatch, "the toolbar omits unavailable actions: " + unavailable.joined(separator: ", "))
+        }
+    }
+
+    private static func checkToolWindow(_ name: String, width: CGFloat? = nil) throws {
         settle()
         guard let view = NSApp.windows.first(where: { $0.title == SelectionLauncherButton.displayName && $0.isVisible })?.contentView else {
             check(false, "missing native panel for \(name)")
             return
         }
-        check(view.bounds.width == width && view.bounds.height > 100 && view.bounds.size == view.fittingSize,
+        check((width.map { view.bounds.width == $0 } ?? true) && view.bounds.height > 100 && view.bounds.size == view.fittingSize,
               "\(name) fits its real native panel at \(Int(view.bounds.width)) × \(Int(view.bounds.height))")
         try captureSelectionPreview(name, view: view)
     }

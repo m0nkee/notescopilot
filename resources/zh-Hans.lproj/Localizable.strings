@@ -601,3 +601,9 @@
 "✅ Granted" = "✅ 已授权";
 "✅ Listening" = "✅ 监听已启动";
 "❌ Grant access to use slash commands." = "❌ 未授权，请开启以使用斜杠命令。";
+
+"Follow Up" = "追问";
+
+"Ask a follow-up…" = "继续追问…";
+
+"Insert" = "插入";
