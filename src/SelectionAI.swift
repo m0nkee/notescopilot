@@ -43,12 +43,14 @@ enum WritingSelection {
     case notes(NotesBridge.SelectionSnapshot)
     case input(InputFieldSelection)
     case service(String)
+    case instruction
 
     var text: String {
         switch self {
         case .notes(let snapshot): return snapshot.text
         case .input(let snapshot): return snapshot.text
         case .service(let text): return text
+        case .instruction: return ""
         }
     }
 
@@ -184,14 +186,15 @@ final class SelectionWatcher {
     func scopeDidChange() {
         polling = SelectionPollingState()
         if !SelectionScope.allowsGlobalSelection(in: defaults) { browserAccess.update(for: nil) }
-        if panel.isInputSession && !SelectionScope.allowsGlobalSelection(in: defaults) { panel.hide() }
+        if !panel.isSourceAllowed { panel.hide() }
     }
 
     private func poll() {
         guard SelectionScope.isEnabled(in: defaults) else { return }
-        if panel.isInputSession && !SelectionScope.allowsGlobalSelection(in: defaults) { scopeDidChange() }
+        if !panel.isSourceAllowed { scopeDidChange() }
         if panel.writing { return }
-        if panel.isServiceSession || (panel.hasOpenedSelection && !panel.isInputSession && panel.panelIsKey) {
+        if panel.isStandaloneSession || panel.isServiceSession
+            || (panel.hasOpenedSelection && !panel.isInputSession && panel.panelIsKey) {
             polling = SelectionPollingState()
             return
         }
@@ -440,6 +443,7 @@ final class SelectionAIPanel: NSObject, ObservableObject {
     private var dismissedSource: (pid: pid_t, window: AXUIElement?, inputCount: UInt64)?
     private var placement = NSRect.zero
     private var returnApplication: NSRunningApplication?
+    private var instructionSource: NSRunningApplication?
     private var sessionID = UUID()
     private(set) var action: SelectionQuickAction?
     private(set) var formats: [NotesFormatItem] = []
@@ -471,12 +475,28 @@ final class SelectionAIPanel: NSObject, ObservableObject {
         if case .input = anchor?.source { return true }
         return false
     }
+    var isStandaloneSession: Bool {
+        if case .instruction = request.selection { return true }
+        return false
+    }
+    var isSourceAllowed: Bool {
+        if let instructionSource { return allowsHost(instructionSource) }
+        if case .input(let host) = anchor?.source { return allowsHost(host.application) }
+        return true
+    }
+
+    private func allowsHost(_ app: NSRunningApplication) -> Bool {
+        guard SelectionScope.isEnabled(in: defaults), !app.isTerminated,
+              app.processIdentifier != ProcessInfo.processInfo.processIdentifier else { return false }
+        return app.bundleIdentifier == NotesBridge.notesBundleID || SelectionScope.allowsApplication(app, in: defaults)
+    }
+
     var sourceName: String? {
         switch request.selection {
         case .notes: return "Notes"
         case .input(let field): return field.host.application.localizedName ?? L10n.text("Text Field")
         case .service: return L10n.text("Services Selection")
-        case nil: return nil
+        case .instruction, nil: return nil
         }
     }
     var hasOpenedSelection: Bool { anchor != nil && phase != .launcher }
@@ -499,7 +519,7 @@ final class SelectionAIPanel: NSObject, ObservableObject {
     var needsConfiguration: Bool { request.needsConfiguration }
     var hasNotesTarget: Bool { request.snapshot != nil }
     var hasReplacementTarget: Bool {
-        if case .input(let selection) = request.selection { return selection.fieldValue != nil && SelectionScope.allowsGlobalSelection(in: defaults) }
+        if case .input(let selection) = request.selection { return selection.fieldValue != nil && isSourceAllowed }
         return hasNotesTarget
     }
     var canWrite: Bool {
@@ -508,7 +528,12 @@ final class SelectionAIPanel: NSObject, ObservableObject {
     }
 
     func showLauncher(at anchor: TextSelectionAnchor, onNewDrag: @escaping () -> Void = {}) {
-        if case .input(let host) = anchor.source, !SelectionScope.allowsApplication(host.application, in: defaults) { return }
+        if case .input(let host) = anchor.source, !allowsHost(host.application) { return }
+        prepareLauncher(at: anchor, onNewDrag: onNewDrag)
+        present(.launcher)
+    }
+
+    private func prepareLauncher(at anchor: TextSelectionAnchor, onNewDrag: @escaping () -> Void = {}) {
         resetSession()
         self.anchor = anchor
         placement = Self.screenRect(for: anchor.bounds)
@@ -533,7 +558,6 @@ final class SelectionAIPanel: NSObject, ObservableObject {
                 if event.type == .leftMouseDown { onNewDrag() }
             }
         }
-        present(.launcher)
     }
 
     @objc func openTools() {
@@ -549,7 +573,7 @@ final class SelectionAIPanel: NSObject, ObservableObject {
             }
             selection = .notes(snapshot)
         case .input:
-            guard SelectionScope.allowsGlobalSelection(in: defaults) else { hide(); return }
+            guard isSourceAllowed else { hide(); return }
             guard let field = InputFieldBridge.openSelection(anchor, excerpt: launcherExcerpt) else {
                 status = L10n.text("Couldn’t read the selection. Select the text again in the original app.")
                 present(.unavailable, focus: true)
@@ -570,6 +594,14 @@ final class SelectionAIPanel: NSObject, ObservableObject {
         if case .input = selection { waitingForSourceGesture = true }
         if case .notes = selection { formats = NotesFormatButton.items(presenting: formatTitles()) }
         status = ""
+        present(.menu, focus: true)
+    }
+
+    func openStandaloneInstruction(returningTo app: NSRunningApplication? = nil) {
+        resetSession()
+        instructionSource = app
+        request.select(.instruction)
+        placement = Self.screenRect(for: nil)
         present(.menu, focus: true)
     }
 
@@ -620,6 +652,7 @@ final class SelectionAIPanel: NSObject, ObservableObject {
         request.cancel()
         anchor = nil
         returnApplication = nil
+        instructionSource = nil
         formats = []
         action = nil
         status = ""
@@ -631,26 +664,77 @@ final class SelectionAIPanel: NSObject, ObservableObject {
         customInstruction = ""
     }
 
-    func openFromHostShortcut() -> Bool {
-        guard phase == .launcher, panel?.isVisible == true, SelectionScope.isEnabled(in: defaults),
-              let anchor, let front = NSWorkspace.shared.frontmostApplication else { return false }
-        let app = AXUIElementCreateApplication(front.processIdentifier)
-        AXUIElementSetMessagingTimeout(app, 0.08)
-        switch anchor.source {
-        case .notes:
-            guard front.bundleIdentifier == NotesBridge.notesBundleID else { return false }
-        case .input(let host):
-            guard SelectionScope.allowsApplication(host.application, in: defaults), front.processIdentifier == host.application.processIdentifier,
-                  let window = AXText.element(app, kAXFocusedWindowAttribute), CFEqual(window, host.window) else { return false }
+    func canReceiveHostShortcut(in app: NSRunningApplication, requiresCompositionCheck: Bool = false) -> Bool {
+        guard !writing, phase == .launcher || panel?.isVisible != true, allowsHost(app),
+              AXIsProcessTrusted(), NSWorkspace.shared.frontmostApplication?.processIdentifier == app.processIdentifier else { return false }
+        if requiresCompositionCheck && Self.chineseCandidateWindowIsAbsent() != true { return false }
+        let application = AXUIElementCreateApplication(app.processIdentifier)
+        AXUIElementSetMessagingTimeout(application, 0.03)
+        var value: CFTypeRef?
+        let focus = AXUIElementCopyAttributeValue(application, kAXFocusedUIElementAttribute as CFString, &value)
+        guard focus == .success, let value, CFGetTypeID(value) == AXUIElementGetTypeID() else {
+            return focus == .noValue || (!requiresCompositionCheck && focus == .attributeUnsupported)
         }
-        if let field = AXText.element(app, kAXFocusedUIElementAttribute),
-           AXText.isProtected(field) || AXText.isComposing(field) { return false }
-        let session = sessionID
-        // Build and focus the same menu as a click, outside the system event tap.
+        let field = value as! AXUIElement
+        guard !AXText.isProtected(field) else { return false }
+        if !requiresCompositionCheck { return !AXText.isComposing(field) }
+
+        var marked: CFTypeRef?
+        let markedStatus = AXUIElementCopyAttributeValue(field, "AXMarkedTextRange" as CFString, &marked)
+        switch markedStatus {
+        case .success:
+            guard let marked, CFGetTypeID(marked) == AXValueGetTypeID() else { return false }
+            var range = CFRange()
+            return AXValueGetValue(marked as! AXValue, .cfRange, &range) && range.length == 0
+        case .noValue:
+            return true
+        case .attributeUnsupported, .notImplemented:
+            // Built-in Chinese input methods show candidates while composing in
+            // standard controls, which often omit the marked-range attribute.
+            // A custom or unidentified editor may have invisible composition.
+            let role = AXText.attribute(field, kAXRoleAttribute) as? String
+            return [kAXTextFieldRole, kAXTextAreaRole, kAXComboBoxRole, kAXStaticTextRole,
+                    kAXButtonRole, kAXWindowRole, kAXApplicationRole].contains(role ?? "")
+        default:
+            return false
+        }
+    }
+
+    private static func chineseCandidateWindowIsAbsent() -> Bool? {
+        // Inspect only WindowServer metadata. No window title, pixels, or
+        // screen recording permission is needed.
+        guard let windows = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID)
+            as? [[String: Any]] else { return nil }
+        let inputPIDs = Set(NSWorkspace.shared.runningApplications.compactMap { app -> pid_t? in
+            guard let id = app.bundleIdentifier,
+                  id == "com.apple.inputmethod.SCIM" || id == "com.apple.inputmethod.TCIM" else { return nil }
+            return app.processIdentifier
+        })
+        return !windows.contains { info in
+            guard let owner = info[kCGWindowOwnerPID as String] as? pid_t else { return false }
+            return inputPIDs.contains(owner)
+        }
+    }
+
+    func openFromHostShortcut(in app: NSRunningApplication, requiresCompositionCheck: Bool = false) -> Bool {
+        guard canReceiveHostShortcut(in: app, requiresCompositionCheck: requiresCompositionCheck) else { return false }
+        // Resolve the live selection and focus the panel outside the event tap.
         DispatchQueue.main.async { [weak self] in
-            guard let self, self.sessionID == session, self.phase == .launcher,
-                  NSWorkspace.shared.frontmostApplication?.processIdentifier == front.processIdentifier else { return }
-            self.openTools()
+            guard let self, self.canReceiveHostShortcut(in: app, requiresCompositionCheck: requiresCompositionCheck) else { return }
+            var current: TextSelectionAnchor?
+            if app.bundleIdentifier == NotesBridge.notesBundleID {
+                current = self.notes.selectionAnchor()
+            } else if var input = InputFieldBridge.anchor(in: app) {
+                input.bounds = input.extent.bounds(in: input.element)
+                current = input
+            }
+            guard NSWorkspace.shared.frontmostApplication?.processIdentifier == app.processIdentifier else { return }
+            if let current {
+                self.prepareLauncher(at: current)
+                self.openTools()
+            } else {
+                self.openStandaloneInstruction(returningTo: app)
+            }
         }
         return true
     }
@@ -708,7 +792,7 @@ final class SelectionAIPanel: NSObject, ObservableObject {
 
     func run(_ action: SelectionQuickAction) {
         guard !writing, request.selection != nil else { return }
-        if isInputSession && !SelectionScope.allowsGlobalSelection(in: defaults) { hide(); return }
+        guard isSourceAllowed else { hide(); return }
         self.action = action
         status = ""
         showingOriginal = false
@@ -727,7 +811,8 @@ final class SelectionAIPanel: NSObject, ObservableObject {
         switch phase {
         case .menu:
             if key == SelectionKeyPanel.instructionKey { return panel?.focusInstruction() == true }
-            guard let action = selectionQuickActions.first(where: { $0.shortcut == key }) else { return false }
+            guard !isStandaloneSession,
+                  let action = selectionQuickActions.first(where: { $0.shortcut == key }) else { return false }
             run(action)
         case .review:
             guard !writing, let key = SelectionReviewKey(rawValue: key) else { return false }
@@ -739,6 +824,7 @@ final class SelectionAIPanel: NSObject, ObservableObject {
             case .original, .copy:
                 guard !result.isEmpty else { return false }
                 if key == .original {
+                    guard !isStandaloneSession else { return false }
                     showingOriginal.toggle()
                     if showingOriginal { showingDiff = false }
                 } else { copyPreview() }
@@ -764,7 +850,7 @@ final class SelectionAIPanel: NSObject, ObservableObject {
 
     private func requestDidChange() {
         guard !request.busy, request.selection != nil else { return }
-        if isInputSession && !SelectionScope.allowsGlobalSelection(in: defaults) { hide(); return }
+        guard isSourceAllowed else { hide(); return }
         status = request.lastError.map {
             result.isEmpty ? $0 : L10n.format("The previous result is still available. %@", $0)
         } ?? ""
@@ -841,7 +927,7 @@ final class SelectionAIPanel: NSObject, ObservableObject {
             panel?.orderOut(nil)
             Task { @MainActor in
                 let error = await InputFieldBridge.write(target, text: text, append: append) {
-                    self.sessionID == session && self.writing && SelectionScope.allowsGlobalSelection(in: self.defaults)
+                    self.sessionID == session && self.writing && self.isSourceAllowed
                 }
                 guard self.sessionID == session else { return }
                 self.writing = false
@@ -947,8 +1033,18 @@ final class SelectionAIPanel: NSObject, ObservableObject {
             window.orderFront(nil)
         }
         if phase == .menu {
-            // Start in command mode even if AppKit initially chose the text field.
-            window.makeFirstResponder(nil)
+            if isStandaloneSession {
+                if !window.focusInstruction() {
+                    let session = sessionID
+                    DispatchQueue.main.async { [weak self] in
+                        guard let self, self.sessionID == session, self.phase == .menu else { return }
+                        _ = self.panel?.focusInstruction()
+                    }
+                }
+            } else {
+                // Start in command mode even if AppKit initially chose the text field.
+                window.makeFirstResponder(nil)
+            }
         }
     }
 

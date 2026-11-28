@@ -1,6 +1,23 @@
 import AppKit
 import WebKit
 
+/// Publishes the native text client's actual marked range across process boundaries.
+private final class CompositionFixture: NSTextView {
+    @available(macOS, deprecated: 10.10)
+    override func accessibilityAttributeNames() -> [NSAccessibility.Attribute] {
+        super.accessibilityAttributeNames() + [NSAccessibility.Attribute(rawValue: "AXMarkedTextRange")]
+    }
+
+    @available(macOS, deprecated: 10.10)
+    override func accessibilityAttributeValue(_ attribute: NSAccessibility.Attribute) -> Any? {
+        if attribute.rawValue == "AXMarkedTextRange" {
+            let range = markedRange()
+            return NSValue(range: range.location == NSNotFound ? NSRange(location: 0, length: 0) : range)
+        }
+        return super.accessibilityAttributeValue(attribute)
+    }
+}
+
 /// Separate AppKit process used exclusively with synthetic input in check-startup.sh.
 @main @MainActor
 final class InputFieldHostApp {
@@ -12,10 +29,13 @@ final class InputFieldHostApp {
     let multiline = NSTextView()
     let readonly = NSTextView()
     let password = NSSecureTextField()
+    private let composing = CompositionFixture()
     let webWindow = NSWindow(contentRect: NSRect(x: 180, y: 210, width: 480, height: 320),
                              styleMask: [.titled, .closable], backing: .buffered, defer: false)
     let webView: WKWebView
     var webField: String?
+    var shortcutKeys = ""
+    private var shortcutMonitor: Any?
     let report: URL
 
     init(report: URL) {
@@ -47,6 +67,8 @@ final class InputFieldHostApp {
             view.frame = NSRect(x: 20, y: 265 - index * 54, width: 425, height: 35)
             window.contentView?.addSubview(view)
         }
+        composing.frame = NSRect(x: 20, y: 10, width: 425, height: 33)
+        window.contentView?.addSubview(composing)
         first.stringValue = sample
         second.stringValue = sample
         multiline.string = sample
@@ -54,6 +76,10 @@ final class InputFieldHostApp {
         readonly.isEditable = false
         password.stringValue = "sample"
         window.makeKeyAndOrderFront(nil)
+        shortcutMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            if let key = event.charactersIgnoringModifiers { self?.shortcutKeys.append(key) }
+            return event
+        }
     }
 
     func select(in view: NSView, range: NSRange) {
@@ -72,6 +98,19 @@ final class InputFieldHostApp {
     func handle(_ command: String) {
         let range = (sample as NSString).range(of: "目标", options: .backwards)
         switch command {
+        case "shortcutDraft":
+            if composing.hasMarkedText() { composing.unmarkText() }
+            first.currentEditor()?.inputContext?.discardMarkedText()
+            window.makeFirstResponder(nil)
+            first.stringValue = "fixture "
+            select(in: first, range: NSRange(location: (first.stringValue as NSString).length, length: 0))
+            shortcutKeys = ""
+        case "compositionDraft":
+            composing.string = "fixture "
+            select(in: composing, range: NSRange(location: 8, length: 0))
+            composing.setMarkedText("拼音", selectedRange: NSRange(location: 2, length: 0),
+                                    replacementRange: composing.selectedRange())
+            shortcutKeys = ""
         case "translateDraft":
             first.stringValue = "草稿：这是什么？"
             select(in: first, range: (first.stringValue as NSString).range(of: "这是什么？"))
@@ -115,7 +154,12 @@ final class InputFieldHostApp {
         case "undoWeb":
             webView.evaluateJavaScript("document.execCommand('undo')") { _, _ in self.reportWebState(command) }
             return
-        case "first": first.stringValue = sample; select(in: first, range: range)
+        case "first":
+            first.currentEditor()?.inputContext?.discardMarkedText()
+            window.makeFirstResponder(nil)
+            first.stringValue = sample
+            select(in: first, range: range)
+            shortcutKeys = ""
         case "second": second.stringValue = sample; select(in: second, range: range)
         case "multiline": multiline.string = sample; select(in: multiline, range: range)
         case "readonly": select(in: readonly, range: range)
@@ -141,8 +185,9 @@ final class InputFieldHostApp {
     }
 
     func writeState(_ command: String, webValue: String = "", edits: Int = 0, bold: String? = nil) {
-        var state = ["command": command, "first": first.stringValue, "second": second.stringValue,
-                     "multiline": multiline.string, "readonly": readonly.string, "edits": String(edits)]
+        var state = ["command": command, "first": first.currentEditor()?.string ?? first.stringValue, "second": second.stringValue,
+                     "multiline": multiline.string, "readonly": readonly.string, "edits": String(edits),
+                     "shortcutKeys": shortcutKeys, "hasMarkedText": String(composing.hasMarkedText())]
         state["bold"] = bold
         if let webField { state[webField] = webValue }
         if let data = try? JSONEncoder().encode(state) { try? data.write(to: report, options: .atomic) }

@@ -2065,6 +2065,8 @@ struct SettingsView: View {
                 Toggle(L10n.text("Show writing tools when text is selected"), isOn: $selAIEnabled)
                     .toggleStyle(.switch)
                 if selAIEnabled {
+                    Text(L10n.text("Press M twice quickly to open the tools. Without a selection you can type an instruction. This shortcut waits until text composition is finished."))
+                        .font(.caption).foregroundStyle(.secondary)
                     Picker(L10n.text("Scope"), selection: $selectionScope) {
                         Text(L10n.text("Notes Only")).tag(SelectionScope.notes)
                         Text(L10n.text("All Apps")).tag(SelectionScope.global)

@@ -501,8 +501,95 @@ private func keyboardListenerTests() async {
     check(disabledAttempts == 1, "只启用选区写作工具也会启动快捷键监听")
 }
 
+private func doubleMShortcutTests() {
+    typealias Gesture = DoubleMShortcut
+    let firstApp: pid_t = 100
+    let secondApp: pid_t = 200
+    let firstRelease = Gesture.interval / 4
+    let secondPress = Gesture.interval / 2
+    let secondRelease = Gesture.interval * 3 / 4
+
+    var gesture = Gesture()
+    let firstDown = gesture.handle(.down, at: 0, eligiblePID: firstApp)
+    let firstUp = gesture.handle(.up, at: firstRelease, eligiblePID: firstApp)
+    let secondDown = gesture.handle(.down, at: secondPress, eligiblePID: firstApp)
+    let secondUp = gesture.handle(.up, at: secondRelease, eligiblePID: firstApp)
+    check(firstDown == .hold && firstUp == .hold && secondDown == .hold && secondUp == .match && gesture.pendingPID == nil,
+          "两次独立的普通 M 按下并松开后只触发一次")
+
+    gesture = Gesture()
+    _ = gesture.handle(.down, at: 0, eligiblePID: firstApp)
+    _ = gesture.handle(.up, at: firstRelease, eligiblePID: firstApp)
+    let ordinary = gesture.handle(.other, at: secondPress, eligiblePID: firstApp)
+    let newPress = gesture.handle(.down, at: secondRelease, eligiblePID: firstApp)
+    check(ordinary == .replayThenPass && newPress == .hold,
+          "夹入其他键时先放行原 M，再放行当前键并结束旧手势")
+
+    gesture = Gesture()
+    _ = gesture.handle(.down, at: 0, eligiblePID: firstApp)
+    let noRelease = gesture.handle(.down, at: secondPress, eligiblePID: firstApp)
+    check(noRelease == .replayThenPass && gesture.handle(.up, at: secondRelease, eligiblePID: firstApp) == .pass,
+          "两个未分离的按下事件不能触发")
+
+    gesture = Gesture()
+    _ = gesture.handle(.down, at: 0, eligiblePID: firstApp)
+    _ = gesture.handle(.up, at: firstRelease, eligiblePID: firstApp)
+    let slow = gesture.handle(.down, at: Gesture.interval * 2, eligiblePID: firstApp)
+    check(slow == .replayThenPass && gesture.handle(.up, at: Gesture.interval * 2 + firstRelease, eligiblePID: firstApp) == .pass,
+          "超出时间窗口的两个 M 不触发")
+
+    gesture = Gesture()
+    _ = gesture.handle(.down, at: 0, eligiblePID: firstApp)
+    _ = gesture.handle(.up, at: firstRelease, eligiblePID: firstApp)
+    _ = gesture.handle(.down, at: secondPress, eligiblePID: firstApp)
+    check(gesture.handle(.up, at: Gesture.interval + firstRelease, eligiblePID: firstApp) == .replayThenPass,
+          "第二次长按超过时间窗口也会放行原始按键")
+
+    gesture = Gesture()
+    _ = gesture.handle(.down, at: 0, eligiblePID: firstApp)
+    _ = gesture.handle(.up, at: firstRelease, eligiblePID: firstApp)
+    let switched = gesture.handle(.down, at: secondPress, eligiblePID: secondApp)
+    check(switched == .replayThenPass && gesture.handle(.up, at: secondRelease, eligiblePID: secondApp) == .pass,
+          "跨应用输入不能合并成双击")
+    gesture.reset()
+    check(gesture.handle(.down, at: 0, eligiblePID: nil) == .pass
+          && gesture.handle(.up, at: firstRelease, eligiblePID: nil) == .pass,
+          "安全输入、IME 或范围不允许时普通 M 直接交给宿主")
+
+    func key(_ code: CGKeyCode, _ text: String, down: Bool = true,
+             flags: CGEventFlags = [], repeating: Bool = false,
+             isUntranslatedM: (CGKeyCode) -> Bool = { _ in false }) -> Gesture.Key {
+        let event = CGEvent(keyboardEventSource: nil, virtualKey: code, keyDown: down)!
+        let units = Array(text.utf16)
+        units.withUnsafeBufferPointer {
+            event.keyboardSetUnicodeString(stringLength: $0.count, unicodeString: $0.baseAddress)
+        }
+        event.flags = flags
+        event.setIntegerValueField(.keyboardEventAutorepeat, value: repeating ? 1 : 0)
+        return Gesture.key(for: event, isUntranslatedM: isUntranslatedM)
+    }
+    check(key(46, "m") == .down && key(46, "m", down: false) == .up
+          && key(0, "a") == .other && key(46, "mm") == .other,
+          "实际键盘事件仅将普通 M 译为候选按下和松开")
+    let modifiers: [CGEventFlags] = [.maskShift, .maskCommand, .maskControl, .maskAlternate, .maskSecondaryFn, .maskAlphaShift]
+    check(modifiers.allSatisfy { key(46, "m", flags: $0) == .other }
+          && key(46, "M") == .other && key(46, "m", repeating: true) == .other,
+          "组合键、大写和按住重复不是两次独立普通 M")
+    check(key(46, "", isUntranslatedM: { $0 == 46 }) == .down
+          && key(46, "", down: false, isUntranslatedM: { $0 == 46 }) == .up
+          && key(46, "拼", isUntranslatedM: { $0 == 46 }) == .other,
+          "只有未携带文字的事件可用键盘布局识别 M，已有的输入法字符原样交给宿主")
+    gesture = Gesture()
+    _ = gesture.handle(key(46, "m"), at: 0, eligiblePID: firstApp)
+    let repeatDecision = gesture.handle(key(46, "m", repeating: true), at: firstRelease, eligiblePID: firstApp)
+    let releaseAfterRepeat = gesture.handle(key(46, "m", down: false), at: secondPress, eligiblePID: firstApp)
+    check(repeatDecision == .replayThenPass && releaseAfterRepeat == .pass,
+          "长按保持普通重复输入和松开")
+}
+
 renderingTests()
 templateImportTests()
+doubleMShortcutTests()
 do { try notesTemplateTests() }
 catch { check(false, "Notes 模板合成数据库测试：\(error)") }
 Task { @MainActor in

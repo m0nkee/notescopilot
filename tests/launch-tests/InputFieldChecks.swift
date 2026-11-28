@@ -1,5 +1,6 @@
 import AppKit
 import ApplicationServices
+import Carbon.HIToolbox
 
 extension LaunchTests {
     static func checkGlobalInputFields() async throws {
@@ -50,8 +51,10 @@ extension LaunchTests {
         let candidate = "新文字"
         let sample = "开头🙂 目标 / 目标 结尾"
         var requests: [String] = []
+        var instructions: [String] = []
         var delayTranslation = false
-        let request = SelectionAIRequest { _, excerpt in
+        let request = SelectionAIRequest { instruction, excerpt in
+            instructions.append(instruction)
             requests.append(excerpt)
             if delayTranslation { try await Task.sleep(nanoseconds: 1_200_000_000) }
             return excerpt == "这是什么？" ? "What is this?" : candidate
@@ -68,8 +71,165 @@ extension LaunchTests {
         try await Task.sleep(nanoseconds: 680_000_000)
         check(SelectionScope.current(in: prefs) == .notes && !panel.isInputSession && requests.isEmpty,
               "default Notes scope ignores a real external text selection")
-        check(!panel.openFromHostShortcut(), "M passes through when no launcher is visible")
+        check(!panel.openFromHostShortcut(in: host), "the shortcut cannot open outside the default Notes scope")
+        watcher.stop()
+        do {
+            let listener = KeywordListener.shared
+            let defaults = UserDefaults.standard
+            let oldArguments = defaults.volatileDomain(forName: UserDefaults.argumentDomain)
+            let hostID = host.bundleIdentifier ?? "local.notescopilot.input-field-fixture"
+            var arguments = oldArguments
+            arguments[SelectionScope.enabledKey] = true
+            defaults.setVolatileDomain(arguments, forName: UserDefaults.argumentDomain)
+            prefs.set(SelectionScope.global.rawValue, forKey: SelectionScope.defaultsKey)
+            prefs.set(SelectionScope.PrivacyMode.allowlist.rawValue, forKey: SelectionScope.PrivacyMode.defaultsKey)
+            prefs.set([hostID], forKey: SelectionScope.privacyAppsKey)
+            listener.hostShortcutTestPanel = panel
+            defer {
+                listener.stop()
+                listener.hostShortcutTestPanel = nil
+                defaults.setVolatileDomain(oldArguments, forName: UserDefaults.argumentDomain)
+                prefs.removeObject(forKey: SelectionScope.PrivacyMode.defaultsKey)
+                prefs.removeObject(forKey: SelectionScope.privacyAppsKey)
+                panel.hide()
+            }
+            listener.startIfNeeded()
+            check(listener.isRunning, "the real keyboard listener starts for the isolated host")
+            let inputSource = TISCopyCurrentKeyboardInputSource()?.takeRetainedValue()
+            func inputProperty(_ key: CFString) -> String? {
+                guard let inputSource, let raw = TISGetInputSourceProperty(inputSource, key) else { return nil }
+                return Unmanaged<CFString>.fromOpaque(raw).takeUnretainedValue() as String
+            }
+            let inputMode = inputProperty(kTISPropertyInputSourceID) ?? "unknown"
+            let directKeyboard = inputProperty(kTISPropertyInputSourceType) == kTISTypeKeyboardLayout as String
+            print("NOTE  real double-M test input source: " + inputMode)
+
+            func prepareHost(_ command: String) async throws {
+                panel.hide()
+                try await send(command)
+                try await waitFor("keyboard fixture focus") {
+                    NSWorkspace.shared.frontmostApplication?.processIdentifier == child.processIdentifier
+                }
+            }
+            let keySource = CGEventSource(stateID: .hidSystemState)
+            func postHostKey(_ code: CGKeyCode, _ letter: String?, down: Bool,
+                             flags: CGEventFlags = [], repeating: Bool = false) throws {
+                guard NSWorkspace.shared.frontmostApplication?.processIdentifier == child.processIdentifier else {
+                    throw NSError(domain: "InputFieldTests", code: 4,
+                                  userInfo: [NSLocalizedDescriptionKey: "The keyboard fixture lost focus before posting a test key."])
+                }
+                let event = CGEvent(keyboardEventSource: keySource, virtualKey: code, keyDown: down)!
+                if let letter {
+                    let units = Array(letter.utf16)
+                    units.withUnsafeBufferPointer {
+                        event.keyboardSetUnicodeString(stringLength: $0.count, unicodeString: $0.baseAddress)
+                    }
+                }
+                event.flags = flags
+                event.setIntegerValueField(.keyboardEventAutorepeat, value: repeating ? 1 : 0)
+                event.post(tap: .cghidEventTap)
+            }
+            func typeHostKeys(_ keys: [(CGKeyCode, String)], useKeyboardLayout: Bool = false) async throws {
+                for (code, letter) in keys {
+                    try postHostKey(code, useKeyboardLayout ? nil : letter, down: true)
+                    try postHostKey(code, useKeyboardLayout ? nil : letter, down: false)
+                    try await Task.sleep(nanoseconds: 40_000_000)
+                }
+            }
+            let m: (CGKeyCode, String) = (46, "m")
+            try await prepareHost("shortcutDraft")
+            try await typeHostKeys([m])
+            try await Task.sleep(nanoseconds: 500_000_000)
+            try await send("inspect-single-m")
+            check(!panel.panelIsKey && state()["shortcutKeys"] == "m" && (!directKeyboard || state()["first"] == "fixture m"),
+                  "the event tap preserves an ordinary single M")
+            try await prepareHost("shortcutDraft")
+            try await typeHostKeys([m, (0, "a"), m])
+            try await Task.sleep(nanoseconds: 500_000_000)
+            try await send("inspect-intervening-key")
+            check(!panel.panelIsKey && state()["shortcutKeys"] == "mam" && (!directKeyboard || state()["first"] == "fixture mam"),
+                  "the event tap does not reorder ordinary typing")
+            try await prepareHost("shortcutDraft")
+            try postHostKey(46, "m", down: true)
+            try await Task.sleep(nanoseconds: 65_000_000)
+            try postHostKey(46, "m", down: true, repeating: true)
+            try await Task.sleep(nanoseconds: 65_000_000)
+            try postHostKey(46, "m", down: true, repeating: true)
+            try postHostKey(46, "m", down: false)
+            try await Task.sleep(nanoseconds: 500_000_000)
+            try await send("inspect-held-m")
+            check(!panel.panelIsKey && state()["shortcutKeys"] == "mmm",
+                  "holding M preserves the original key and the host's repeats")
+            try await prepareHost("shortcutDraft")
+            for _ in 0..<2 {
+                try postHostKey(46, "M", down: true, flags: .maskShift)
+                try postHostKey(46, "M", down: false, flags: .maskShift)
+            }
+            try await Task.sleep(nanoseconds: 500_000_000)
+            try await send("inspect-shift-m")
+            check(!panel.panelIsKey && state()["shortcutKeys"]?.count == 2,
+                  "two modified M presses are delivered only as normal keyboard events")
+
+            for (policyKey, policyValue, inspection) in [
+                (SelectionScope.pausedKey, true as Any, "paused"),
+                (SelectionScope.privacyAppsKey, [] as [String] as Any, "excluded")
+            ] {
+                try await prepareHost("shortcutDraft")
+                prefs.set(policyValue, forKey: policyKey)
+                try await typeHostKeys([m, m])
+                try await Task.sleep(nanoseconds: 500_000_000)
+                try await send("inspect-" + inspection)
+                check(!panel.panelIsKey && state()["shortcutKeys"] == "mm" && (!directKeyboard || state()["first"] == "fixture mm"),
+                      "two ordinary Ms pass through when the source is " + inspection)
+                prefs.removeObject(forKey: SelectionScope.pausedKey)
+                prefs.set([hostID], forKey: SelectionScope.privacyAppsKey)
+            }
+
+            try await prepareHost("password")
+            check(!panel.canReceiveHostShortcut(in: host), "the actual focused secure field is ineligible for the shortcut")
+            try await typeHostKeys([m, m])
+            try await Task.sleep(nanoseconds: 500_000_000)
+            check(!panel.panelIsKey, "the keyboard tap cannot open a tool in a secure field")
+
+            try await prepareHost("compositionDraft")
+            let axHost = AXUIElementCreateApplication(child.processIdentifier)
+            let markedField = AXText.element(axHost, kAXFocusedUIElementAttribute)
+            check(state()["hasMarkedText"] == "true" && markedField.map(AXText.isComposing) == true,
+                  "the fixture makes active native marked text visible to the listener")
+            try await typeHostKeys([m, m])
+            try await Task.sleep(nanoseconds: 500_000_000)
+            try await send("inspect-composition")
+            check(!panel.panelIsKey && state()["shortcutKeys"] == "mm",
+                  "active marked text receives both ordinary Ms without opening the tool")
+
+            try await prepareHost("first")
+            try await typeHostKeys([m, m], useKeyboardLayout: true)
+            try await waitFor("double-M selection menu") { panel.panelIsKey && panel.phase == .menu }
+            try await send("inspect-double-m-selection")
+            check(panel.original == "目标" && panel.hasReplacementTarget && !panel.isStandaloneSession
+                  && state()["first"] == sample && state()["shortcutKeys"] == "",
+                  "double M opens the selected text menu and consumes only the shortcut in " + inputMode)
+
+            try await prepareHost("shortcutDraft")
+            try await typeHostKeys([m, m], useKeyboardLayout: true)
+            try await waitFor("double-M standalone editor") { panel.panelIsKey && panel.isStandaloneSession }
+            if let window = NSApp.keyWindow as? SelectionKeyPanel,
+               let editor = window.firstResponder as? NSTextView, editor.isEditable {
+                editor.insertText("Give me a title", replacementRange: editor.selectedRange())
+                sendToolKey("\r", code: 36)
+                await request.task?.value
+                check(requests.last == "" && instructions.last == "Give me a title" && panel.result == candidate,
+                      "the actual host shortcut submits and generates an independent instruction")
+                try await send("inspect-double-m-standalone")
+                check(state()["first"] == "fixture " && state()["shortcutKeys"] == "" && !panel.hasReplacementTarget,
+                      "standalone double M leaves no trigger text or write target in the host in " + inputMode)
+            } else {
+                check(false, "the actual host shortcut focuses the standalone editor")
+            }
+        }
         prefs.set(SelectionScope.global.rawValue, forKey: SelectionScope.defaultsKey)
+        try await send("first")
+        watcher.startIfNeeded()
         watcher.scopeDidChange()
         let action = selectionQuickActions.first { $0.name == "精简" }!
 
@@ -125,12 +285,12 @@ extension LaunchTests {
         translated.releaseGlobally()
         panel.dismiss()
         try await Task.sleep(nanoseconds: 650_000_000)
-        check(!panel.isInputSession && !panel.openFromHostShortcut(), "closing a tool does not rearm M on the unchanged selection")
+        check(!panel.isInputSession && !panel.panelIsKey, "closing a tool does not recreate the launcher on the unchanged selection")
         panel.hide()
         watcher.scopeDidChange()
         try await send("first")
         try await waitFor("editable launcher before focus moves to the tool") { panel.isInputSession && panel.phase == .launcher }
-        check(panel.openFromHostShortcut(), "M opens a confirmed editable selection")
+        check(panel.openFromHostShortcut(in: host), "a recognized double M opens a confirmed editable selection")
         try await waitFor("keyboard-opened editable menu") { panel.phase == .menu }
         try await send("readonly")
         try await Task.sleep(nanoseconds: 700_000_000)
@@ -174,9 +334,9 @@ extension LaunchTests {
         watcher.scopeDidChange()
         try await send("translateDraft")
         try await waitFor("translation launcher") { panel.isInputSession && panel.phase == .launcher }
-        check(panel.openFromHostShortcut(), "the visible external launcher accepts its M shortcut")
+        check(panel.openFromHostShortcut(in: host), "the visible external launcher accepts a recognized double M")
         try await waitFor("shortcut opens the same menu as a click") { panel.phase == .menu }
-        check(!panel.openFromHostShortcut(), "M returns to text input once the menu is open")
+        check(!panel.openFromHostShortcut(in: host), "M returns to text input once the menu is open")
         check(panel.phase == .menu && panel.original == "这是什么？", "translation menu captured the five-character excerpt")
         try await send("collapse")
         try await Task.sleep(nanoseconds: 480_000_000)

@@ -223,7 +223,7 @@ struct LaunchTests {
         check(reads == 0 && inputs.isEmpty && tools.phase == .launcher && !tools.panelIsKey,
               "a passive Notes button takes no focus, reads no document and sends no request")
         if let launcher = NSApp.windows.compactMap({ $0.isVisible ? $0.contentView as? SelectionLauncherButton : nil }).first {
-            check(launcher.attributedTitle.string.hasSuffix("M") && launcher.accessibilityLabel() == "Copilot 写作阅读助手",
+            check(launcher.attributedTitle.string.hasSuffix("M M") && launcher.accessibilityLabel() == "Copilot 写作阅读助手",
                   "the launcher labels its shortcut visually and exposes its action to Accessibility")
             try captureSelectionPreview("selection-launcher", view: launcher)
         } else {
@@ -289,6 +289,47 @@ struct LaunchTests {
                                            context: nil, characters: text, charactersIgnoringModifiers: text,
                                            isARepeat: repeating, keyCode: code) else { return }
         NSApp.sendEvent(event)
+    }
+
+    private static func checkStandaloneInstruction() async {
+        let board = NSPasteboard.withUniqueName()
+        defer { board.releaseGlobally() }
+        var prompts: [String] = []
+        var sources: [String] = []
+        let request = SelectionAIRequest { prompt, source in
+            prompts.append(prompt)
+            sources.append(source)
+            return "独立指令结果"
+        }
+        let panel = SelectionAIPanel(request: request)
+        defer { panel.hide() }
+        panel.openStandaloneInstruction()
+        settle()
+        guard let window = NSApp.keyWindow as? SelectionKeyPanel,
+              let editor = window.firstResponder as? NSTextView, editor.isEditable else {
+            check(false, "the standalone shortcut focuses the same native instruction editor as I")
+            return
+        }
+        check(panel.isStandaloneSession && panel.phase == .menu && panel.original.isEmpty
+              && !panel.hasReplacementTarget && prompts.isEmpty && panel.formats.isEmpty,
+              "an empty selection starts an independent prompt without requesting AI")
+        sendToolKey("\r", code: 36)
+        check(panel.phase == .menu && prompts.isEmpty, "Return ignores an empty standalone instruction")
+        editor.setMarkedText("拼", selectedRange: NSRange(location: 1, length: 0), replacementRange: editor.selectedRange())
+        sendToolKey("\u{1b}", code: 53)
+        check(window.isVisible && window.firstResponder === editor && panel.phase == .menu,
+              "Escape during standalone marked input stays with the input method")
+        if editor.hasMarkedText() { editor.unmarkText() }
+        editor.insertText("  请给我两个标题  ", replacementRange: NSRange(location: 0, length: (editor.string as NSString).length))
+        sendToolKey("\r", code: 36)
+        await request.task?.value
+        check(panel.phase == .review && panel.result == "独立指令结果" && prompts == ["请给我两个标题"] && sources == [""],
+              "Return submits a trimmed standalone instruction with no fabricated input")
+        sendToolKey("r", code: 15)
+        sendToolKey("a", code: 0)
+        panel.copyPreview(to: board)
+        check(!panel.canWrite && !panel.writing && board.string(forType: .string) == "独立指令结果",
+              "standalone results support copy and cannot replace or append to the host")
     }
 
     private static func checkToolShortcuts(excerpt: String) async {
@@ -569,6 +610,7 @@ struct LaunchTests {
             settle()
             check(settingsOffscreen && reachable(settings), "unconfigured reopen restores offscreen settings")
             try await checkWritingTools()
+            await checkStandaloneInstruction()
             try await checkGlobalInputFields()
         } catch {
             check(false, "launch harness error: \(error.localizedDescription)")

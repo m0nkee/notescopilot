@@ -62,6 +62,7 @@ private final class InstructionField: NSTextField {
 private struct SelectionInstructionField: NSViewRepresentable {
     @ObservedObject private var localization = L10n.shared
     @Binding var text: String
+    let standalone: Bool
     let submit: () -> Void
 
     func makeCoordinator() -> Coordinator { Coordinator(self) }
@@ -84,9 +85,11 @@ private struct SelectionInstructionField: NSViewRepresentable {
 
     func updateNSView(_ field: NSTextField, context: Context) {
         context.coordinator.parent = self
-        field.placeholderString = L10n.text("Describe the change you want…")
+        field.placeholderString = L10n.text(standalone ? "What would you like to do?" : "Describe the change you want…")
         field.setAccessibilityLabel(L10n.text("Custom Instruction"))
-        field.setAccessibilityHelp(L10n.text("Press I to enter an instruction, then Return to run it"))
+        field.setAccessibilityHelp(L10n.text(standalone
+            ? "Type an instruction and press Return to run it"
+            : "Press I to enter an instruction, then Return to run it"))
         if field.currentEditor() == nil, field.stringValue != text { field.stringValue = text }
     }
 
@@ -108,7 +111,7 @@ private struct SelectionInstructionField: NSViewRepresentable {
 /// A nonactivating panel receives its first click directly in this AppKit button.
 final class SelectionLauncherButton: NSButton {
     static var displayName: String { L10n.text("Copilot Writing Tools") }
-    static let size = NSSize(width: 184, height: 32)
+    static let size = NSSize(width: 198, height: 32)
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
     override var needsPanelToBecomeKey: Bool { false }
 
@@ -117,8 +120,8 @@ final class SelectionLauncherButton: NSButton {
         let label = Self.displayName
         title = label
         setAccessibilityLabel(label)
-        toolTip = L10n.format("Open %@ (M)", label)
-        setAccessibilityHelp(L10n.format("Press M to open %@", label))
+        toolTip = L10n.format("Open %@ (M M)", label)
+        setAccessibilityHelp(L10n.format("Press M twice to open %@", label))
         image = NSImage(systemSymbolName: "book", accessibilityDescription: nil)
         symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 14, weight: .medium)
         imagePosition = .imageLeading
@@ -130,7 +133,7 @@ final class SelectionLauncherButton: NSButton {
             .font: NSFont.systemFont(ofSize: NSFont.smallSystemFontSize, weight: .semibold),
             .foregroundColor: NSColor.labelColor
         ])
-        caption.append(NSAttributedString(string: "   M", attributes: [
+        caption.append(NSAttributedString(string: "   M M", attributes: [
             .font: NSFont.monospacedSystemFont(ofSize: NSFont.smallSystemFontSize, weight: .medium),
             .foregroundColor: NSColor.labelColor
         ]))
@@ -172,7 +175,7 @@ struct SelectionToolsView: View {
             switch model.phase {
             case .menu: menu
             case .working:
-                excerpt
+                if !model.isStandaloneSession { excerpt }
                 HStack(spacing: 8) {
                     ProgressView().controlSize(.small)
                     Text(model.action.map { L10n.format("Running %@…", $0.displayName) }
@@ -220,26 +223,29 @@ struct SelectionToolsView: View {
 
     private var menu: some View {
         Group {
-            excerpt
+            if !model.isStandaloneSession { excerpt }
             HStack(spacing: 6) {
-                keyHint(SelectionKeyPanel.instructionKey)
-                SelectionInstructionField(text: $model.customInstruction, submit: model.runCustom)
+                if !model.isStandaloneSession { keyHint(SelectionKeyPanel.instructionKey) }
+                SelectionInstructionField(text: $model.customInstruction, standalone: model.isStandaloneSession,
+                                          submit: model.runCustom)
                     .frame(maxWidth: .infinity)
                 Button(action: model.runCustom) { Image(systemName: "arrow.right") }
                     .accessibilityLabel(L10n.text("Run Custom Instruction"))
                     .disabled(model.customInstruction.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
             }
-            Divider()
-            ForEach(SelectionQuickAction.Group.allCases, id: \.self) { group in
-                HStack(spacing: 6) {
-                    Text(group.title).font(.caption).foregroundStyle(.secondary)
-                        .frame(width: 32, alignment: .leading)
-                    ForEach(selectionQuickActions.filter { $0.group == group }, id: \.name) { action in
-                        if let key = action.shortcut {
-                            shortcutButton(action.displayName, key: key) { model.run(action) }
-                                .help(L10n.format("%@ (%@)",
-                                                  action.instruction == .translate ? WritingInstruction.translationHint : action.displayName,
-                                                  key.uppercased()))
+            if !model.isStandaloneSession {
+                Divider()
+                ForEach(SelectionQuickAction.Group.allCases, id: \.self) { group in
+                    HStack(spacing: 6) {
+                        Text(group.title).font(.caption).foregroundStyle(.secondary)
+                            .frame(width: 32, alignment: .leading)
+                        ForEach(selectionQuickActions.filter { $0.group == group }, id: \.name) { action in
+                            if let key = action.shortcut {
+                                shortcutButton(action.displayName, key: key) { model.run(action) }
+                                    .help(L10n.format("%@ (%@)",
+                                                      action.instruction == .translate ? WritingInstruction.translationHint : action.displayName,
+                                                      key.uppercased()))
+                            }
                         }
                     }
                 }
@@ -254,8 +260,10 @@ struct SelectionToolsView: View {
                 .fixedSize()
             }
             feedback
-            Text(L10n.text("Choose by letter · Return to run · Esc to go back"))
-                .font(.caption).foregroundStyle(.secondary)
+            if !model.isStandaloneSession {
+                Text(L10n.text("Choose by letter · Return to run · Esc to go back"))
+                    .font(.caption).foregroundStyle(.secondary)
+            }
         }
     }
 
@@ -266,7 +274,7 @@ struct SelectionToolsView: View {
 
     private var review: some View {
         Group {
-            if !model.result.isEmpty {
+            if !model.isStandaloneSession && !model.result.isEmpty {
                 HStack(spacing: 6) {
                     Picker(L10n.text("View Text"), selection: $model.showingOriginal) {
                         Text(L10n.text("Result")).tag(false)
@@ -285,6 +293,8 @@ struct SelectionToolsView: View {
                 }
                 .buttonStyle(.borderless)
                 .disabled(model.writing || model.original.isEmpty || model.result.isEmpty)
+            }
+            if !model.result.isEmpty {
                 if model.showingDiff {
                     ScrollView {
                         VStack(alignment: .leading, spacing: 2) {
@@ -369,7 +379,8 @@ struct SelectionToolsView: View {
                     NotificationCenter.default.post(name: .init("nc.openSettings"), object: nil)
                 }
             }
-            shortcutButton(L10n.text("Back to Tools"), key: SelectionReviewKey.back.rawValue, action: model.chooseAnotherTool)
+            shortcutButton(L10n.text(model.isStandaloneSession ? "Edit Instruction" : "Back to Tools"),
+                           key: SelectionReviewKey.back.rawValue, action: model.chooseAnotherTool)
             if let action = model.action {
                 let title = model.result.isEmpty ? L10n.text("Retry") : L10n.text("Regenerate")
                 shortcutButton(title, key: SelectionReviewKey.generate.rawValue) { model.run(action) }

@@ -351,7 +351,7 @@
 "OK" = "确定";
 "Ollama (Local)" = "Ollama 本地";
 "Only the summary is available. The note may be encrypted or use an unsupported format." = "无法读取完整正文（可能为加密笔记或不支持的数据格式），当前仅显示摘要。";
-"Open %@ (M)" = "打开%@（M）";
+"Open %@ (M M)" = "打开%@（连按两次 M）";
 "Open Accessibility Settings" = "打开辅助功能设置";
 "Open AI Panel" = "打开 AI 面板";
 "Open Automation Settings" = "打开自动化设置";
@@ -377,7 +377,8 @@
 "Permissions" = "权限状态";
 "Polish" = "润色";
 "Press I to enter an instruction, then Return to run it" = "按 I 输入指令，按回车执行";
-"Press M to open %@" = "按 M 打开%@";
+"Press M twice to open %@" = "快速连按两次 M 打开%@";
+"Press M twice quickly to open the tools. Without a selection you can type an instruction. This shortcut waits until text composition is finished." = "快速连按两次 M 打开工具，无选区时直接输入指令。请在输入法组词结束后使用。";
 "Press O to switch between the original and the result" = "按 O 切换原文与结果";
 "Preview" = "预览";
 "Previous conversation restored" = "已恢复上次会话";
@@ -419,6 +420,9 @@
 "Review the AI result before writing it to Notes" = "AI 已完成，确认后写回笔记";
 "Rewrite as a list of key points" = "改写为要点清单";
 "Run Custom Instruction" = "执行自定义指令";
+"Edit Instruction" = "编辑指令";
+"Type an instruction and press Return to run it" = "输入指令后按回车执行";
+"What would you like to do?" = "输入要执行的指令…";
 "Running %@…" = "正在%@…";
 "Running Apps" = "运行中的应用";
 "Same as /heading" = "同 /heading";

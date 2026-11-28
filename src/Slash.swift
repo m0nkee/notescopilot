@@ -1,5 +1,7 @@
 import Foundation
 import AppKit
+import Carbon
+import Carbon.HIToolbox
 
 // MARK: - 模板系统（对应 ProNotes TemplateNote / TemplateNoteManager：
 // "Templates allow you to insert repetitive snippets using slash commands"）
@@ -456,6 +458,108 @@ enum KeywordStore {
     }
 }
 
+struct DoubleMShortcut {
+    static let interval: TimeInterval = 0.35
+
+    enum Key { case down, up, other }
+    enum Decision { case pass, hold, replayThenPass, match }
+
+    private enum Stage { case firstDown, firstUp, secondDown }
+
+    private struct Pending {
+        let pid: pid_t
+        let started: TimeInterval
+        var stage: Stage
+    }
+
+    private var pending: Pending?
+    var pendingPID: pid_t? { pending?.pid }
+
+    mutating func reset() { pending = nil }
+
+    mutating func handle(_ key: Key, at time: TimeInterval, eligiblePID: pid_t?) -> Decision {
+        guard var current = pending else {
+            guard key == .down, let eligiblePID else { return .pass }
+            pending = Pending(pid: eligiblePID, started: time, stage: .firstDown)
+            return .hold
+        }
+
+        guard eligiblePID == current.pid, time >= current.started, time - current.started <= Self.interval else {
+            reset()
+            return .replayThenPass
+        }
+        switch (current.stage, key) {
+        case (.firstDown, .up):
+            current.stage = .firstUp
+        case (.firstUp, .down):
+            current.stage = .secondDown
+        case (.secondDown, .up):
+            reset()
+            return .match
+        default:
+            reset()
+            return .replayThenPass
+        }
+
+        pending = current
+        return .hold
+    }
+
+    static func key(for event: CGEvent, isUntranslatedM: (CGKeyCode) -> Bool = { _ in false }) -> Key {
+        guard event.type == .keyDown || event.type == .keyUp,
+              event.flags.intersection([.maskShift, .maskCommand, .maskControl, .maskAlternate,
+                                        .maskSecondaryFn, .maskAlphaShift, .maskHelp]).isEmpty,
+              event.getIntegerValueField(.keyboardEventAutorepeat) == 0 else { return .other }
+        let isM = withUnsafeTemporaryAllocation(of: UniChar.self, capacity: 2) { chars in
+            var count = 0
+            event.keyboardGetUnicodeString(maxStringLength: chars.count, actualStringLength: &count,
+                                           unicodeString: chars.baseAddress)
+            return count == 1 && chars[0] == 109
+                || count == 0 && isUntranslatedM(CGKeyCode(event.getIntegerValueField(.keyboardEventKeycode)))
+        }
+        return isM ? (event.type == .keyDown ? .down : .up) : .other
+    }
+}
+
+#if NC_APP
+private enum HostShortcutInputSource {
+    case layout, chineseIME, unsupported
+
+    static var current: Self {
+        guard let input = TISCopyCurrentKeyboardInputSource()?.takeRetainedValue(),
+              let type = property(kTISPropertyInputSourceType, of: input) else { return .unsupported }
+        if type == kTISTypeKeyboardLayout as String { return .layout }
+        guard type == kTISTypeKeyboardInputMode as String,
+              let bundle = property(kTISPropertyBundleID, of: input) else { return .unsupported }
+        return ["com.apple.inputmethod.SCIM", "com.apple.inputmethod.TCIM"].contains(bundle) ? .chineseIME : .unsupported
+    }
+
+    static var currentID: String? {
+        guard let input = TISCopyCurrentKeyboardInputSource()?.takeRetainedValue() else { return nil }
+        return property(kTISPropertyInputSourceID, of: input)
+    }
+
+    private static func property(_ key: CFString, of input: TISInputSource) -> String? {
+        TISGetInputSourceProperty(input, key).map { Unmanaged<CFString>.fromOpaque($0).takeUnretainedValue() as String }
+    }
+
+    static func isMInCurrentLayout(_ keyCode: CGKeyCode, keyboardType: UInt32) -> Bool {
+        guard let input = TISCopyCurrentKeyboardLayoutInputSource()?.takeRetainedValue(),
+              let value = TISGetInputSourceProperty(input, kTISPropertyUnicodeKeyLayoutData) else { return false }
+        let data = Unmanaged<CFData>.fromOpaque(value).takeUnretainedValue()
+        guard let bytes = CFDataGetBytePtr(data) else { return false }
+        let layout = UnsafeRawPointer(bytes).assumingMemoryBound(to: UCKeyboardLayout.self)
+        var state: UInt32 = 0
+        var count = 0
+        var char: UniChar = 0
+        let type = keyboardType == 0 ? UInt32(LMGetKbdType()) : keyboardType
+        let result = UCKeyTranslate(layout, keyCode, UInt16(kUCKeyActionDisplay), 0, type,
+                                    OptionBits(kUCKeyTranslateNoDeadKeysMask), &state, 1, &count, &char)
+        return result == noErr && count == 1 && char == 109
+    }
+}
+#endif
+
 final class KeywordListener {
     static let shared = KeywordListener()
     enum Status {
@@ -494,7 +598,29 @@ final class KeywordListener {
     /// 斜杠命令缓冲（如英文别名 "/polish"）：
     /// 只在监听启动后重新开始记录，避免旧缓冲误触发
     private var slashBuf = ""
-    private var consumedLauncherKey = false
+    #if NC_APP
+    private static let replayTag: Int64 = 0x4E_43_4D_52
+    private var hostShortcut = DoubleMShortcut()
+    private var hostShortcutApp: NSRunningApplication?
+    private var hostShortcutInputSource: HostShortcutInputSource?
+    private var hostShortcutInputID: String?
+    private var heldKeys: [CGEvent] = []
+    private var hostShortcutTimeout: Timer?
+    private var applicationObserver: NSObjectProtocol?
+    private var inputSourceObserver: NSObjectProtocol?
+
+    #if NC_APP_TEST
+    var hostShortcutTestPanel: SelectionAIPanel?
+    #endif
+
+    @MainActor
+    private var hostShortcutPanel: SelectionAIPanel {
+        #if NC_APP_TEST
+        if let hostShortcutTestPanel { return hostShortcutTestPanel }
+        #endif
+        return .shared
+    }
+    #endif
     /// 授权重试定时器：用户在系统设置里授完权后自动拉起监听，无需重启应用
     private var retryTimer: Timer?
     /// 上次记录的辅助功能授权结果（日志去重）
@@ -555,6 +681,9 @@ final class KeywordListener {
             reportTapUnavailable()
             return
         }
+        #if NC_APP
+        observeHostShortcutChanges()
+        #endif
         cancelPermissionRetry()
         NCLog.log("菜单键盘导航与关键词监听已启动（主动 tap 已启用）")
         NotificationCenter.default.post(
@@ -563,18 +692,19 @@ final class KeywordListener {
     }
 
     private static func createTap(options: CGEventTapOptions) -> CFMachPort? {
-        let mask = CGEventMask(1 << CGEventType.keyDown.rawValue)
+        let types: [CGEventType] = [.keyDown, .keyUp, .flagsChanged, .leftMouseDown, .rightMouseDown, .otherMouseDown]
+        let mask = types.reduce(CGEventMask(0)) { $0 | (1 << $1.rawValue) }
         return CGEvent.tapCreate(
             tap: .cgSessionEventTap,
             place: .headInsertEventTap,
             options: options,
             eventsOfInterest: mask,
-            callback: { _, type, event, _ in
+            callback: { proxy, type, event, _ in
                 if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
                     KeywordListener.shared.handleTapDisabled()
                     return Unmanaged.passUnretained(event)
                 }
-                return KeywordListener.shared.handle(event)
+                return KeywordListener.shared.handle(event, proxy: proxy)
             },
             userInfo: nil
         )
@@ -582,6 +712,9 @@ final class KeywordListener {
 
     /// 撤销辅助功能后不能反复启用旧 tap；保留重试等待用户重新授权。
     func handleTapDisabled() {
+        #if NC_APP
+        replayHostShortcut()
+        #endif
         guard accessibilityTrusted() else {
             stop()
             waitForAccessibility()
@@ -631,6 +764,17 @@ final class KeywordListener {
     }
 
     func stop() {
+        #if NC_APP
+        replayHostShortcut()
+        if let applicationObserver {
+            NSWorkspace.shared.notificationCenter.removeObserver(applicationObserver)
+            self.applicationObserver = nil
+        }
+        if let inputSourceObserver {
+            DistributedNotificationCenter.default().removeObserver(inputSourceObserver)
+            self.inputSourceObserver = nil
+        }
+        #endif
         if let s = source {
             CFRunLoopRemoveSource(CFRunLoopGetMain(), s, .commonModes)
             source = nil
@@ -641,15 +785,131 @@ final class KeywordListener {
         }
         buffer = ""
         slashBuf = ""
-        consumedLauncherKey = false
         cancelPermissionRetry()
     }
 
-    /// keyDown 仅路由菜单导航与显式启用的关键词；正文命令统一交给 AX。
-    fileprivate func handle(_ event: CGEvent) -> Unmanaged<CGEvent>? {
+    #if NC_APP
+    private func observeHostShortcutChanges() {
+        applicationObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            guard let self else { return }
+            if let pending = self.hostShortcutApp,
+               NSWorkspace.shared.frontmostApplication?.processIdentifier != pending.processIdentifier {
+                self.replayHostShortcut()
+            }
+            self.buffer = ""
+        }
+        inputSourceObserver = DistributedNotificationCenter.default().addObserver(
+            forName: .init(kTISNotifySelectedKeyboardInputSourceChanged as String), object: nil, queue: .main
+        ) { [weak self] _ in
+            // macOS can announce the same input source again when a field gains focus.
+            guard let self, self.hostShortcutApp != nil,
+                  self.hostShortcutInputID != HostShortcutInputSource.currentID else { return }
+            self.replayHostShortcut()
+        }
+    }
+
+    private func clearHostShortcut() {
+        hostShortcut.reset()
+        hostShortcutApp = nil
+        hostShortcutInputSource = nil
+        hostShortcutInputID = nil
+        heldKeys.removeAll(keepingCapacity: true)
+        hostShortcutTimeout?.invalidate()
+        hostShortcutTimeout = nil
+    }
+
+    private func replayHostShortcut(before proxy: CGEventTapProxy? = nil, targetPID: Int64? = nil) {
+        let app = hostShortcutApp
+        let events = heldKeys
+        clearHostShortcut()
+        guard let app, !app.isTerminated, !events.isEmpty else { return }
+        let isFrontmost = NSWorkspace.shared.frontmostApplication == app
+        // Never inject a key buffered in ordinary input into a newly secured field.
+        guard !isFrontmost || !IsSecureEventInputEnabled() else { return }
+        for event in events {
+            event.setIntegerValueField(.eventSourceUserData, value: Self.replayTag)
+            if let proxy, isFrontmost, targetPID == 0 || targetPID == Int64(app.processIdentifier) {
+                // Quartz queues this before the currently intercepted key or click.
+                event.tapPostEvent(proxy)
+            } else {
+                // A timeout or app change cannot send the pending M to a different app.
+                event.postToPid(app.processIdentifier)
+            }
+            if isFrontmost, event.type == .keyDown { appendKeywordInput(from: event) }
+        }
+    }
+
+    private func routeHostShortcut(_ event: CGEvent, proxy: CGEventTapProxy?) -> Bool {
+        var source: HostShortcutInputSource?
+        let key = DoubleMShortcut.key(for: event) { keyCode in
+            source = .current
+            guard source == .chineseIME else { return false }
+            return HostShortcutInputSource.isMInCurrentLayout(
+                keyCode, keyboardType: UInt32(clamping: event.getIntegerValueField(.keyboardEventKeyboardType)))
+        }
+        guard key == .down || hostShortcut.pendingPID != nil else { return false }
+        let time = ProcessInfo.processInfo.systemUptime
+        let target = event.getIntegerValueField(.eventTargetUnixProcessID)
+        let app = key == .other ? nil : NSWorkspace.shared.frontmostApplication
+        let inputSource: HostShortcutInputSource = app == nil ? .unsupported : source ?? .current
+        let requiresCompositionCheck = inputSource == .chineseIME
+        var eligiblePID: pid_t?
+        if let app, target == 0 || target == Int64(app.processIdentifier),
+           !IsSecureEventInputEnabled(), inputSource != .unsupported,
+           hostShortcutInputSource == nil || hostShortcutInputSource == inputSource,
+           hostShortcut.pendingPID != nil || MainActor.assumeIsolated({
+               hostShortcutPanel.canReceiveHostShortcut(in: app, requiresCompositionCheck: requiresCompositionCheck)
+           }) {
+            eligiblePID = app.processIdentifier
+        }
+
+        switch hostShortcut.handle(key, at: time, eligiblePID: eligiblePID) {
+        case .pass:
+            return false
+        case .hold:
+            guard let saved = event.copy() else { replayHostShortcut(before: proxy, targetPID: target); return false }
+            heldKeys.append(saved)
+            if hostShortcutApp == nil {
+                hostShortcutApp = app
+                hostShortcutInputSource = inputSource
+                hostShortcutInputID = HostShortcutInputSource.currentID
+                let timer = Timer(timeInterval: DoubleMShortcut.interval, repeats: false) { [weak self] _ in
+                    self?.replayHostShortcut()
+                }
+                hostShortcutTimeout = timer
+                RunLoop.main.add(timer, forMode: .common)
+            }
+            return true
+        case .replayThenPass:
+            replayHostShortcut(before: proxy, targetPID: target)
+            return false
+        case .match:
+            if let app, MainActor.assumeIsolated({
+                hostShortcutPanel.openFromHostShortcut(in: app, requiresCompositionCheck: requiresCompositionCheck)
+            }) {
+                clearHostShortcut()
+                buffer = ""
+                slashBuf = ""
+                return true
+            }
+            replayHostShortcut(before: proxy, targetPID: target)
+            return false
+        }
+    }
+    #endif
+
+    /// 正文命令统一交给 AX，键盘 tap 处理显式快捷键、菜单和关键词。
+    fileprivate func handle(_ event: CGEvent, proxy: CGEventTapProxy? = nil) -> Unmanaged<CGEvent>? {
+        #if NC_APP
+        if event.getIntegerValueField(.eventSourceUserData) == Self.replayTag {
+            return Unmanaged.passUnretained(event)
+        }
+        if routeHostShortcut(event, proxy: proxy) { return nil }
+        #endif
+        guard event.type == .keyDown else { return Unmanaged.passUnretained(event) }
         let flags = event.flags
-        let repeating = event.getIntegerValueField(.keyboardEventAutorepeat) != 0
-        if !repeating { consumedLauncherKey = false }
         if !flags.intersection([.maskCommand, .maskAlternate, .maskControl]).isEmpty {
             buffer = ""
             slashBuf = ""
@@ -659,49 +919,41 @@ final class KeywordListener {
         // tap 挂在主 runloop = 主线程，可安全进入 MainActor；测试构建（无 NC_APP）跳过
         #if NC_APP
         let kc = CGKeyCode(event.getIntegerValueField(.keyboardEventKeycode))
-        if MainActor.assumeIsolated({ SelectionAIPanel.shared.panelIsKey }) {
+        if MainActor.assumeIsolated({ hostShortcutPanel.panelIsKey }) {
             // The nonactivating tools panel can own the keyboard while the
             // source app remains frontmost. Let its window and its IME route input.
             buffer = ""
             slashBuf = ""
-            if repeating && consumedLauncherKey { return nil }
             return Unmanaged.passUnretained(event)
         }
         if kc == 125 || kc == 126 || kc == 36 || kc == 53,
            MainActor.assumeIsolated({
                SlashSuggestPanel.shared.routeKeyIfVisible(kc)
-                   || (kc == 53 && SelectionAIPanel.shared.dismissFromHost())
+                   || (kc == 53 && hostShortcutPanel.dismissFromHost())
            }) {
             buffer = ""
             slashBuf = ""
             return nil
         }
         #endif
+        appendKeywordInput(from: event)
+        return Unmanaged.passUnretained(event)
+    }
+
+    private func appendKeywordInput(from event: CGEvent) {
         var chars = [UniChar](repeating: 0, count: 4)
         var actual = 0
         event.keyboardGetUnicodeString(maxStringLength: 4, actualStringLength: &actual, unicodeString: &chars)
-        #if NC_APP
-        let isM = actual == 1 ? (chars[0] == 109 || chars[0] == 77) : (actual == 0 && kc == 46)
-        if isM && flags.intersection([.maskShift, .maskSecondaryFn]).isEmpty {
-            if repeating && consumedLauncherKey { return nil }
-            if !repeating && MainActor.assumeIsolated({ SelectionAIPanel.shared.openFromHostShortcut() }) {
-                consumedLauncherKey = true
-                buffer = ""
-                slashBuf = ""
-                return nil
-            }
-        }
-        #endif
-        guard actual > 0 else {
+        guard actual > 0, actual <= chars.count else {
             buffer = ""
             slashBuf = ""
-            return Unmanaged.passUnretained(event)
+            return
         }
         let s = String(utf16CodeUnits: chars, count: Int(actual))
         guard let c = s.first, s.count == 1 else {
             buffer = ""
             slashBuf = ""
-            return Unmanaged.passUnretained(event)
+            return
         }
 
         // 正文斜杠与 Markdown 统一由 AX 通道识别。tap 仅负责菜单导航和关键词，
@@ -711,7 +963,7 @@ final class KeywordListener {
         // ---- 关键词文本扩展通道 ----
         guard enabled, c.isLetter || c.isNumber || ";._-".contains(c) else {
             buffer = ""
-            return Unmanaged.passUnretained(event)
+            return
         }
         buffer.append(c)
         if buffer.count > maxSequenceLength {
@@ -729,7 +981,6 @@ final class KeywordListener {
             }
             break
         }
-        return Unmanaged.passUnretained(event)
     }
 
     /// 斜杠命令匹配："/alias" 精确或前缀唯一匹配
