@@ -239,6 +239,41 @@ extension LaunchTests {
             let captured = InputFieldBridge.openSelection(initialHit, excerpt: InputFieldBridge.launcherExcerpt(initialHit))
             check(captured?.fieldValue == sample, "opening a pointer-discovered selection recognizes the now-focused editor")
         } else { check(false, "the fixture exposes its focused editor") }
+        // Electron retains the field, value and selected range while reporting
+        // no focused AX element until the nonactivating results panel closes.
+        for append in [false, true] {
+            try await send("first")
+            guard let anchor = InputFieldBridge.anchor(in: host) else {
+                check(false, "focus handoff starts in the editable fixture")
+                return
+            }
+            panel.showLauncher(at: anchor)
+            panel.openTools()
+            try await send("suspendAXFocus")
+            let app = AXUIElementCreateApplication(host.processIdentifier)
+            check(AXText.element(app, kAXFocusedUIElementAttribute) == nil, "the fixture reports the Electron focus gap")
+            panel.run(action)
+            await request.task?.value
+            check(panel.canWrite, "the verified selection stays writable while the tool owns focus")
+            sendToolKey(append ? "a" : "r", code: append ? 0 : 15)
+            check(panel.pendingWriteAppend == append, "the review keyboard shortcut opens write confirmation")
+            panel.confirmPendingWrite()
+            try await Task.sleep(nanoseconds: 65_000_000)
+            try await send("restoreAXFocus")
+            try await waitFor("write after focus handoff") { !panel.writing }
+            try await send("inspect-handoff-" + String(append))
+            let expected = append ? "开头🙂 目标 / 目标新文字 结尾" : "开头🙂 目标 / 新文字 结尾"
+            check(state()["first"] == expected, "the original field regains focus before the write")
+            panel.hide()
+        }
+        try await send("first")
+        if let anchor = InputFieldBridge.anchor(in: host), let original = InputFieldBridge.capture(anchor) {
+            try await send("suspendAXFocus")
+            try await send("collapse")
+            check(!InputFieldBridge.selectionSurvivesFocusHandoff(original),
+                  "a collapsed selection remains unwritable during a focus handoff")
+            try await send("restoreAXFocus")
+        } else { check(false, "the changed-selection test starts in the editable fixture") }
         let serviceBoard = NSPasteboard.withUniqueName()
         defer { serviceBoard.releaseGlobally() }
         for append in [false, true] {
@@ -406,7 +441,7 @@ extension LaunchTests {
                   && panel.canWrite == writable && panel.hasReplacementTarget == writable,
                   "the confirmed excerpt and write actions match the host's capabilities")
         }
-        for field in ["first", "multiline", "webInput", "webArea", "webRich"] {
+        for field in ["first", "multiline", "webInput", "webArea", "webRich", "webEditor"] {
             if field != "first" { try await send(field) }
             try await prepareReview()
             try await send("inspect-" + field)
@@ -415,7 +450,7 @@ extension LaunchTests {
             try await waitFor("finish replacement") { !panel.writing }
             try await send("result-" + field)
             let actual = state()[field]
-            let replaced = (actual == "开头🙂 目标 / 新文字 结尾" || (field == "webRich" && actual == "开头🙂 目标 / 新文字\u{00A0}结尾")) && !panel.isInputSession
+            let replaced = (actual == "开头🙂 目标 / 新文字 结尾" || (["webRich", "webEditor"].contains(field) && actual == "开头🙂 目标 / 新文字\u{00A0}结尾")) && !panel.isInputSession
             check(replaced, "external " + field + " replaces only the selected duplicate and preserves adjacent Unicode")
             if !replaced {
                 print("FIXTURE", field, "status", panel.status, "synthetic field", state()[field] ?? "missing")
@@ -429,14 +464,14 @@ extension LaunchTests {
             }
         }
 
-        for field in ["first", "webArea", "webRich"] {
+        for field in ["first", "webArea", "webRich", "webEditor"] {
             try await send(field)
             try await prepareReview()
             panel.writeResult(append: true)
             try await waitFor("finish append") { !panel.writing }
             try await send("appended-" + field)
             let actual = state()[field]
-            let appended = actual == "开头🙂 目标 / 目标新文字 结尾" || (field == "webRich" && actual == "开头🙂 目标 / 目标新文字\u{00A0}结尾")
+            let appended = actual == "开头🙂 目标 / 目标新文字 结尾" || (["webRich", "webEditor"].contains(field) && actual == "开头🙂 目标 / 目标新文字\u{00A0}结尾")
             check(appended && !panel.isInputSession,
                   "append inserts at the selected occurrence and preserves the suffix, " + field)
             if !appended || panel.isInputSession { print("FIXTURE", field, "append status", panel.status, "synthetic field", actual ?? "missing") }

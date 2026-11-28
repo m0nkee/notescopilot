@@ -8,7 +8,7 @@ English · [简体中文](README.md)
 
 Write in Apple Notes and work with selected text across your Mac.
 
-[Download v2.11.0 for Apple silicon](https://github.com/m0nkee/notescopilot/releases/download/v2.11.0/NotesCopilot-2.11.0-arm64.dmg) · [Release notes and checksum](https://github.com/m0nkee/notescopilot/releases/tag/v2.11.0) · [User guide (Chinese)](docs/USAGE.md)
+[Download v2.11.1 for Apple silicon](https://github.com/m0nkee/notescopilot/releases/download/v2.11.1/NotesCopilot-2.11.1-arm64.dmg) · [Release notes and checksum](https://github.com/m0nkee/notescopilot/releases/tag/v2.11.1) · [User guide (Chinese)](docs/USAGE.md)
 
 </div>
 
@@ -44,7 +44,7 @@ The project has tested replacing and appending text in Chrome’s address bar, s
 
 Choose **Follow System**, **简体中文**, or **English** under **Settings → General & Diagnostics → Interface Language**. The app interface switches immediately and remembers your choice. macOS permission prompts and the Services menu use the language selected in macOS.
 
-1. Download the DMG, drag `NotesCopilot.app` into Applications, and open it. The release requires **Apple silicon and macOS 13 or later**. The release page also provides `NotesCopilot-2.11.0-arm64.dmg.sha256`.
+1. Download the DMG, drag `NotesCopilot.app` into Applications, and open it. The release requires **Apple silicon and macOS 13 or later**. The release page also provides `NotesCopilot-2.11.1-arm64.dmg.sha256`.
 2. In Settings, choose a provider or local model, enter any required credentials, and click **Save Profiles**. NotesCopilot supports DeepSeek, Kimi, Qwen, OpenAI, OpenRouter, SiliconFlow, and custom OpenAI-compatible endpoints. It can discover local Ollama, LM Studio, llama.cpp, and vLLM endpoints.
 3. Allow NotesCopilot in **System Settings → Privacy & Security → Accessibility**. Enable the corresponding permissions if you plan to write back to Notes or index your notes locally.
 

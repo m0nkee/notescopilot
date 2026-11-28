@@ -857,7 +857,9 @@ final class SelectionAIPanel: NSObject, ObservableObject {
         if hasReplacementTarget && !result.isEmpty && request.lastError == nil {
             switch request.selection {
             case .notes(let target): staleSelection = notes.readNotesSnapshot().map(target.matches) != true
-            case .input(let target): staleSelection = !InputFieldBridge.isCurrent(target)
+            case .input(let target):
+                staleSelection = !InputFieldBridge.isCurrent(target)
+                    && !(panelIsKey && InputFieldBridge.selectionSurvivesFocusHandoff(target))
             default: break
             }
             if staleSelection { markStale() }

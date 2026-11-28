@@ -1,6 +1,15 @@
 import AppKit
 import WebKit
 
+private final class FocusFixtureApplication: NSApplication {
+    var focusInToolPanel = false
+    @available(macOS, deprecated: 10.10)
+    override func accessibilityAttributeValue(_ attribute: NSAccessibility.Attribute) -> Any? {
+        if focusInToolPanel && attribute.rawValue == kAXFocusedUIElementAttribute { return nil }
+        return super.accessibilityAttributeValue(attribute)
+    }
+}
+
 /// Publishes the native text client's actual marked range across process boundaries.
 private final class CompositionFixture: NSTextView {
     @available(macOS, deprecated: 10.10)
@@ -59,7 +68,11 @@ final class InputFieldHostApp {
         webView.loadHTMLString("""
             <input id="webInput"><textarea id="webArea"></textarea>
             <input id="webPassword" type="password"><input id="webReadonly" readonly>
-            <div id="webRich" contenteditable="true" role="textbox"></div><p id="webStatic"></p>
+            <div id="webRich" contenteditable="true" role="textbox"></div>
+            <style>.ProseMirror { white-space: pre-wrap; white-space: break-spaces; }</style>
+            <div id="webEditor" class="ProseMirror" data-native-chat-prompt-editor="true"
+                 contenteditable="true" role="textbox" aria-multiline="true"></div>
+            <p id="webStatic"></p>
             <script>var edits = 0; document.addEventListener('input', () => edits++);</script>
             """, baseURL: nil)
         window.title = "NotesCopilot 测试输入框"
@@ -98,6 +111,8 @@ final class InputFieldHostApp {
     func handle(_ command: String) {
         let range = (sample as NSString).range(of: "目标", options: .backwards)
         switch command {
+        case "suspendAXFocus", "restoreAXFocus":
+            (NSApp as? FocusFixtureApplication)?.focusInToolPanel = command == "suspendAXFocus"
         case "shortcutDraft":
             if composing.hasMarkedText() { composing.unmarkText() }
             first.currentEditor()?.inputContext?.discardMarkedText()
@@ -122,7 +137,7 @@ final class InputFieldHostApp {
         case "collapseWeb":
             webView.evaluateJavaScript("getSelection().removeAllRanges()") { _, _ in self.reportWebState(command) }
             return
-        case "webInput", "webArea", "webPassword", "webReadonly", "webRich", "webStatic":
+        case "webInput", "webArea", "webPassword", "webReadonly", "webRich", "webEditor", "webStatic":
             webField = command
             NSApp.activate(ignoringOtherApps: true)
             webWindow.makeKeyAndOrderFront(nil)
@@ -137,7 +152,7 @@ final class InputFieldHostApp {
                         field.setSelectionRange(start, start + 2);
                     } else {
                         document.activeElement.blur();
-                        field.innerHTML = '开头🙂 目标 / <b>目标</b> 结尾';
+                        field.innerHTML = field.id === 'webEditor' ? '<p>开头🙂 目标 / <b>目标</b> 结尾</p>' : '开头🙂 目标 / <b>目标</b> 结尾';
                         field.focus();
                         const selection = getSelection();
                         const range = document.createRange();
@@ -194,7 +209,7 @@ final class InputFieldHostApp {
     }
 
     static func main() {
-        let app = NSApplication.shared
+        let app = FocusFixtureApplication.shared
         app.setActivationPolicy(.regular)
         let host = InputFieldHostApp(report: URL(fileURLWithPath: CommandLine.arguments[1]))
         host.handle("ready")

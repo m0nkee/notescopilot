@@ -392,6 +392,30 @@ enum InputFieldBridge {
             && original.text.utf16.elementsEqual(current.text.utf16)
     }
 
+    // Electron can leave its focused element empty while a nonactivating tool panel
+    // owns the keyboard. The original editor still exposes its exact live selection.
+    static func selectionSurvivesFocusHandoff(_ original: InputFieldSelection) -> Bool {
+        let host = original.host
+        let element = original.anchor.element
+        guard host.editable, let value = original.fieldValue, !host.application.isTerminated,
+              let front = NSWorkspace.shared.frontmostApplication,
+              front.processIdentifier == host.application.processIdentifier || front.processIdentifier == ProcessInfo.processInfo.processIdentifier else { return false }
+        let app = AXUIElementCreateApplication(host.application.processIdentifier)
+        AXUIElementSetMessagingTimeout(app, 0.2)
+        var focused: CFTypeRef?
+        let focusStatus = AXUIElementCopyAttributeValue(app, kAXFocusedUIElementAttribute as CFString, &focused)
+        guard focusStatus == .noValue || (focusStatus == .success && focused == nil),
+              let window = AXText.element(app, kAXFocusedWindowAttribute), CFEqual(window, host.window),
+              let owner = AXText.element(element, kAXWindowAttribute), CFEqual(owner, window),
+              original.document == document(of: window),
+              original.windowTitle == AXText.attribute(window, kAXTitleAttribute) as? String,
+              !AXText.isProtected(element), !AXText.isComposing(element), isWritable(element),
+              let live = selection(in: element), live.identity == original.anchor.extent.identity,
+              let text = live.text(in: element), text.utf16.elementsEqual(original.text.utf16),
+              let full = AXText.attribute(element, kAXValueAttribute) as? String else { return false }
+        return full.utf16.elementsEqual(value.utf16)
+    }
+
     // WebKit may acknowledge an AXSelectedText setter without editing the DOM. Use its
     // native edit command once so the host also handles input events, rich text and Undo.
     private static func needsPaste(_ element: AXUIElement) -> Bool {
@@ -442,8 +466,15 @@ enum InputFieldBridge {
     static func write(_ original: InputFieldSelection, text: String, append: Bool, isValid: () -> Bool) async -> String? {
         let stale = L10n.text("The original app, text field, or selection changed.")
         let app = original.host.application
-        guard isValid(), let value = original.fieldValue, case .characters(let selected) = original.anchor.extent,
-              isCurrent(original) else { return stale }
+        guard isValid(), let value = original.fieldValue, case .characters(let selected) = original.anchor.extent else { return stale }
+        // Closing the panel restores Electron's focused editor asynchronously.
+        // Wait only while the same verified selection is still in the focus handoff.
+        for _ in 0..<12 {
+            if isCurrent(original) { break }
+            guard isValid(), selectionSurvivesFocusHandoff(original) else { return stale }
+            try? await Task.sleep(nanoseconds: 25_000_000)
+        }
+        guard isValid(), isCurrent(original) else { return stale }
         if !append && text.utf16.elementsEqual(original.text.utf16) { return nil }
         if NSWorkspace.shared.frontmostApplication?.processIdentifier != app.processIdentifier {
             guard app.activate(options: []) else { return stale }
